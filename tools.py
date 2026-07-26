@@ -2967,7 +2967,7 @@ def _enforce_subagent_toolset_policy(child, requested_toolsets) -> None:
     child._cached_system_prompt = None
 
 
-def _resolve_parent_agent(parent_agent=None):
+def _resolve_parent_agent(parent_agent=None, session_id: str = ""):
     """Resolve the live commissioning agent without guessing across sessions.
 
     Hermes injects ``parent_agent`` for direct callers in some contexts and
@@ -2993,24 +2993,40 @@ def _resolve_parent_agent(parent_agent=None):
 
     try:
         from gateway.session_context import get_session_env
+        from tui_gateway import server as tui_server
 
         ui_session_id = str(
             get_session_env("HERMES_UI_SESSION_ID", "") or ""
         ).strip()
-        if not ui_session_id:
-            return None
-
-        from tui_gateway import server as tui_server
-
+        durable_session_id = str(session_id or "").strip()
         sessions_lock = getattr(tui_server, "_sessions_lock", None)
+
+        def _resolve_from_sessions(sessions):
+            if ui_session_id:
+                session = sessions.get(ui_session_id)
+                if isinstance(session, dict) and session.get("agent") is not None:
+                    return session.get("agent")
+            if not durable_session_id:
+                return None
+            matches = []
+            for session in sessions.values():
+                if not isinstance(session, dict):
+                    continue
+                agent = session.get("agent")
+                if agent is None:
+                    continue
+                if (
+                    str(session.get("session_key") or "") == durable_session_id
+                    or str(getattr(agent, "session_id", "") or "")
+                    == durable_session_id
+                ):
+                    matches.append(agent)
+            return matches[0] if len(matches) == 1 else None
+
         if sessions_lock is None:
-            session = getattr(tui_server, "_sessions", {}).get(ui_session_id)
-        else:
-            with sessions_lock:
-                session = getattr(tui_server, "_sessions", {}).get(ui_session_id)
-        if not isinstance(session, dict):
-            return None
-        return session.get("agent")
+            return _resolve_from_sessions(getattr(tui_server, "_sessions", {}))
+        with sessions_lock:
+            return _resolve_from_sessions(getattr(tui_server, "_sessions", {}))
     except Exception:
         return None
 
@@ -3045,7 +3061,9 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
     inherit_soul = args.get("inherit_soul", False) is True
     inherit_context = args.get("inherit_context", False) is True
     inherit_toolsets = args.get("inherit_toolsets", True) is not False
-    parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
+    parent_agent = _resolve_parent_agent(
+        kwargs.get("parent_agent"), kwargs.get("session_id", "")
+    )
 
     if not goal.strip():
         return _tool_error("'goal' is required.")

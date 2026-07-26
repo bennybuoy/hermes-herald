@@ -119,6 +119,69 @@ def test_parent_agent_resolution_is_exact_and_fails_closed(monkeypatch):
     assert tools._resolve_parent_agent(explicit) is explicit
 
 
+def test_parent_agent_resolves_from_exact_durable_session_id(monkeypatch):
+    import gateway.session_context as session_context
+    import hermes_cli.plugins as plugins
+    import tui_gateway.server as tui_server
+
+    expected = SimpleNamespace(session_id="durable-session")
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": default,
+    )
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_manager",
+        lambda: SimpleNamespace(_cli_ref=None),
+    )
+    monkeypatch.setattr(
+        tui_server,
+        "_sessions",
+        {
+            "ui-session-1": {
+                "agent": expected,
+                "session_key": "durable-session",
+            }
+        },
+    )
+
+    assert tools._resolve_parent_agent(None, "durable-session") is expected
+
+
+def test_parent_agent_durable_session_resolution_rejects_ambiguity(monkeypatch):
+    import gateway.session_context as session_context
+    import hermes_cli.plugins as plugins
+    import tui_gateway.server as tui_server
+
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": default,
+    )
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_manager",
+        lambda: SimpleNamespace(_cli_ref=None),
+    )
+    monkeypatch.setattr(
+        tui_server,
+        "_sessions",
+        {
+            "ui-session-1": {
+                "agent": SimpleNamespace(session_id="durable-session"),
+                "session_key": "durable-session",
+            },
+            "ui-session-2": {
+                "agent": SimpleNamespace(session_id="durable-session"),
+                "session_key": "durable-session",
+            },
+        },
+    )
+
+    assert tools._resolve_parent_agent(None, "durable-session") is None
+
+
 def test_subagent_routing_uses_task_local_capture_not_stale_environment(monkeypatch):
     from hermes_herald import callback
 
