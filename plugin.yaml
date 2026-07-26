@@ -1,0 +1,16 @@
+name: hermes-herald
+version: 1.0.0
+description: "Hermes Herald — directed cross-profile dispatch with a durable SQLite call ledger, detached graph routing, fail-closed model-route verification, model-selectable in-process subagents, and bare LLM inference."
+author: Ben
+provides_tools:
+  - dispatch_agent
+  - check_dispatch
+  - collect_dispatches
+  - dispatch_status
+  - dispatch_chat
+  - cancel_dispatch
+  - delegate_subagent
+  - llm_call
+  - ping_profile
+  - approve_dispatch
+  - list_profile_models
