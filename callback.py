@@ -30,6 +30,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Any, Dict, Optional
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
@@ -632,6 +633,23 @@ def _check_run_status(
     return None  # still running or waiting_for_approval
 
 
+def _parse_updated_at(value: Any) -> float:
+    """Normalize current RFC3339 and legacy epoch run timestamps."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return 0.0
+    text = value.strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _poll_run_status(
     run_id: str,
     profile: str,
@@ -712,7 +730,7 @@ def _poll_run_status(
         # updated_at timestamp, the agent is still producing output
         # (tool calls, message deltas, etc.). Reset the stall timer,
         # mirroring the SSE path's activity-event reset.
-        updated_at = float(status_data.get("updated_at") or 0)
+        updated_at = _parse_updated_at(status_data.get("updated_at"))
         if updated_at > last_updated_at:
             last_updated_at = updated_at
             last_activity = time.time()

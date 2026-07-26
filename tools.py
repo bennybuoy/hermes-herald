@@ -2,7 +2,7 @@
 
 Eleven tools for cross-profile dispatch, local delegation, and bare inference:
   - dispatch_agent: POST /v1/runs (async, SSE callback or detached graph edge)
-  - dispatch_chat: POST /api/sessions/{id}/chat, sync session-persistent
+  - dispatch_chat: streaming POST /v1/chat/completions, sync session-persistent
   - delegate_subagent: in-process subagent with per-call model and timeout policy
   - llm_call: bare inference through Hermes provider routing
   - check_dispatch: GET /v1/runs/{run_id}, returns status
@@ -11,7 +11,7 @@ Eleven tools for cross-profile dispatch, local delegation, and bare inference:
   - cancel_dispatch: POST /v1/runs/{run_id}/stop, cooperative cancellation
   - ping_profile: GET /v1/health, health check for target profile
   - approve_dispatch: POST /v1/runs/{run_id}/approval, resolve approvals
-  - list_profile_models: GET /v1/models, discover safe dispatch aliases
+  - list_profile_models: GET /v1/models, discover safe aliases for both dispatch modes
 
 All HTTP is done with urllib.request (stdlib). Handlers are synchronous
 except delegate_subagent which runs in a background thread.
@@ -263,17 +263,15 @@ DISPATCH_STATUS_SCHEMA: Dict[str, Any] = {
 DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
     "name": "dispatch_chat",
     "description": (
-        "Synchronously dispatch a task to another Hermes profile and block "
-        "until the reply arrives. Uses the persistent session API endpoint "
-        "(/api/sessions/{id}/chat) so conversation history is preserved — "
-        "subsequent calls to the same profile continue the same conversation. "
-        "The profile receives prior conversation history from that session. "
-        "Herald v1 intentionally uses the target profile's default runtime on "
-        "this path and rejects configured or supplied model overrides before "
-        "sending a message. Optional instructions apply to the current turn; "
-        "resend them on later turns when still required. "
-        "Use this for interactive multi-turn dialogue with a teaching agent. "
-        "For fire-and-forget parallel dispatch, use dispatch_agent instead."
+        "Synchronously dispatch one conversational turn to another Hermes "
+        "profile. The call blocks the current agent turn until the reply "
+        "arrives, while a streaming /v1/chat/completions connection observes "
+        "assistant and tool activity and preserves history through the target "
+        "session ID. Subsequent calls to the same profile continue that "
+        "conversation. Use model to select an exact target model_routes alias; "
+        "omit it to use the target default. Optional instructions apply only "
+        "to this turn. Use this when the next decision depends on the target's "
+        "reply. For independent or parallel work, use dispatch_agent instead."
     ),
     "parameters": {
         "type": "object",
@@ -307,15 +305,23 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
                     "Default: false (continue existing session)."
                 ),
             },
-            "timeout": {
-                "type": "number",
+            "model": {
+                "type": "string",
                 "description": (
-                    "Optional per-call timeout in seconds for the synchronous "
-                    "chat request. Overrides the configured default "
-                    "(hermes_herald.chat_timeout, default 600s). Pass a "
-                    "larger value for long agentic tasks, or a smaller value "
-                    "for quick questions. The call blocks until the target "
-                    "replies or this timeout expires."
+                    "Optional exact model_routes alias advertised by the "
+                    "target's authenticated /v1/models endpoint. Herald "
+                    "verifies the alias before sending. Omit to use the "
+                    "target profile's default runtime."
+                ),
+            },
+            "stall_timeout_seconds": {
+                "type": "number",
+                "minimum": 30,
+                "description": (
+                    "Seconds without assistant or tool activity before Herald "
+                    "treats the chat as stalled. Activity resets the timer; "
+                    "SSE transport keepalives do not. Overrides "
+                    "hermes_herald.chat_timeout (default 600s). Minimum 30."
                 ),
             },
         },
@@ -470,7 +476,18 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Background information the subagent needs: file paths, "
-                    "error messages, project structure, constraints."
+                    "error messages, project structure, constraints. This is "
+                    "always included whether or not inherit_context is enabled."
+                ),
+            },
+            "inherit_context": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "If true, prepend a bounded copy of recent parent "
+                    "user/assistant text to context. System messages, tool "
+                    "calls, tool results, memory, and hidden state are excluded. "
+                    "Defaults to false."
                 ),
             },
             "inherit_soul": {
@@ -487,9 +504,19 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional list of toolset names for the subagent. If "
-                    "omitted, inherits the parent's toolsets (minus blocked "
-                    "tools like delegate_task, clarify, memory, etc.)."
+                    "Optional exact toolset subset for the subagent. A non-empty "
+                    "list is intersected with the parent's capabilities; an "
+                    "empty list creates a model-only child. If omitted, "
+                    "inherit_toolsets controls the behaviour."
+                ),
+            },
+            "inherit_toolsets": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "When toolsets is omitted, inherit the parent's safe "
+                    "toolset subset if true, or create a model-only child if "
+                    "false. Defaults to true. Explicit toolsets always wins."
                 ),
             },
             "stall_timeout_seconds": {
@@ -697,6 +724,135 @@ def _post_json(url: str, api_key: str, body: dict, timeout: float = 30.0) -> dic
     try:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"HTTP {e.code} from {url}: {err_body or e.reason}"
+        ) from e
+    except URLError as e:
+        raise RuntimeError(f"Cannot reach {url}: {e.reason}") from e
+
+
+def _post_streaming_chat(
+    url: str,
+    api_key: str,
+    body: dict,
+    *,
+    session_id: str,
+    stall_timeout_seconds: float,
+    progress_callback=None,
+) -> dict:
+    """Consume one OpenAI-compatible streaming chat turn with stall detection."""
+    data = json.dumps(body).encode("utf-8")
+    req = Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "X-Hermes-Session-Id": session_id,
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=max(1.0, min(stall_timeout_seconds, 60.0))) as resp:
+            result_session_id = resp.headers.get("X-Hermes-Session-Id", session_id)
+            read_available = getattr(resp, "read1", None) or resp.read
+            buffer = ""
+            reply_parts: List[str] = []
+            usage: Dict[str, int] = {}
+            response_model = ""
+            last_activity = time.monotonic()
+            saw_done = False
+
+            while True:
+                chunk = read_available(4096)
+                if not chunk:
+                    break
+                buffer += chunk.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+                while "\n\n" in buffer:
+                    event_block, buffer = buffer.split("\n\n", 1)
+                    stripped = event_block.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith(":"):
+                        if time.monotonic() - last_activity > stall_timeout_seconds:
+                            raise RuntimeError(
+                                f"dispatch_chat stalled for {stall_timeout_seconds:g} seconds "
+                                "without assistant or tool activity."
+                            )
+                        continue
+
+                    event_name = "message"
+                    data_lines: List[str] = []
+                    for line in event_block.split("\n"):
+                        if line.startswith("event:"):
+                            event_name = line[6:].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[5:].lstrip())
+                    if not data_lines:
+                        continue
+                    payload_text = "\n".join(data_lines)
+                    if payload_text == "[DONE]":
+                        saw_done = True
+                        break
+                    try:
+                        payload = json.loads(payload_text)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event_name == "hermes.tool.progress":
+                        last_activity = time.monotonic()
+                        if progress_callback:
+                            progress_callback(event_name, payload)
+                        continue
+
+                    choices = payload.get("choices") if isinstance(payload, dict) else None
+                    if isinstance(choices, list) and choices:
+                        choice = choices[0] if isinstance(choices[0], dict) else {}
+                        raw_delta = choice.get("delta")
+                        delta: Dict[str, Any] = raw_delta if isinstance(raw_delta, dict) else {}
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            reply_parts.append(content)
+                            last_activity = time.monotonic()
+                        elif delta.get("role"):
+                            last_activity = time.monotonic()
+                        finish_reason = choice.get("finish_reason")
+                        if finish_reason and finish_reason != "stop":
+                            raw_error = payload.get("error")
+                            error: Dict[str, Any] = (
+                                raw_error if isinstance(raw_error, dict) else {}
+                            )
+                            detail = error.get("message") or f"finish_reason={finish_reason}"
+                            raise RuntimeError(f"Target chat failed: {detail}")
+                    if isinstance(payload, dict):
+                        if isinstance(payload.get("model"), str):
+                            response_model = payload["model"]
+                        raw_usage = payload.get("usage")
+                        if isinstance(raw_usage, dict):
+                            usage = {
+                                "input_tokens": int(raw_usage.get("prompt_tokens", 0) or 0),
+                                "output_tokens": int(raw_usage.get("completion_tokens", 0) or 0),
+                                "total_tokens": int(raw_usage.get("total_tokens", 0) or 0),
+                            }
+                if saw_done:
+                    break
+
+            if not saw_done:
+                raise RuntimeError("Target chat stream closed before data: [DONE].")
+            return {
+                "session_id": result_session_id,
+                "reply": "".join(reply_parts),
+                "model": response_model,
+                "usage": usage,
+            }
     except HTTPError as e:
         err_body = ""
         try:
@@ -1769,10 +1925,8 @@ def handle_dispatch_status(args: dict, **kwargs) -> str:
 def handle_dispatch_chat(args: dict, **kwargs) -> str:
     """Synchronously dispatch a task with session persistence.
 
-    Uses POST /api/sessions/{id}/chat which:
-    - Blocks until the agent replies (synchronous)
-    - Loads and saves conversation history to state.db
-    - Allows multi-turn conversations with the same agent
+    Uses streaming POST /v1/chat/completions with X-Hermes-Session-Id so the
+    target loads/saves history while Herald observes model and tool activity.
 
     Session IDs are tracked per-profile in callback.py so subsequent
     calls continue the same conversation thread.
@@ -1782,7 +1936,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     instructions = args.get("instructions")
     new_session = args.get("new_session", False)
     model_override = args.get("model")
-    call_timeout = args.get("timeout")
+    call_timeout = args.get("stall_timeout_seconds")
 
     if not profile:
         return _tool_error("'profile' is required.")
@@ -1802,15 +1956,17 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
 
     configured_model = pcfg.get("model")
     requested_model = model_override or configured_model or ""
+    model_provenance = {
+        "requested_model": "",
+        "resolved_model": "",
+        "resolution_source": "target_default",
+    }
     if requested_model:
-        return _tool_error(
-            f"dispatch_chat cannot guarantee model override "
-            f"'{requested_model}' for {profile}: Hermes' persistent session "
-            f"chat endpoint does not apply request model routing. No session "
-            f"was created and no message was sent. Remove model (and any "
-            f"hermes_herald profile model alias) to use the target default, "
-            f"or use dispatch_agent with a verified model_routes alias."
+        model_provenance, model_error = _verify_run_model_route(
+            profile, pcfg, requested_model,
         )
+        if model_error:
+            return _tool_error(model_error)
 
     from .callback import get_profile_session_id, store_profile_session_id
 
@@ -1819,7 +1975,12 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
 
     if not session_id or new_session:
         # Create a new session on the target API server
-        create_body: Dict[str, Any] = {"title": f"Dispatch to {profile}"}
+        # Hermes session titles are unique. Keep the target recognisable while
+        # allowing repeated ``new_session=True`` calls and recovery after a
+        # lost local session handle.
+        create_body: Dict[str, Any] = {
+            "title": f"Dispatch to {profile} · {uuid.uuid4().hex[:8]}"
+        }
         try:
             create_result = _post_json(
                 f"{pcfg['url']}/api/sessions",
@@ -1851,21 +2012,48 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         try:
             effective_timeout = float(call_timeout)
         except (TypeError, ValueError):
-            return _tool_error("'timeout' must be a number (seconds) when provided.")
-        if effective_timeout <= 0:
-            return _tool_error("'timeout' must be a positive number (seconds).")
+            return _tool_error(
+                "'stall_timeout_seconds' must be a number when provided."
+            )
+        if effective_timeout < 30:
+            return _tool_error("'stall_timeout_seconds' must be at least 30 seconds.")
 
-    # Send the message via the persistent session chat endpoint
-    chat_body: Dict[str, Any] = {"message": message}
+    # Stream one OpenAI-compatible turn while preserving target session history.
+    chat_messages: List[Dict[str, Any]] = []
     if instructions:
-        chat_body["system_message"] = instructions
+        chat_messages.append({"role": "system", "content": instructions})
+    chat_messages.append({"role": "user", "content": message})
+    chat_body: Dict[str, Any] = {
+        "model": requested_model or "hermes-agent",
+        "messages": chat_messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
+    parent_progress = getattr(parent_agent, "tool_progress_callback", None)
+
+    def _relay_progress(_event_name: str, payload: dict) -> None:
+        if not parent_progress:
+            return
+        status = str(payload.get("status") or "running")
+        event_type = "tool.completed" if status == "completed" else "tool.started"
+        tool_name = str(payload.get("tool") or "remote_tool")
+        preview = f"[{profile}] {payload.get('label') or tool_name}"
+        try:
+            parent_progress(event_type, tool_name=tool_name, preview=preview)
+        except Exception:
+            logger.debug("Could not relay dispatch_chat progress", exc_info=True)
+
     chat_started = time.monotonic()
     try:
-        result = _post_json(
-            f"{pcfg['url']}/api/sessions/{session_id}/chat",
+        result = _post_streaming_chat(
+            f"{pcfg['url']}/v1/chat/completions",
             pcfg["api_key"],
             chat_body,
-            timeout=effective_timeout,
+            session_id=session_id,
+            stall_timeout_seconds=effective_timeout,
+            progress_callback=_relay_progress,
         )
     except RuntimeError as e:
         msg = str(e)
@@ -1889,7 +2077,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         return _tool_error(f"dispatch_chat to {profile} failed: {msg}")
 
     # Extract the reply
-    reply = result.get("message", {}).get("content", "")
+    reply = result.get("reply", "")
     result_session_id = result.get("session_id", session_id)
     if result_session_id != session_id:
         store_profile_session_id(profile, result_session_id)
@@ -1909,7 +2097,10 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "message_preview": message[:120],
                 "session_id": result_session_id,
-                "model": "",
+                "model": result.get("model") or model_provenance["resolved_model"],
+                "requested_model": model_provenance["requested_model"],
+                "resolved_model": model_provenance["resolved_model"],
+                "model_resolution": model_provenance["resolution_source"],
                 "status": "completed",
                 "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "duration_seconds": None,
@@ -1924,7 +2115,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
 
     from .callback import capture_session_routing
 
-    routing = capture_session_routing(kwargs.get("parent_agent"))
+    routing = capture_session_routing(parent_agent)
     try:
         _record_dispatch_ledger(
             edge_id=edge_id,
@@ -1942,6 +2133,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             output_preview=reply,
             duration_seconds=time.monotonic() - chat_started,
             usage=usage,
+            requested_model=model_provenance["requested_model"],
+            resolved_model=model_provenance["resolved_model"],
+            model_resolution=model_provenance["resolution_source"],
         )
     except Exception as exc:
         logger.error("Chat completed but ledger insert failed: %s", exc)
@@ -1961,6 +2155,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         "edge_id": edge_id,
         "reply": reply,
         "usage": usage,
+        "requested_model": model_provenance["requested_model"],
+        "resolved_model": model_provenance["resolved_model"],
+        "model_resolution": model_provenance["resolution_source"],
     }
     if recovery_warning:
         response["warning"] = recovery_warning
@@ -2689,6 +2886,87 @@ def _apply_soul_inheritance(child, inherit_soul: bool) -> None:
     setattr(child, "_cached_system_prompt", None)
 
 
+_INHERITED_CONTEXT_MESSAGE_LIMIT = 20
+_INHERITED_CONTEXT_CHAR_LIMIT = 12_000
+_NO_TOOLSETS_SENTINEL = "__herald_model_only__"
+
+
+def _compose_subagent_context(parent_agent, explicit_context, inherit_context: bool):
+    """Build opt-in bounded user/assistant context without copying tool state."""
+    if not inherit_context:
+        return explicit_context
+
+    messages = getattr(parent_agent, "_session_messages", None)
+    if not isinstance(messages, list):
+        messages = []
+    rendered: List[str] = []
+    for message in messages[-_INHERITED_CONTEXT_MESSAGE_LIMIT:]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        content = content.strip()
+        if content:
+            rendered.append(f"Parent {role}: {content}")
+
+    transcript = "\n".join(rendered)
+    if len(transcript) > _INHERITED_CONTEXT_CHAR_LIMIT:
+        transcript = transcript[-_INHERITED_CONTEXT_CHAR_LIMIT:]
+    sections = []
+    if transcript:
+        sections.append("Recent parent conversation (opt-in, text only):\n" + transcript)
+    if explicit_context:
+        sections.append("Explicit task context:\n" + str(explicit_context))
+    return "\n\n".join(sections) or None
+
+
+def _resolve_subagent_toolsets(toolsets, inherit_toolsets: bool):
+    """Map public inheritance semantics onto core's truthy-list API."""
+    if toolsets is None:
+        return None if inherit_toolsets else [_NO_TOOLSETS_SENTINEL]
+    if not isinstance(toolsets, list) or not all(
+        isinstance(item, str) and item.strip() for item in toolsets
+    ):
+        raise ValueError("'toolsets' must be an array of non-empty strings.")
+    if not toolsets:
+        # Core treats [] as omitted. A truthy unknown name intersects to [],
+        # which AIAgent correctly interprets as no enabled toolsets.
+        return [_NO_TOOLSETS_SENTINEL]
+    return toolsets
+
+
+def _enforce_subagent_toolset_policy(child, requested_toolsets) -> None:
+    """Remove core-added toolsets so an explicit child subset remains exact."""
+    requested = {
+        str(name) for name in (requested_toolsets or [])
+        if str(name) != _NO_TOOLSETS_SENTINEL
+    }
+    built_toolsets = [
+        str(name) for name in (getattr(child, "enabled_toolsets", None) or [])
+    ]
+    enabled = [name for name in built_toolsets if name in requested]
+    disabled = list(getattr(child, "disabled_toolsets", None) or [])
+    for name in built_toolsets:
+        if name not in enabled and name not in disabled:
+            disabled.append(name)
+
+    from model_tools import get_tool_definitions
+
+    child.enabled_toolsets = enabled
+    child.disabled_toolsets = disabled
+    child.tools = get_tool_definitions(
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
+        quiet_mode=True,
+    )
+    child.valid_tool_names = {
+        tool["function"]["name"] for tool in (child.tools or [])
+    }
+    child._cached_system_prompt = None
+
+
 def _resolve_parent_agent(parent_agent=None):
     """Resolve the live commissioning agent without guessing across sessions.
 
@@ -2737,6 +3015,18 @@ def _resolve_parent_agent(parent_agent=None):
         return None
 
 
+def _capture_subagent_routing(parent_agent) -> dict:
+    """Capture task-local completion ownership before spawning the child thread."""
+    from .callback import capture_session_routing
+
+    routing = capture_session_routing(parent_agent)
+    return {
+        "session_id": str(routing.get("session_id") or ""),
+        "session_key": str(routing.get("session_key") or ""),
+        "origin_ui_session_id": str(routing.get("origin_ui_session_id") or ""),
+    }
+
+
 def handle_delegate_subagent(args: dict, **kwargs) -> str:
     """Spawn an in-process subagent with per-call model and timeout policy.
 
@@ -2752,9 +3042,9 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
 
     goal = args.get("goal", "")
     model_name = args.get("model", "")
-    context = args.get("context")
     inherit_soul = args.get("inherit_soul", False) is True
-    toolsets = args.get("toolsets")
+    inherit_context = args.get("inherit_context", False) is True
+    inherit_toolsets = args.get("inherit_toolsets", True) is not False
     parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
 
     if not goal.strip():
@@ -2770,6 +3060,16 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
             "detached results. No child was started. Use llm_call when a "
             "synchronous result is required."
         )
+
+    context = _compose_subagent_context(
+        parent_agent, args.get("context"), inherit_context,
+    )
+    try:
+        toolsets = _resolve_subagent_toolsets(
+            args.get("toolsets"), inherit_toolsets,
+        )
+    except ValueError as e:
+        return _tool_error(str(e))
 
     # Resolve the model to a credential bundle
     try:
@@ -2823,6 +3123,8 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         # SOUL.md is loaded from the active profile, while project context,
         # USER.md, memory, and parent conversation history remain excluded.
         _apply_soul_inheritance(child, inherit_soul)
+        if toolsets is not None:
+            _enforce_subagent_toolset_policy(child, toolsets)
     except Exception as e:
         return _tool_error(f"Failed to build subagent: {type(e).__name__}: {e}")
 
@@ -2830,16 +3132,11 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
     effective_model = creds["model"] or getattr(parent_agent, "model", "?")
     start_time = time.time()
 
-    # Capture session routing identifiers BEFORE spawning the thread —
-    # env vars and session state can change between dispatch and delivery.
-    session_id = os.environ.get("HERMES_SESSION_ID", "")
-    try:
-        from tools.approval import get_current_session_key
-        session_key = get_current_session_key(default="")
-    except Exception:
-        session_key = ""
-    if not session_key:
-        session_key = os.environ.get("HERMES_SESSION_KEY", "") or session_id
+    # Capture task-local routing identifiers BEFORE spawning the thread.
+    routing = _capture_subagent_routing(parent_agent)
+    session_id = routing["session_id"]
+    session_key = routing["session_key"]
+    origin_ui_session_id = routing["origin_ui_session_id"]
 
     # Record in state file for provenance (task 5)
     with _state_lock:
@@ -2849,7 +3146,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
             "profile": "in-process",
             "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "message_preview": goal[:120],
-            "session_id": os.environ.get("HERMES_SESSION_ID", ""),
+            "session_id": session_id,
             "model": effective_model,
             "status": "running",
             "completed_at": "",
@@ -2918,6 +3215,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                     "completed_at": time.time(),
                     "session_id": session_id,
                     "session_key": session_key,
+                    "origin_ui_session_id": origin_ui_session_id,
                 }
                 process_registry.completion_queue.put(evt)
             except ImportError:
@@ -2952,6 +3250,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                     "completed_at": time.time(),
                     "session_id": session_id,
                     "session_key": session_key,
+                    "origin_ui_session_id": origin_ui_session_id,
                 }
                 process_registry.completion_queue.put(evt)
             except ImportError:

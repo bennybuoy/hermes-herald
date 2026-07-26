@@ -42,7 +42,7 @@ Do not use Herald for non-Hermes A2A peers. Use Hermes's A2A tooling for Agent C
 | Audit calls or inspect topology | `dispatch_status` | Queries SQLite; full task text is opt-in |
 | Cancel a target run | `cancel_dispatch` | Cooperative; also retires the local listener after target stop succeeds |
 | Check target reachability | `ping_profile` | Liveness, not model-route authorization |
-| Discover safe model aliases | `list_profile_models` | Call before using `dispatch_agent(model=...)` |
+| Discover safe model aliases | `list_profile_models` | Call before using either dispatch tool with `model=...` |
 | Resolve a relayed protected command | `approve_dispatch` | Requires the fresh Herald approval ID and human confirmation |
 
 ## Installation and Configuration
@@ -67,13 +67,13 @@ hermes_herald:
       url: http://127.0.0.1:8651
       api_key: ${REVIEWER_API_KEY}
       capabilities: [dispatch, chat]
-      # Optional async default for dispatch_agent only:
+      # Optional exact model_routes alias for both dispatch tools:
       # model: reviewer-fast
   # Optional; defaults to <active HERMES_HOME>/hermes-herald-runs.json
   # state_file: /custom/private/path/hermes-herald-runs.json
   # Optional durable audit DB; share only across same-filesystem origins:
   # ledger_file: /custom/private/path/hermes-herald-network.db
-  # Optional dispatch_chat default, in seconds:
+  # Optional dispatch_chat activity-stall default, in seconds:
   chat_timeout: 600
 ```
 
@@ -90,7 +90,7 @@ ping_profile(profile="reviewer")
 list_profile_models(profile="reviewer")
 ```
 
-`ping_profile` establishes reachability. `list_profile_models` authenticates to the target and returns exact `model_routes` aliases that may be supplied to `dispatch_agent`.
+`ping_profile` establishes reachability. `list_profile_models` authenticates to the target and returns exact `model_routes` aliases that may be supplied to `dispatch_agent` or `dispatch_chat`.
 
 ### 2. Write a self-contained brief
 
@@ -114,7 +114,7 @@ A target's final summary is a self-report. Read back files, fetch URLs, inspect 
 `dispatch_agent` POSTs a new run to a configured target and returns a `run_id` immediately. The target run has its own session, model, skills, memory, and tools.
 
 - An explicit `model` must be an exact target `model_routes` alias advertised by authenticated `GET /v1/models`.
-- A profile-level `model` is the default only for async `dispatch_agent`.
+- A profile-level `model` is the default for both `dispatch_agent` and `dispatch_chat`.
 - If neither is present, Herald omits the model field and preserves the target's normal default.
 - Auto-delivery requires a commissioning session that supports detached results and a live origin process.
 - `delivery="none"` requires neither: no listener or callback is created. Preserve incoming `trace_id`/`max_hops`, set `parent_edge_id`, and pass incoming `hop_count` as `parent_hop` when forwarding detached graph work.
@@ -122,13 +122,13 @@ A target's final summary is a self-report. Read back files, fetch URLs, inspect 
 
 ## Directed Routes and Audit Ledger
 
-- Routes are per-origin allowlists. A target in A's config grants A→B only; B→A requires a separate entry in B's config.
+- Routes are caller-side outbound policy. A target in A's config grants calls through Herald from A→B only; B→A requires a separate outbound entry in B's config.
 - Standard profile names are inferred from `HERMES_HOME`; set `origin_name` for custom/Docker homes so ledger attribution is not merely `custom`.
-- `capabilities: [dispatch]`, `[chat]`, or `[dispatch, chat]` gates each outbound route. Omitted capabilities retain both for v1 compatibility.
+- `capabilities: [dispatch]`, `[chat]`, or `[dispatch, chat]` gates each outbound route. Missing or malformed capabilities grant nothing.
 - There is no wildcard "all profiles" route.
 - Self-routing needs both a matching profile entry and `allow_self: true`; otherwise it fails before network contact.
 - Async graphs have no mandatory depth cap. Optional `max_hops` is a per-trace loop brake for detached or callback chains; Herald increments `parent_hop` and refuses an over-budget edge before network contact. Ping-pong consumes one hop per edge. Treat this model-carried context as an operational guardrail, not a cryptographic security boundary.
-- These are Herald tool controls, not a sandbox. The target bearer key is the actual API authority.
+- These are enforced Herald caller-side controls, not authenticated target-side caller identity. The target bearer key is the actual API authority; a key holder can bypass Herald through direct HTTP or terminal tools.
 - SQLite stores full task text, instructions, origin/target, delivery mode, trace/hop lineage, model provenance, status, and timestamps. Existing bounded JSON history is imported once; migrated rows are labelled `legacy_state_cache` because only previews survived. Configured transport keys are excluded, but secrets placed inside task text are not detectable and will be stored.
 - A recovery-state write failure after a remote side effect is non-fatal: the handle and ledger edge are retained and the tool response carries a warning.
 - `dispatch_status(include_messages=false, include_topology=true)` is the safe default. Set `include_messages=true` only when full briefs are needed.
@@ -142,9 +142,11 @@ Use `dispatch_chat` for synchronous dialogue where later messages depend on prio
 
 - Calls reuse one target session per configured profile name.
 - `new_session=true` creates and stores a fresh target session.
-- `timeout` overrides `hermes_herald.chat_timeout` for that call.
-- `instructions` is sent as `system_message` for the current request; resend it when later turns still require it.
-- Herald v1 does not support a model override on persistent chat. A supplied model or profile-level `model` causes the call to fail before creating a session or sending a message.
+- The target streams assistant deltas and tool lifecycle events; activity resets the stall timer and is surfaced to the parent UI when it exposes a progress callback.
+- `stall_timeout_seconds` (or deprecated alias `timeout`) overrides `hermes_herald.chat_timeout`. It is an inactivity threshold, not a flat wall-clock cap; productive calls may run longer.
+- `instructions` is sent as a system message for the current request; resend it when later turns still require it.
+- An explicit or profile-level `model` must be an exact target `model_routes` alias verified through authenticated `/v1/models`. Omission preserves the target default.
+- Persistent chat returns one final reply and blocks the current origin agent turn; it does not create a separately pollable Herald run.
 - If a saved target session returns 404, retry deliberately with `new_session=true`.
 
 ## `delegate_subagent`
@@ -156,8 +158,10 @@ delegate_subagent(
   goal="Review the current diff. Do not edit.",
   model="gpt-5",
   context="Repo: /path; constraints: ...",
+  inherit_context=true,
   inherit_soul=true,
-  toolsets=["terminal", "file"],
+  inherit_toolsets=false,
+  toolsets=["file", "terminal"],
   stall_timeout_seconds=600,
   interrupt_after_seconds=1800
 )
@@ -169,7 +173,9 @@ Key contracts:
 - It returns a `task_id` immediately and auto-delivers the final summary or error.
 - It runs in a daemon background thread and dies with the parent process.
 - Bare and full model names pass through Hermes's model-switch pipeline.
+- `inherit_context=true` copies only a bounded recent parent user/assistant text window (20 messages, 12,000 characters). System prompts, tool calls/results, memory, and hidden state are excluded. Explicit `context` is always included.
 - `inherit_soul=true` loads the active profile's full `SOUL.md` as primary identity. It remains off by default and does not inherit conversation history, `USER.md`, memory, or project context files.
+- `inherit_toolsets=true` is the default when `toolsets` is omitted. Set it false plus `toolsets=[]` for a model-only child, or request an explicit subset; requested tools are intersected with parent capabilities and blocked child surfaces remain unavailable. An explicit list is exact: parent MCP toolsets are stripped unless named in that list, overriding core's global MCP-preservation default for this child.
 - `stall_timeout_seconds` is activity-based and defaults to 600 seconds.
 - `interrupt_after_seconds` is an optional wall-clock threshold that requests cooperative interruption, stops waiting, and reports timeout. It cannot immediately terminate a blocking provider or tool call.
 - Hermes core's global `delegation.child_timeout_seconds` must be unset or `0`; otherwise Herald refuses to launch because core could preempt the per-call policy.
@@ -232,9 +238,9 @@ Safety and scope:
 3. Inspect `dispatch_status` for persisted provenance.
 4. Reconcile the existing run; do not redispatch blindly.
 
-### Persistent chat rejects model configuration
+### Persistent chat rejects a model alias
 
-Remove `model` from that target's `hermes_herald.profiles` entry, or use `dispatch_agent` with a verified model alias instead.
+Call `list_profile_models(profile=...)` and use one of the exact advertised route aliases. The target's primary identity or an arbitrary provider/model slug is not sufficient unless it is also declared as a route alias. Omit `model` to use the target default.
 
 ### Approval notice does not arrive
 

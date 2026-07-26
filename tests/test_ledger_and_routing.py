@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -111,9 +112,9 @@ def test_previews_are_bounded(ledger_file):
     assert len(row["output_preview"]) == 500
 
 
-def test_route_capabilities_default_and_fail_closed(monkeypatch):
+def test_route_capabilities_require_explicit_grants_and_fail_closed(monkeypatch):
     monkeypatch.setattr(config, "_load_config", lambda: {"profiles": {"p": {}}})
-    assert config.get_route_capabilities("p") == ["dispatch", "chat"]
+    assert config.get_route_capabilities("p") == []
     monkeypatch.setattr(
         config,
         "_load_config",
@@ -215,10 +216,11 @@ def test_chat_recovery_state_failure_returns_reply_and_records_ledger(monkeypatc
         lambda profile, operation=None: ({"url": "http://target", "api_key": "secret"}, None),
     )
     monkeypatch.setattr(tools, "_preflight_dispatch_ledger", lambda: None)
-    monkeypatch.setattr(tools, "_post_json", lambda *a, **k: {
+    monkeypatch.setattr(tools, "_post_streaming_chat", lambda *a, **k: {
         "session_id": "session-1",
-        "message": {"content": "the reply"},
-        "usage": {"input_tokens": 3, "output_tokens": 2},
+        "reply": "the reply",
+        "model": "hermes-agent",
+        "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
     })
     monkeypatch.setattr(tools, "_load_state", lambda: (_ for _ in ()).throw(OSError("disk full")))
     monkeypatch.setattr(tools, "_record_dispatch_ledger", lambda **kw: recorded.append(kw))
@@ -233,3 +235,95 @@ def test_chat_recovery_state_failure_returns_reply_and_records_ledger(monkeypatc
     assert "recovery state" in result["warning"]
     assert recorded[0]["dispatch_type"] == "chat"
     assert recorded[0]["output_preview"] == "the reply"
+
+
+def test_chat_progress_uses_exact_resolved_parent_without_injected_kwarg(monkeypatch):
+    progress_events = []
+    parent = SimpleNamespace(
+        tool_progress_callback=lambda *args, **kwargs: progress_events.append(
+            (args, kwargs)
+        )
+    )
+
+    def fake_stream(*_args, **kwargs):
+        kwargs["progress_callback"](
+            "hermes.tool.progress",
+            {"status": "running", "tool": "terminal", "label": "Running terminal"},
+        )
+        return {
+            "session_id": "session-1",
+            "reply": "done",
+            "model": "hermes-agent",
+            "usage": {},
+        }
+
+    monkeypatch.setattr(
+        tools, "_resolve_profile",
+        lambda profile, operation=None: ({"url": "http://target", "api_key": "secret"}, None),
+    )
+    monkeypatch.setattr(tools, "_preflight_dispatch_ledger", lambda: None)
+    monkeypatch.setattr(tools, "_resolve_parent_agent", lambda supplied=None: parent)
+    monkeypatch.setattr(tools, "_post_streaming_chat", fake_stream)
+    monkeypatch.setattr(tools, "_load_state", lambda: {"runs": []})
+    monkeypatch.setattr(tools, "_save_state", lambda state: None)
+    monkeypatch.setattr(tools, "_record_dispatch_ledger", lambda **kwargs: None)
+    monkeypatch.setattr(callback, "get_profile_session_id", lambda profile: "session-1")
+    monkeypatch.setattr(callback, "capture_session_routing", lambda parent=None: {})
+
+    result = json.loads(tools.handle_dispatch_chat({
+        "profile": "target",
+        "message": "run a tool",
+    }))
+
+    assert result["status"] == "completed"
+    assert progress_events == [(("tool.started",), {
+        "tool_name": "terminal",
+        "preview": "[target] Running terminal",
+    })]
+
+
+def test_new_chat_sessions_use_unique_human_readable_titles(monkeypatch):
+    """Repeated new_session calls must not collide with Hermes title uniqueness."""
+    titles = []
+    created = iter(("session-1", "session-2"))
+
+    def fake_post_json(_url, _key, body, **_kwargs):
+        titles.append(body["title"])
+        return {"session": {"id": next(created)}}
+
+    monkeypatch.setattr(
+        config,
+        "get_profile_config",
+        lambda profile: {
+            "url": "http://target.invalid",
+            "api_key": "transport-key",
+            "capabilities": ["chat"],
+        },
+    )
+    monkeypatch.setattr(config, "get_route_capabilities", lambda profile: ["chat"])
+    monkeypatch.setattr(tools, "_post_json", fake_post_json)
+    monkeypatch.setattr(tools, "_post_streaming_chat", lambda *a, **k: {
+        "session_id": k["session_id"],
+        "reply": "ok",
+        "model": "hermes-agent",
+        "usage": {},
+    })
+    monkeypatch.setattr(tools, "_load_state", lambda: {"runs": []})
+    monkeypatch.setattr(tools, "_save_state", lambda state: None)
+    monkeypatch.setattr(tools, "_record_dispatch_ledger", lambda **kwargs: None)
+    monkeypatch.setattr(callback, "get_profile_session_id", lambda profile: "")
+    monkeypatch.setattr(callback, "store_profile_session_id", lambda *args: None)
+    monkeypatch.setattr(callback, "capture_session_routing", lambda parent=None: {})
+
+    for _ in range(2):
+        result = json.loads(tools.handle_dispatch_chat({
+            "profile": "target",
+            "message": "hello",
+            "new_session": True,
+        }))
+        assert result["status"] == "completed"
+
+    assert len(titles) == 2
+    assert titles[0].startswith("Dispatch to target · ")
+    assert titles[1].startswith("Dispatch to target · ")
+    assert titles[0] != titles[1]

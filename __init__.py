@@ -2,7 +2,7 @@
 
 Three dispatch modes:
   - dispatch_agent: async, SSE callback, verified target model_routes aliases
-  - dispatch_chat: sync, session-persistent, target default model only
+  - dispatch_chat: sync, streamed, session-persistent, verified model aliases
   - delegate_subagent: in-process subagent with per-call model and timeout policy
 
 Inference:
@@ -21,7 +21,7 @@ Config (config.yaml):
       reviewer:
         url: http://localhost:8651
         api_key: ${REVIEWER_API_KEY}
-        model: reviewer-fast  # optional dispatch_agent model_routes alias
+        model: reviewer-fast  # optional exact model_routes alias for both dispatch tools
     state_file: /custom/private/path/hermes-herald-runs.json  # optional
 """
 

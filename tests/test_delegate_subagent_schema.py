@@ -28,6 +28,12 @@ def test_delegate_subagent_schema_matches_async_handler():
     assert properties["inherit_soul"]["type"] == "boolean"
     assert properties["inherit_soul"]["default"] is False
     assert "full SOUL.md" in properties["inherit_soul"]["description"]
+    assert properties["inherit_context"]["type"] == "boolean"
+    assert properties["inherit_context"]["default"] is False
+    assert "user/assistant" in properties["inherit_context"]["description"]
+    assert properties["inherit_toolsets"]["type"] == "boolean"
+    assert properties["inherit_toolsets"]["default"] is True
+    assert "model-only" in properties["inherit_toolsets"]["description"]
     assert "hard_timeout_seconds" not in properties
     assert properties["interrupt_after_seconds"]["minimum"] == 30
     assert "cooperative" in properties["interrupt_after_seconds"]["description"]
@@ -113,6 +119,30 @@ def test_parent_agent_resolution_is_exact_and_fails_closed(monkeypatch):
     assert tools._resolve_parent_agent(explicit) is explicit
 
 
+def test_subagent_routing_uses_task_local_capture_not_stale_environment(monkeypatch):
+    from hermes_herald import callback
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-process-session")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "stale-process-key")
+    monkeypatch.setattr(
+        callback,
+        "capture_session_routing",
+        lambda parent_agent=None: {
+            "session_id": "context-session",
+            "session_key": "context-key",
+            "origin_ui_session_id": "ui-session-9",
+        },
+    )
+
+    routing = tools._capture_subagent_routing(SimpleNamespace(session_id="parent"))
+
+    assert routing == {
+        "session_id": "context-session",
+        "session_key": "context-key",
+        "origin_ui_session_id": "ui-session-9",
+    }
+
+
 def test_timeout_policy_parses_cooperative_interrupt_name():
     stall, interrupt = tools._parse_subagent_timeout_policy(
         {"stall_timeout_seconds": 45, "interrupt_after_seconds": 90},
@@ -165,3 +195,75 @@ def test_soul_inheritance_is_opt_in_and_invalidates_cached_prompt():
     tools._apply_soul_inheritance(child, True)
     assert child.load_soul_identity is True
     assert child._cached_system_prompt is None
+
+
+def test_parent_context_inheritance_is_opt_in_bounded_and_excludes_tools():
+    parent = SimpleNamespace(_session_messages=[
+        {"role": "system", "content": "hidden system"},
+        {"role": "user", "content": "original question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "secret"}]},
+        {"role": "tool", "content": "sensitive tool output"},
+        {"role": "user", "content": "follow-up"},
+    ])
+
+    assert tools._compose_subagent_context(parent, "explicit facts", False) == "explicit facts"
+    inherited = tools._compose_subagent_context(parent, "explicit facts", True)
+
+    assert "Parent user: original question" in inherited
+    assert "Parent assistant: first answer" in inherited
+    assert "Parent user: follow-up" in inherited
+    assert "Explicit task context:\nexplicit facts" in inherited
+    assert "hidden system" not in inherited
+    assert "sensitive tool output" not in inherited
+    assert "secret" not in inherited
+
+    oversized = SimpleNamespace(_session_messages=[
+        {"role": "user", "content": str(index) + "x" * 1000}
+        for index in range(30)
+    ])
+    bounded = tools._compose_subagent_context(oversized, None, True)
+    assert len(bounded) <= tools._INHERITED_CONTEXT_CHAR_LIMIT + 100
+    assert "Parent user: 29" in bounded
+    assert "Parent user: 0" not in bounded
+
+
+def test_toolset_inheritance_can_be_disabled_or_explicitly_emptied():
+    assert tools._resolve_subagent_toolsets(None, True) is None
+    assert tools._resolve_subagent_toolsets(None, False) == [tools._NO_TOOLSETS_SENTINEL]
+    assert tools._resolve_subagent_toolsets([], True) == [tools._NO_TOOLSETS_SENTINEL]
+    assert tools._resolve_subagent_toolsets(["web", "file"], False) == ["web", "file"]
+
+    with pytest.raises(ValueError, match="toolsets"):
+        tools._resolve_subagent_toolsets("web", True)
+
+
+def test_post_build_toolset_policy_removes_core_preserved_mcp(monkeypatch):
+    child = SimpleNamespace(
+        enabled_toolsets=["mcp-demo"],
+        disabled_toolsets=[],
+        tools=[{"function": {"name": "mcp_secret"}}],
+        valid_tool_names={"mcp_secret"},
+        _cached_system_prompt="stale",
+    )
+    rebuilds = []
+
+    import model_tools
+
+    def rebuild(*, enabled_toolsets, disabled_toolsets, quiet_mode):
+        rebuilds.append((enabled_toolsets, disabled_toolsets, quiet_mode))
+        return []
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", rebuild)
+
+    tools._enforce_subagent_toolset_policy(
+        child,
+        [tools._NO_TOOLSETS_SENTINEL],
+    )
+
+    assert child.enabled_toolsets == []
+    assert "mcp-demo" in child.disabled_toolsets
+    assert child.tools == []
+    assert child.valid_tool_names == set()
+    assert child._cached_system_prompt is None
+    assert rebuilds == [([], ["mcp-demo"], True)]

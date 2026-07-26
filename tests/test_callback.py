@@ -701,6 +701,34 @@ class TestSSERecovery:
 
 
 class TestActivityAwarePolling:
+    def test_rfc3339_updated_at_resets_activity_without_crashing(self):
+        responses = [
+            _FakeJSONResponse({
+                "status": "running",
+                "updated_at": "2026-07-26T12:34:56+00:00",
+            }),
+            _FakeJSONResponse({
+                "status": "completed",
+                "updated_at": "2026-07-26T12:34:57Z",
+                "output": "done",
+                "usage": {},
+            }),
+        ]
+        with patch.object(
+            callback, "urlopen", side_effect=responses
+        ), patch.object(
+            callback.time, "sleep"
+        ), patch.object(callback, "_STALL_TIMEOUT", 10):
+            result = callback._poll_run_status(
+                "run-rfc3339", "reviewer", "http://target", "secret",
+                "preview", "session", "session-key", "", "",
+                start_time=1.0, poll_start=callback.time.time(),
+            )
+
+        assert result is not None
+        assert result["status"] == "completed"
+        assert result["summary"] == "done"
+
     def test_stall_fires_when_updated_at_stops_advancing(self):
         running = {"status": "running", "updated_at": 1.0}
         times = iter([1.0, 1.0, 1.0, 2.0])

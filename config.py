@@ -72,8 +72,8 @@ def get_profile_config(profile: str) -> Optional[Dict[str, Any]]:
 
     Returns ``None`` if the profile is not configured. The returned dict
     has keys: ``url``, ``api_key``, and optionally ``model``. The model value
-    is an exact target ``model_routes`` alias for ``dispatch_agent``; it is not
-    an arbitrary model name and is incompatible with ``dispatch_chat``.
+    is an exact target ``model_routes`` alias accepted by ``dispatch_agent``
+    and ``dispatch_chat``; it is not an arbitrary model name.
     """
     cfg = _load_config()
     profiles = cfg.get("profiles", {})
@@ -109,17 +109,17 @@ def get_active_profile_name() -> str:
 
 
 def get_route_capabilities(profile: str) -> list[str]:
-    """Return allowed originating operations for one configured target.
+    """Return explicitly allowed outbound operations for one configured target.
 
-    Existing v1 entries without ``capabilities`` retain both operations.
-    Unknown capability names are ignored so they cannot accidentally grant a
-    route that Herald does not implement.
+    Missing or malformed grants fail closed. Unknown capability names are
+    ignored so they cannot accidentally grant a route Herald does not implement.
+    This is caller-side policy, not target-side caller authentication.
     """
     cfg = _load_config()
     entry = (cfg.get("profiles") or {}).get(profile) or {}
     raw = entry.get("capabilities")
     if raw is None:
-        return ["dispatch", "chat"]
+        return []
     if not isinstance(raw, list):
         return []
     allowed = {str(item).strip().lower() for item in raw}
@@ -178,7 +178,7 @@ def get_ledger_file_path() -> Path:
 
 
 def get_chat_timeout() -> float:
-    """Return the default dispatch_chat timeout in seconds.
+    """Return the default dispatch_chat activity-stall timeout in seconds.
 
     Configured via ``hermes_herald.chat_timeout`` in config.yaml.
     Defaults to 600 (10 minutes) — agentic tasks with tool calls can take a while.

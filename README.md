@@ -9,549 +9,487 @@
   <img src="https://img.shields.io/badge/tools-11-orange" alt="11 Tools">
 </p>
 
-> **Your agents shouldn't just talk to you. They should talk to each other.**
+> **Your agents should not just talk to you. They should be able to talk to each other.**
 
-Hermes Herald turns Hermes Agent from a solo operator into a **conductor of agents**. It adds three independent capabilities:
+Hermes Herald turns one Hermes Agent into a **conductor of specialist agents and models**. It adds three capabilities that Hermes users otherwise have to wire together themselves:
 
-| Capability | What it gives you |
+| Herald adds | Why you would want it |
 |---|---|
-| **📡 Agent-to-agent conversation** | Talk to named, separately configured Hermes profiles over authenticated API endpoints. Keep a multi-turn session or fan tasks out asynchronously. |
-| **🔀 Per-call subagent models** | Spawn an isolated in-process subagent with the model best suited to one task, without changing the parent agent's runtime. |
-| **🧠 Bare LLM inference** | Run classification, translation, summarisation, extraction, and scoring without loading an agent loop or tool schemas. |
+| **📡 A network of named Hermes agents** | Ask another profile a question, continue the conversation later, or send independent work to several specialists in parallel. Each target keeps its own identity, memory, skills, credentials, tools, and runtime. |
+| **🔀 A model switchboard for subagents** | Spawn a local child with the model, context, SOUL identity, and tool access appropriate to this one task—without changing the parent agent. |
+| **🧠 A lightweight inference lane** | Use a model for classification, extraction, translation, scoring, or JSON generation without paying for an agent loop and a large tool schema. |
 
-The headline feature is genuine inter-agent dialogue. Agent A can ask Agent B a question, receive an answer, ask a follow-up, and get a response with the earlier session history. For independent work, asynchronous dispatch returns immediately and delivers the result later through Hermes's Runs API and SSE event stream.
+These are independent. You can use Herald only for `llm_call`, only for model-selectable subagents, or build a multi-host network of persistent specialist profiles.
 
-Why use separate agents instead of one enormous prompt?
+## Why Herald?
 
-- **Isolation:** each target keeps its own model, skills, memory, tool permissions, credentials, and operating context.
-- **Continuity:** `dispatch_chat` gives a named profile a reusable conversation instead of a fresh anonymous worker every turn.
-- **Parallelism:** dispatch several independent runs and keep the origin agent available while they work.
-- **Fit-for-purpose models:** reserve an expensive reasoning model for the tasks that need it and use faster models for reviews, extraction, or classification.
-- **Operational control:** discover models, inspect persisted run metadata, poll, batch-collect, cancel, and relay protected-command approvals.
-- **Credential separation:** Herald sends a transport bearer token to the target API; the target's upstream model credentials stay on the target.
+A single giant agent prompt is convenient until different jobs need different identities, memories, credentials, tools, costs, or trust boundaries.
 
-All three pillars work independently. Use `llm_call` without configuring another profile, use `delegate_subagent` without dispatching anywhere, or build a network of specialist Hermes agents that can talk to one another. Herald does not replace Hermes profile or provider setup: every target must already be a working Hermes profile.
+Herald lets you build systems such as:
+
+- a coordinator that sends code, security, and documentation reviews to separate specialists in parallel;
+- a teacher agent that maintains an ongoing conversation with a curriculum expert;
+- a local reasoning agent that delegates mechanical inspection to a faster model;
+- several Hermes installations connected over Tailscale, each retaining its own environment and credentials;
+- an autonomous workflow whose calls, model choices, lineage, status, and results remain queryable after the originating turn;
+- a high-volume classifier that uses bare inference rather than loading terminal, browser, and file tools for every item.
+
+Herald is not a replacement for Hermes profiles or provider configuration. It is the **control plane between them**.
 
 ---
 
-## Quick Start
+## Choose the right execution mode
 
-### 1. Install and enable Herald on the origin profile
+This is the most important distinction in Herald:
+
+| What you need | Use | Returns | Context and lifetime | Model choice |
+|---|---|---|---|---|
+| A conversation with a named specialist | `dispatch_chat` | Final reply; blocks the current agent turn | Reuses a persistent target session; streamed activity resets the stall timer | Target default or a verified target `model_routes` alias |
+| Independent work on another Hermes profile | `dispatch_agent` | `run_id` immediately | Fresh target session; monitored by SSE/polling or explicitly detached | Target default or a verified target `model_routes` alias |
+| A local child agent with a different model | `delegate_subagent` | `task_id` immediately; result returns asynchronously | In-process and non-durable; context, SOUL, and tools are controlled per call | Any model resolvable through the parent Hermes runtime |
+| Classification, extraction, translation, scoring | `llm_call` | Text synchronously | No agent loop and no tools | Hermes provider/model routing |
+
+**Use `dispatch_chat` when your next decision depends on the target’s reply.**
+
+**Use `dispatch_agent` when the work is self-contained and the origin should remain available.**
+
+```python
+# Continue a real conversation with a named profile.
+dispatch_chat(profile="tutor", message="Explain decorators with one example")
+dispatch_chat(profile="tutor", message="Now adapt that example to cache results")
+
+# Fan independent work out without blocking the origin.
+dispatch_agent(profile="reviewer", message="Review the current diff. Do not edit.")
+dispatch_agent(profile="researcher", message="Find authoritative sources for the design.")
+
+# Choose a different local model and exactly what it inherits.
+delegate_subagent(
+    goal="Classify the test failures by likely root cause",
+    model="gpt-5",
+    inherit_context=True,
+    inherit_soul=True,
+    toolsets=[],
+)
+
+# Skip the agent machinery for a small inference job.
+llm_call(
+    messages=[{"role": "user", "content": "Return the sentiment: The fix worked perfectly."}],
+)
+```
+
+---
+
+## Five-minute setup
+
+### 1. Install Herald on an origin profile
 
 ```bash
 hermes plugins install bennybuoy/hermes-herald --enable
 ```
 
-Install Herald only on profiles that will **originate** calls. A target-only profile needs Hermes's API server, not this plugin. Restart the active Hermes process after installation: reopen a CLI/TUI session, or run `hermes gateway restart` for a gateway process.
+Install Herald on profiles that will **originate** calls. A target-only profile needs Hermes’s API server, not the plugin. Restart the process that loads the origin profile after installation.
 
-The unprefixed `hermes ...` commands below act on the current origin profile. If your origin is a named profile, prefix those commands with `hermes -p <origin>`.
+For a named origin, prefix the commands below with `hermes -p <origin>`.
 
-### 2. Prepare a target Hermes profile
-
-Create and set up the target normally. Skip creation if the profile already exists.
+### 2. Prepare a target profile
 
 ```bash
 hermes profile create tutor --description "A patient teaching specialist"
 hermes -p tutor setup
-```
 
-Generate a dedicated transport key, enable the target API server, and store the same key in the origin profile under a profile-specific name:
-
-```bash
 HERALD_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-
-# Target profile. The explicit `extra` path works across Hermes releases.
 hermes -p tutor config set --force gateway.platforms.api_server.enabled true
 hermes -p tutor config set --force gateway.platforms.api_server.extra.host 127.0.0.1
 hermes -p tutor config set --force gateway.platforms.api_server.extra.port 8652
 hermes -p tutor config set --force gateway.platforms.api_server.extra.key "$HERALD_KEY"
 
-# Origin profile — custom *_API_KEY names are stored in its .env
+# Store the same transport key in the origin profile's .env.
 hermes config set TUTOR_API_KEY "$HERALD_KEY"
 unset HERALD_KEY
 ```
 
-Start the target gateway in another terminal:
+Start the target gateway:
 
 ```bash
 hermes -p tutor gateway run
 ```
 
-For a background service, use `hermes -p tutor gateway install` followed by `hermes -p tutor gateway start` instead.
+For a background service, use `hermes -p tutor gateway install` and `hermes -p tutor gateway start`.
 
 > [!IMPORTANT]
-> The API-server key is a **transport bearer token**, not a model-provider key. It authorizes access to a terminal-capable Hermes agent. Use a unique random value per target, protect both profiles' local config files, never commit them, and expose the API only on loopback, a trusted private network, or behind TLS. Configure the target's model/provider credentials separately with `hermes -p tutor setup`.
+> The API key is a **bearer credential for a terminal-capable Hermes agent**, not a model-provider key. Use a unique random key per target trust boundary. Keep it out of Git and logs. Expose the API only on loopback, a trusted private network, or behind authenticated TLS.
 
-### 3. Map the target in the origin config
+### 3. Declare the origin’s outbound route
 
-Add a `hermes_herald` block to the origin profile's `config.yaml`:
+Add this to the origin profile’s `config.yaml`:
 
 ```yaml
 hermes_herald:
-  # Optional stable ledger identity for custom/Docker HERMES_HOME layouts.
-  # origin_name: marie
-  # Self-routing is blocked unless this is explicitly true.
+  # Optional when a custom/Docker HERMES_HOME cannot reveal the profile name.
+  # origin_name: coordinator
   allow_self: false
+
   profiles:
     tutor:
       url: http://127.0.0.1:8652
       api_key: ${TUTOR_API_KEY}
+      # Required explicit outbound grants. Missing/malformed means no calls.
       capabilities: [dispatch, chat]
-  # Optional: default timeout for dispatch_chat (seconds, default 600)
-  chat_timeout: 900
-  # Optional: omit for <active HERMES_HOME>/hermes-herald-runs.json
-  # state_file: /custom/private/path/hermes-herald-runs.json
-  # Durable audit ledger. Profiles on one filesystem may share this path.
-  # ledger_file: /custom/private/path/hermes-herald-network.db
+      # Optional exact target model_routes alias used by both dispatch tools.
+      # model: tutor-fast
+
+  # Activity-stall timeout for dispatch_chat, not a flat wall-clock deadline.
+  chat_timeout: 600
+
+  # Optional paths; defaults live under the active HERMES_HOME.
+  # state_file: /private/path/hermes-herald-runs.json
+  # ledger_file: /private/path/hermes-herald-network.db
 ```
 
-Do **not** put `model:` on a profile you intend to use with `dispatch_chat`. A profile-level model is an async `dispatch_agent` default, and Herald rejects it on the synchronous persistent-chat path rather than silently applying the wrong runtime.
+`capabilities` is deliberately fail-closed. Use `[dispatch]`, `[chat]`, or `[dispatch, chat]`.
 
 ### 4. Restart and verify
 
-Restart the origin Hermes process so it loads the plugin. Look for:
+Start a fresh origin session and look for:
 
-```
+```text
 hermes-herald: registered 11 tools
 ```
 
-Herald also bundles an opt-in operating skill. Load it explicitly when you
-want the agent to configure, choose between, or troubleshoot Herald's tools:
-
-```python
-skill_view(name="hermes-herald:agent-dispatch")
-```
-
-Then verify both reachability and authenticated model discovery:
+Then verify reachability and authenticated model discovery:
 
 ```python
 ping_profile(profile="tutor")
 list_profile_models(profile="tutor")
 ```
 
-`ping_profile` is a liveness check. `list_profile_models` also exercises bearer authentication and reports the target's advertised primary identity plus any exact aliases Herald can safely send to `dispatch_agent(model=...)`.
-
-### 5. Use it
+The plugin also bundles an opt-in operating skill:
 
 ```python
-# Ask the tutor a question
-dispatch_chat(profile="tutor", message="Explain Python decorators with a simple example")
-
-# Ask a follow-up — the tutor remembers the prior turn
-dispatch_chat(profile="tutor", message="Now show me one that caches results")
-
-# Fire off independent work — result arrives via SSE while this process is alive
-dispatch_agent(profile="tutor", message="Draft three practice questions about decorators")
-
-# Truly detached graph work — no callback/listener; inspect it later
-dispatch_agent(profile="tutor", message="Pass this down the chain", delivery="none")
-dispatch_status(include_topology=True, include_messages=False)
-
-# Spawn a subagent with a different model
-delegate_subagent(goal="Summarise this codebase", model="gemma4:31b")
-
-# Quick classification — no agent loop, just inference
-llm_call(messages=[{"role": "user", "content": "Is this email spam? Subject: 'WIN FREE iPhone'"}])
+skill_view(name="hermes-herald:agent-dispatch")
 ```
 
----
-
-## The Three Pillars
-
-Hermes Herald equips your agent with 11 tools across three independent pillars. Each works standalone — you can use `llm_call` without ever dispatching, or dispatch without ever spawning a subagent.
-
-### 📡 Pillar 1: Cross-Profile Dispatch
-
-Hermes core's `delegate_task` is excellent for anonymous in-process workers. Herald adds a tool-level control plane for **named profiles exposed through Hermes's authenticated API server**: reusable conversations, async runs, persisted run metadata, cancellation, model-alias discovery, and approval relay. Targets can be separate local profiles or remote Hermes installations.
-
-#### `dispatch_chat` — agents talking to agents
-
-`dispatch_chat` opens a synchronous connection to a target profile and blocks until the reply arrives. The critical difference: **subsequent calls to the same profile continue the same stored session.** The target receives the prior conversation history, subject to that target's normal retention and context-management behaviour.
-
-```
-Your Agent                    Tutor Profile
-   │                              │
-   ├─ "Explain decorators" ─────▶│  (turn 1)
-   │                              │
-   │ ◀──────────────── "Here's…" ┤
-   │                              │
-   ├─ "Show me a caching one" ───▶│  (turn 2 — remembers turn 1)
-   │                              │
-   │ ◀────────── "Use @lru_cache"┤
-   │                              │
-   ├─ "What about timeout?" ─────▶│  (turn 3 — same stored session)
-   │                              │
-```
-
-Set `new_session=true` to start fresh. Configurable per-call `timeout` (default 600s).
-
-#### `dispatch_agent` — monitored async or truly detached
-
-POSTs to the target's `/v1/runs` endpoint. With the default `delivery="callback"`, Herald opens an SSE stream and **automatically delivers** the terminal result to the current origin session. With `delivery="none"`, it starts the run without a listener or callback; use `check_dispatch` or `dispatch_status` later. Multiple dispatches in one turn run in parallel.
-
-Auto-delivery is process-bound: the origin Hermes process must remain alive. The durable SQLite ledger retains call provenance, while the bounded JSON state cache retains live recovery data such as session handles and approvals. If that recovery cache becomes unwritable after a remote side effect, Herald still returns the remote handle and records the ledger edge with an explicit warning. Herald does not recreate an old SSE listener or retroactively inject a result into a dead session.
-
-Detached calls receive a small `[HERALD ROUTING CONTEXT]` containing a generated `trace_id`, `edge_id`, and `hop_count`; callback calls receive it when a guarded chain opts into lineage. A forwarding agent preserves the trace and delivery mode, sets `parent_edge_id` to the incoming edge, and passes the incoming count as `parent_hop`; Herald performs the increment. Set optional `max_hops` on the first call to stop A→B→A ping-pong before the next edge exceeds the budget. Omit it for unlimited depth. This creates explicit graph lineage and an optional normal-flow loop brake without a Hermes core patch.
-
-```
-Your Agent                      Reviewer Profile
-   │                                 │
-   ├─ dispatch_agent ──────────────▶│ POST /v1/runs
-   │                                 │ (task starts)
-   │                                 │
-   │  ◀───────────── SSE stream ────┤ /v1/runs/{id}/events
-   │                                 │
-   │  [ASYNC DELEGATION COMPLETE]    │
-   │  result auto-delivered          │
-```
-
-If the SSE connection drops mid-run, the listener attempts to reconnect with exponential backoff:
-
-| Before connection attempt | Delay | Cumulative backoff |
-|---|---:|---:|
-| 2 | 5s | 5s |
-| 3 | 10s | 15s |
-| 4 | 20s | 35s |
-| 5 | 40s | 75s |
-
-Before each reconnection, Herald checks the run status via `GET /v1/runs/{run_id}` — if the run already reached a terminal state while disconnected, the result is delivered immediately without resubscribing to the non-replayable SSE queue.
-
-After five total failed connection attempts — the initial connection plus four reconnections, with ~75 seconds of cumulative backoff — the listener switches to authenticated `GET /v1/runs/{run_id}` polling. The polling fallback uses activity-based stall detection: each poll checks the target's `updated_at` timestamp, and if it has advanced since the last poll, the stall timer resets — just like activity events on the SSE path. A run whose target status keeps reporting activity should not hit the stall during a long polling session. If no activity is observed for 600 seconds (or 30 minutes while awaiting approval), a stall notification is delivered. Five consecutive polling transport failures also end local monitoring and tell you to reconcile with `check_dispatch`. If the stream is lost before a protected-command preview arrives, Herald refuses to approve the unseen command.
-
-While SSE is healthy, activity events (message deltas, tool calls, reasoning, or approval state changes) reset the 600-second stall timer. While waiting for approval, a separate 30-minute approval timeout applies. A silent tool can still outlive the listener; use `check_dispatch` to reconcile target state.
-
-#### `dispatch_agent` vs `dispatch_chat`
-
-| | `dispatch_agent` | `dispatch_chat` |
-|---|---|---|
-| **Mode** | Async; callback-monitored or explicitly detached | Sync (blocks until reply) |
-| **Session** | New target session per run; not reused by Herald | Persistent — continues the same stored conversation |
-| **Context** | Self-contained task; no Herald continuity across runs | Prior session history, subject to target retention/context limits |
-| **Result delivery** | `callback`: SSE auto-delivery with polling fallback; `none`: no callback | Return value — response is immediate |
-| **Model selection** | Optional exact `model_routes` alias, verified before dispatch | Herald v1 intentionally uses the target's default runtime |
-| **Parallelism** | Multiple dispatches run in parallel | Blocks the current turn |
-| **Best for** | Independent background tasks | Multi-turn inter-agent dialogue |
-
-**Use `dispatch_chat` for a back-and-forth conversation.** **Use `dispatch_agent` to fire off a self-contained task and keep working.**
-
-### 🔀 Pillar 2: In-Process Subagents
-
-Hermes core's `delegate_task` inherits the parent model — you can't pick a different model per subagent. The maintainers explicitly closed [issue #62731](https://github.com/NousResearch/hermes-agent/issues/62731) requesting this as "not-planned".
-
-`delegate_subagent` fills that gap. It accepts a `model` parameter — bare names like `opus`, `gpt-5`, `glm` work, as do full `vendor/model` slugs. If model resolution selects a different provider, Herald uses the resolved provider credentials; the same resolved provider reuses the parent's credentials.
-
-```python
-# Review code with a fast model while parent uses a reasoning model
-delegate_subagent(goal="Review auth.py for security issues", model="gemma4:31b")
-```
-
-The subagent runs in a daemon background thread with its own isolated context, terminal session, and toolset. Set `inherit_soul=true` to load the active parent profile's full `SOUL.md` as the child's primary identity. It is off by default and does not inherit conversation history, `USER.md`, memory, or project context files. Activity-based stall detection defaults to 600 seconds; tool events and streamed text reset it. An optional `interrupt_after_seconds` threshold requests cooperative interruption, stops waiting, and reports a timeout. It cannot guarantee immediate termination of a blocking provider or tool call. Local subagents are in-process and not durable across parent-process exit.
-
-`delegate_subagent` works in the classic interactive CLI and desktop/TUI. Herald resolves the exact commissioning TUI session rather than scanning for another live agent. Gateway and API plugin-dispatch paths do not expose a parent-agent context, so this tool fails closed there; cross-profile dispatch and `llm_call` remain available on those surfaces.
-
-> **Note:** Disable Hermes core's older global hard timeout so it can't preempt the plugin's per-call policy:
-> ```yaml
-> delegation:
->   child_timeout_seconds: 0
-> ```
-
-### 🧠 Pillar 3: Bare LLM Inference
-
-Completely separate from dispatch. `llm_call` doesn't touch profiles, API servers, SSE streams, or subagents. It's a direct inference call through Hermes's provider routing — no agent loop, no tool schemas, no terminal access, no subagent overhead.
-
-```python
-# Classification
-llm_call(messages=[{"role": "user", "content": "Is this email spam? Subject: 'WIN FREE iPhone'"}])
-
-# Translation
-llm_call(messages=[{"role": "user", "content": "Translate to French: 'Hello, how are you?'"}])
-
-# JSON extraction
-llm_call(
-    messages=[{"role": "user", "content": "Extract name and age from: 'John Smith is 32'"}],
-    json_mode=True
-)
-```
-
-**When to use which tool:**
-
-| Need | Tool |
-|-----|------|
-| Quick classification, translation, summarisation, scoring | `llm_call` |
-| Agent with tools and terminal access, different model | `delegate_subagent` |
-| Fire-and-forget task on a separate profile | `dispatch_agent` |
-| Multi-turn conversation with a named agent | `dispatch_chat` |
-
----
-
-## Tool Reference
-
-### Dispatch Tools
-
-#### `dispatch_agent`
-
-Async dispatch to a named profile. Returns a `run_id` immediately; result auto-delivered via SSE when complete if the origin process is still running.
-
-```python
-dispatch_agent(
-    profile="reviewer",           # required — target profile name
-    message="Review this PR",     # required — task message
-    instructions="You are a...",  # optional — system prompt override
-    model="reviewer-fast",        # optional — verified model_routes alias
-    delivery="none",              # optional — callback (default) or none
-    trace_id="existing-trace",    # optional — preserve when forwarding
-    parent_edge_id="incoming-edge", # optional — graph parent
-    parent_hop=2,                  # optional — incoming hop; Herald increments
-    max_hops=6                     # optional — omit for unlimited graph depth
-)
-```
-
-- Multiple `dispatch_agent` calls in one turn run in parallel.
-- `delivery="none"` is real fire-and-forget: it does not create a local listener and works from sessions that cannot accept async callbacks.
-- Every call is recorded in the SQLite ledger. Detached forwarding can preserve lineage to form a directed call graph; optional `max_hops` terminates repeated forwarding and ping-pong loops.
-- If `model` is specified, it must be an exact alias configured under the target's `model_routes`. The plugin verifies via `GET /v1/models` before starting the task. Unverifiable aliases fail closed.
-- If the origin restarts, use `dispatch_status` to recover the handle and `check_dispatch` to query the target; the previous listener is not recreated.
-
-#### `dispatch_chat`
-
-Sync dispatch with persistent session. Subsequent calls continue the same conversation.
+### 5. Talk to the target
 
 ```python
 dispatch_chat(
-    profile="tutor",              # required — target profile name
-    message="Explain decorators", # required — message to send
-    instructions="You are a...",  # optional — system prompt for this turn
-    new_session=False,            # optional — start fresh conversation
-    timeout=60                    # optional — per-call timeout in seconds
+    profile="tutor",
+    message="Explain Python decorators with a simple example",
 )
 ```
 
-- Calls to the same profile reuse the same target session until `new_session=True`.
-- `instructions` applies to the current turn. Resend it on later turns if it remains required.
-- Herald v1 always uses the target profile's default runtime on this path; a configured or supplied `model` override is rejected before the request is sent.
-- Timeout resolution: per-call `timeout` → config `chat_timeout` (default 600s) → built-in default.
+A follow-up to `tutor` reuses the stored target session unless `new_session=True`.
 
-#### `delegate_subagent`
+---
 
-In-process subagent with per-call model override. Result auto-delivered on completion.
+## Pillar 1 — A network of named Hermes agents
+
+A Herald target is a real Hermes profile, not an anonymous prompt wrapper. It can have its own:
+
+- SOUL and operating instructions;
+- model and provider credentials;
+- skills and memory;
+- tools and filesystem;
+- Home Assistant, browser, GitHub, email, or other integrations;
+- machine, container, or network location.
+
+### Persistent inter-agent conversation
+
+`dispatch_chat` sends one synchronous turn over a streaming `/v1/chat/completions` connection and preserves continuity with `X-Hermes-Session-Id`.
+
+```text
+Coordinator                         Tutor profile
+    │                                    │
+    ├─ "Explain decorators" ────────────▶│ turn 1
+    │◀──────────────────────── "Here's…" ┤
+    │                                    │
+    ├─ "Show a caching version" ────────▶│ turn 2, same history
+    │◀──────────────────── "Use lru_cache"┤
+```
+
+While the call is synchronous, target assistant deltas and tool lifecycle events keep the activity timer alive. Tool progress is relayed to the origin UI when that surface exposes a progress callback. SSE keepalives prove the transport is connected but do not count as agent activity.
+
+```python
+dispatch_chat(
+    profile="tutor",
+    message="Challenge my proposed explanation",
+    model="tutor-reasoning",       # exact verified model_routes alias
+    instructions="Be direct.",    # current turn only
+    stall_timeout_seconds=900,     # activity-based
+    new_session=False,
+)
+```
+
+Important contracts:
+
+- the call blocks the **current origin agent turn**, not every Hermes session or process;
+- later calls to the configured profile name reuse its saved target session;
+- `new_session=True` creates and stores a fresh session;
+- `instructions` applies to the current turn and should be resent when still needed;
+- `model` is verified against authenticated `/v1/models`; omission uses the target default;
+- the stall timer resets on actual assistant or tool activity, so productive long turns can exceed it indefinitely;
+- persistent chat is synchronous and does not return a separately pollable Herald `run_id`.
+
+### Parallel or detached work
+
+`dispatch_agent` starts a target `/v1/runs` task and returns a `run_id` immediately.
+
+```python
+# Default: monitor through SSE and deliver the result back to this session.
+dispatch_agent(
+    profile="reviewer",
+    message="Review the repository for release blockers. Do not edit.",
+    model="reviewer-fast",
+)
+
+# Detached: no local listener or callback. Inspect it later.
+dispatch_agent(
+    profile="researcher",
+    message="Continue this workflow independently.",
+    delivery="none",
+    max_hops=6,
+)
+```
+
+With `delivery="callback"` (default), Herald monitors structured target events and reinjects the terminal result into the commissioning session. With `delivery="none"`, the target continues without a local listener; use `check_dispatch` or `dispatch_status` later.
+
+Herald also provides:
+
+- batch polling with `collect_dispatches`;
+- cooperative cancellation with `cancel_dispatch`;
+- durable call and model provenance in SQLite;
+- trace, parent-edge, and hop lineage for forwarded agent graphs;
+- optional `max_hops` to stop repeated A→B→A forwarding before another edge is created;
+- protected-command approval relay for advanced human-attended workflows.
+
+<details>
+<summary><strong>Async monitoring and recovery details</strong></summary>
+
+The listener consumes `/v1/runs/{run_id}/events`. If SSE drops, Herald checks authoritative run status before reconnecting, then retries with 5/10/20/40-second backoff. After five total failed connections, it switches to authenticated polling.
+
+SSE activity and advancing target `updated_at` timestamps reset the normal 600-second stall timer. Approval waits use 30 minutes. Five consecutive polling transport failures end monitoring with instructions to reconcile using `check_dispatch`.
+
+Auto-delivery is process-bound: restarting the origin loses its active listener. The durable SQLite ledger retains provenance and the bounded JSON cache retains live recovery data, but Herald does not recreate an old listener or inject a result into a dead session. Recover the handle with `dispatch_status`, then query the target with `check_dispatch`.
+
+</details>
+
+---
+
+## Pillar 2 — A model switchboard for local subagents
+
+Hermes core’s `delegate_task` is the right tool when the child should inherit the parent model. `delegate_subagent` adds **per-call model choice** and explicit inheritance controls.
 
 ```python
 delegate_subagent(
-    goal="Summarise this codebase",  # required
-    model="gemma4:31b",              # optional — model override
-    context="The repo is at /path",  # optional — background info
-    inherit_soul=True,                # optional — load parent profile SOUL.md
-    toolsets=["web", "terminal"],    # optional — restrict toolsets
-    stall_timeout_seconds=600,       # optional — activity-based stall timer
-    interrupt_after_seconds=1800     # optional — cooperative interrupt threshold
+    goal="Review auth.py for security issues. Do not edit.",
+    model="gpt-5",
+    context="Repository: /srv/app; focus on token handling.",
+    inherit_context=True,
+    inherit_soul=True,
+    inherit_toolsets=False,
+    toolsets=["file", "terminal"],
+    stall_timeout_seconds=600,
+    interrupt_after_seconds=1800,
 )
 ```
 
-### Management Tools
+### Decide exactly what the child inherits
 
-| Tool | What it does |
-|------|-------------|
-| `check_dispatch` | Poll the status of a single dispatched run |
-| `collect_dispatches` | Batch-poll multiple dispatched runs at once |
-| `dispatch_status` | Query durable call history, optionally reveal full task text, and show configured/observed directed topology |
-| `cancel_dispatch` | Request cooperative target cancellation and suppress late local delivery |
-| `ping_profile` | Liveness check — is the target profile's API server reachable? |
-| `list_profile_models` | List models a target profile can safely accept for `dispatch_agent(model=...)` |
+| Input | Default | Behaviour |
+|---|---:|---|
+| `context` | none | Explicit task facts supplied regardless of inheritance mode |
+| `inherit_context` | `false` | Opt-in copy of the latest 20 parent user/assistant text messages, capped at 12,000 characters; excludes system, tools, results, memory, and hidden state |
+| `inherit_soul` | `false` | Loads the active parent profile’s full `SOUL.md` as the child identity |
+| `inherit_toolsets` | `true` | Inherits the parent’s safe child tool subset when `toolsets` is omitted |
+| `toolsets=[]` | omitted | Creates a model-only child |
+| `toolsets=[...]` | omitted | Requests an exact subset, intersected with parent capabilities; inherited MCP toolsets are stripped unless explicitly named |
 
-### Approval Relay
+The child runs asynchronously in a daemon thread and returns a `task_id` immediately. Streamed text and tool events reset the stall timer. `interrupt_after_seconds` requests cooperative interruption after a wall-clock threshold; it cannot instantly kill a provider or blocking tool call.
 
-For autonomous agent meshes, configure trusted targets with Hermes's `smart` approval mode. Use `off`/YOLO only where the target's tools and execution environment are deliberately trusted or sandboxed. Manual relay is an advanced, model-mediated fallback for workflows that intentionally keep a human available; it is not required for normal Herald dispatch.
+Because the child is in-process, it is not durable across parent-process exit. Use `dispatch_agent` when process isolation or durable target execution matters.
 
-When the target Hermes instance leaves a protected command pending and emits an
-`approval.request` event, Herald relays that request back to your session:
+`delegate_subagent` requires the live parent-agent context exposed by classic interactive CLI and desktop/TUI sessions. Gateway/API plugin-dispatch paths fail closed rather than guessing another session.
 
-```
-[DISPATCH APPROVAL REQUIRED]
-Profile: reviewer
-Run: abc123...
-Herald approval ID: 4f8c...
-Command: <redacted command preview>
-Choices: once | session | always | deny
-```
+> If Hermes core’s global `delegation.child_timeout_seconds` is enabled, it can preempt Herald’s per-call policy. Set it to `0` or leave it unset when using Herald timeout controls.
+
+---
+
+## Pillar 3 — A lightweight inference lane
+
+`llm_call` goes directly through Hermes provider routing without an agent loop, tool schemas, terminal access, or subagent overhead.
 
 ```python
-approve_dispatch(
-    run_id="abc123",
-    profile="reviewer",
-    approval_id="fresh-id-from-the-notice",
-    choice="once",
-    resolve_all=False,
+# Classification
+llm_call(messages=[{
+    "role": "user",
+    "content": "Classify as urgent or routine: Production database is unavailable.",
+}])
+
+# Structured extraction
+llm_call(
+    messages=[{
+        "role": "user",
+        "content": "Extract name and age: John Smith is 32.",
+    }],
+    json_mode=True,
+)
+
+# Translation on a selected route
+llm_call(
+    messages=[{"role": "user", "content": "Translate to French: Good morning."}],
+    model="gpt-5",
 )
 ```
 
-- **Model-mediated relay:** the current implementation injects a pending request into the originating agent as a synthetic turn. The origin model may then call `approve_dispatch`; the original approval request is not presented directly to the human.
-- **Target policy runs first:** in `smart` mode, Hermes may automatically approve or deny a flagged command without emitting a pending request, so nothing reaches Herald or the origin session. This is the recommended mode for autonomous agent-to-agent operation. `manual` mode makes the target wait, but does not by itself guarantee that the originating human receives a timely, usable prompt.
-- **Scoped locally:** Herald binds the decision to the originating session, `{profile, run_id}`, and a fresh delivery nonce. Cross-session, cross-profile, and stale/replayed attempts are rejected before contacting the target. The displayed `approval_id` is Herald's local ownership/anti-replay token, not an opaque target-side approval-entry ID.
-- **FIFO-bound at the target:** Hermes's current run-approval endpoint resolves pending commands FIFO, so Herald preserves that order locally. If several requests arrive, only the current head is shown; the next notice is promoted after the visible request resolves.
-- **Defensive display:** the target redacts the command preview and Herald wraps it in explicit delimiters. Treat the preview as untrusted data and base the decision on the current FIFO head and fresh Herald `approval_id` shown in that notice.
-- **Permanent scope is explicit:** `choice="always"` is refused unless the target supplies the approval `pattern_key`; that scope is shown on the human confirmation surface.
+Use it for tasks where tools and iterative reasoning would be overhead: routing, scoring, rewriting, extraction, translation, compact summarisation, and schema-constrained JSON.
+
+---
+
+## The 11 tools
+
+| Tool | Purpose |
+|---|---|
+| `dispatch_chat` | Persistent synchronous conversation with streamed activity and verified target model selection |
+| `dispatch_agent` | Async cross-profile run with callback or detached delivery |
+| `delegate_subagent` | In-process child with per-call model and inheritance controls |
+| `llm_call` | Bare model inference without an agent loop |
+| `check_dispatch` | Query one target run using its exact `{profile, run_id}` |
+| `collect_dispatches` | Query several run handles in one call |
+| `dispatch_status` | Read durable call history and credential-free configured/observed topology |
+| `cancel_dispatch` | Request cooperative target cancellation and suppress late local delivery |
+| `approve_dispatch` | Resolve the exact visible protected-command request through human confirmation |
+| `ping_profile` | Check target API reachability |
+| `list_profile_models` | Discover exact target `model_routes` aliases accepted by both dispatch modes |
+
+---
+
+## Routing policy is not caller authentication
+
+This distinction is deliberate and non-negotiable.
+
+A route such as:
+
+```yaml
+profiles:
+  reviewer:
+    capabilities: [dispatch]
+```
+
+means:
+
+> “Calls made through Herald on **this origin profile** may dispatch to `reviewer`, but may not open persistent chat.”
+
+Herald enforces that rule before network contact. Missing or malformed capabilities grant nothing. Adding reviewer to coordinator creates coordinator→reviewer only; the reverse requires a separate outbound entry on reviewer.
+
+It does **not** mean:
+
+> “The reviewer API server can cryptographically identify coordinator and reject every other bearer-key holder.”
+
+Hermes’s API server currently authenticates the target bearer key. It does not map different client keys to verified Hermes profile principals. Anyone who can reach the endpoint and possesses that key has the key’s authority, including callers that bypass Herald with HTTP or terminal tools.
+
+Therefore:
+
+- Herald’s route table is a useful, enforced **caller-side policy and accidental-recursion guard**;
+- it is not a bilateral network ACL, sandbox, or target-side identity firewall;
+- `origin_name` is audit attribution, not authenticated caller identity;
+- use a unique target/key per trust boundary, network ACLs/Tailscale, containers, or a credential-aware reverse proxy when callers need different authority;
+- true “only profile A may call profile B” enforcement requires per-caller principals in Hermes core or equivalent infrastructure.
+
+Self-routing requires both a matching route entry and `allow_self: true`. Async `max_hops` is an operational loop brake, not a cryptographic control; a malicious caller can discard model-carried lineage or bypass Herald.
+
+---
+
+## Model routing
+
+Both `dispatch_agent` and `dispatch_chat` support target-controlled model choice.
+
+When `model` is supplied explicitly or configured on the Herald profile route, Herald:
+
+1. authenticates to the target’s `GET /v1/models`;
+2. requires an exact `model_routes` alias with a resolved target model;
+3. refuses unknown, unverifiable, or primary-identity-only names before sending work;
+4. records requested and resolved model provenance in the ledger.
+
+Omit `model` to preserve the target’s normal default. Call `list_profile_models(profile=...)` before selecting an alias.
+
+This is intentionally stricter than calling the native API directly: a typo must not silently fall back to a different model.
+
+---
+
+## Persistence, audit, and graph lineage
+
+Herald uses two local stores:
+
+- a bounded JSON state cache for live run handles, target chat sessions, listeners, and approval recovery;
+- a SQLite ledger for durable call provenance, status, model resolution, timing, delivery mode, trace lineage, and optional full task text.
+
+`dispatch_status(include_messages=False, include_topology=True)` is the safe default. Set `include_messages=True` deliberately: the ledger excludes configured bearer credentials, but it stores task text exactly as supplied. Do not put secrets in dispatch briefs.
+
+Same-filesystem origins may share one `ledger_file` for a combined observed graph. Never share one JSON `state_file` between processes.
+
+A post-side-effect state-cache failure does not hide a remote handle: Herald returns the handle, records the ledger edge when possible, and includes an explicit warning.
+
+---
+
+## Approval relay
+
+For autonomous target profiles, prefer Hermes’s `smart` approval mode. Use manual Herald relay only when a human-attended origin is intentionally part of the workflow.
+
+When the target emits `approval.request`, Herald delivers the redacted request to the commissioning session. `approve_dispatch` requires:
+
+- the exact target `{profile, run_id}`;
+- a fresh Herald `approval_id` bound to the originating session;
+- the visible FIFO head;
+- explicit human confirmation through Hermes’s owned approval surface.
+
+Cross-session, cross-profile, stale, replayed, or unseen requests fail before the target is contacted. Positive commands are resolved one at a time. `resolve_all=True` is deny-only. `choice="always"` requires a target-supplied permanent pattern scope.
+
+Target command descriptions remain untrusted display data. If the listener was lost before the command preview arrived, do not approve it—reconcile or cancel the run.
 
 ---
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────┐
-│  Origin Hermes Instance (your profile)                   │
-│                                                          │
-│  ┌───────────────┐    ┌───────────────────────────────┐  │
-│  │ dispatch_chat │───▶│ POST /api/sessions/{id}/chat  │  │
-│  │ (sync,        │    │ (persistent session —          │  │
-│  │  back-and-    │    │  target remembers prior turns) │  │
-│  │  forth)       │◀───│                               │  │
-│  └───────────────┘    └───────────────────────────────┘  │
-│                                                          │
-│  ┌───────────────┐    ┌───────────────────────────────┐  │
-│  │ dispatch_agent│───▶│ POST /v1/runs                  │  │
-│  │ (async,       │    │ (task starts on target)        │  │
-│  │  fire-and-    │    └───────────────────────────────┘  │
-│  │  forget)      │           │                           │
-│  └───────────────┘           ▼                           │
-│                     ┌───────────────────────────────┐    │
-│                     │ SSE Listener Thread            │    │
-│                     │ • authenticated poll fallback │    │
-│                     │ • no redirect credential leak │    │
-│                     │ • stall detection              │    │
-│                     │ • approval relay               │    │
-│                     └──────────┬────────────────────┘    │
-│                          │ result via                     │
-│                          ▼ completion_queue                │
-│                     ┌──────────────┐                     │
-│                     │ Your Session │                     │
-│                     │ (auto-delivery)│                    │
-│                     └──────────────┘                     │
-│                                                          │
-│  ┌───────────────┐              ┌──────────────┐         │
-│  │delegate_      │              │ llm_call     │         │
-│  │subagent       │              │ (direct      │         │
-│  │ (in-process   │              │  inference,  │         │
-│  │  thread,      │              │  no dispatch)│         │
-│  │  per-call     │              └──────────────┘         │
-│  │  model)       │                                       │
-│  └───────────────┘                                       │
-└──────────────────────────────────────────────────────────┘
-         │                              │
-         ▼                              ▼
-┌─────────────────┐          ┌─────────────────┐
-│ Target Profile  │          │ Target Profile  │
-│ reviewer (:8651)│          │ tutor (:8652)   │
-│ (separate API   │          │ (separate API   │
-│  server, own    │          │  server, own    │
-│  model+memory)  │          │  model+memory)  │
-└─────────────────┘          └─────────────────┘
+```text
+                         HERMES HERALD
+
+ Origin profile
+ ├─ dispatch_chat ───── streaming persistent turn ───▶ Named target profile
+ ├─ dispatch_agent ─── async /v1/runs task ─────────▶ Named target profile
+ │                       │
+ │                       └─ SSE → reconnect → polling → callback/ledger
+ ├─ delegate_subagent ─ in-process model-selected child
+ └─ llm_call ────────── direct provider inference
+
+ Target profiles retain their own model routes, SOUL, skills, memory,
+ credentials, tools, sessions, filesystem, and network location.
 ```
 
-### Reliability
-
-- **Two persistence layers** — the bounded profile-local JSON state cache uses atomic replacement for live recovery; the uncapped SQLite ledger stores durable call provenance and supports concurrent readers/writers through WAL. Existing bounded JSON run history is imported into SQLite once when `dispatch_status` first sees it.
-- **Share the ledger, not the state cache** — same-filesystem origins may point `ledger_file` at one database for a combined observed graph. Never point multiple origins at one JSON `state_file`.
-- **Session and approval recovery** — stored chat session IDs and pending approval metadata are restored when the plugin registers after a restart.
-- **Protected shared registries** — locks guard state-file updates, live listeners, chat session IDs, and pending approvals.
-- **Credential-safe HTTP** — authenticated API and SSE requests reject redirects, preventing a target-controlled redirect from forwarding its bearer token to another origin.
-- **Cooperative cancellation** — `cancel_dispatch` requests target interruption and suppresses stale local callback delivery; the target stops at a safe interruption point.
-- **Zero core patches** — uses stdlib HTTP (`urllib`) and core delegation internals as importable library functions.
+Reliability properties include redirect refusal for credentialed HTTP, atomic state replacement, WAL-backed SQLite, bounded previews, session-owned approval nonces, cooperative cancellation, model-route verification, activity-aware stalls, and zero Hermes core patches.
 
 ---
 
-## Config
+## Trust boundaries
 
-```yaml
-hermes_herald:
-  # Optional when Hermes cannot infer a named profile from HERMES_HOME.
-  # origin_name: reviewer-orchestrator
-  # Block self-dispatch/self-chat unless explicitly enabled.
-  allow_self: false
-  profiles:
-    reviewer:
-      url: http://localhost:8651
-      api_key: ${REVIEWER_API_KEY}
-      capabilities: [dispatch]  # this origin may delegate, but not chat
-      # Optional async default: exact model_routes alias used by dispatch_agent.
-      # Omit this if the profile will also be used with dispatch_chat.
-      model: reviewer-fast
-    tutor:
-      url: http://localhost:8652
-      api_key: ${TUTOR_API_KEY}
-      capabilities: [dispatch, chat]
-  # Optional: default timeout for dispatch_chat in seconds (default 600).
-  chat_timeout: 900
-  # Optional: defaults under the active profile's HERMES_HOME.
-  # Do not share one custom state file across multiple origin processes.
-  state_file: /custom/private/path/hermes-herald-runs.json
-  # Durable SQLite history. Share this path across same-filesystem origins
-  # when you want one observed network graph.
-  ledger_file: /custom/private/path/hermes-herald-network.db
-```
-
-API keys support `${VAR_NAME}` environment interpolation. Prefer `hermes config set REVIEWER_API_KEY <value>` so the secret is written to the origin profile's `.env`; do not commit bearer tokens to `config.yaml`.
-
-### Directed topology: forward, reverse, self, and "all agents"
-
-Routes are **outbound and per origin**. Registering `ada` in Marie's config creates Marie→Ada; it does not create Ada→Marie. To allow the reverse direction, add Marie to Ada's own config. `capabilities` independently gates asynchronous `dispatch` and persistent `chat`; an omitted list preserves the v1-compatible default of both. There is no wildcard route to every registered Hermes profile. Herald infers the origin from standard profile homes; set `origin_name` when using a custom or containerized home that would otherwise appear as `custom`.
-
-```yaml
-# Marie's config: one-way delegation to Ada; no reverse authority implied.
-hermes_herald:
-  allow_self: false
-  ledger_file: /srv/hermes/herald-network.db
-  profiles:
-    ada:
-      url: http://127.0.0.1:8652
-      api_key: ${ADA_API_KEY}
-      capabilities: [dispatch]
-
-# Ada's separate config: no Marie entry, so Ada cannot delegate back.
-hermes_herald:
-  ledger_file: /srv/hermes/herald-network.db
-  profiles: {}
-```
-
-Self-routing requires **both** an explicit entry whose name matches the active profile and `allow_self: true`. This prevents accidental recursion. These controls govern Herald's tools at the origin; they are not a sandbox or target-side identity firewall. The bearer key remains the target API's actual authority, and a profile with other network/terminal tools may be able to call that API outside Herald.
-
-There is no mandatory global layer limit. For a bounded async workflow, set `max_hops` on the initial dispatch and preserve it while forwarding. A call at `hop_count == max_hops` may finish normally but cannot create the next Herald edge in that trace. This catches A→B→A loops as repeated hops in either detached or callback mode. The context is model-carried rather than cryptographically signed, so it is an operational guardrail, not protection against a malicious agent that discards the trace or bypasses Herald.
-
-`dispatch_status()` returns the current origin's declared outbound routes plus observed `origin_profile → target_profile` call counts from the ledger. Pass `include_messages=true` to retrieve full stored task text and instructions; it defaults to false because the ledger may contain sensitive briefs. The DB is created mode `0600` and never stores configured transport credentials. Task text is stored exactly as supplied, so do not put secrets in a brief.
-
-### Cross-profile model routing
-
-`dispatch_agent` sends no `model` field when neither the tool call nor the profile config specifies one, preserving the target's normal default. When a model is specified, it must be an exact alias configured under the target API server's `gateway.platforms.api_server.extra.model_routes`. The plugin authenticates to `GET /v1/models` and verifies the alias before starting the task. Arbitrary model strings, the advertised primary identity, or any unverifiable response fails closed.
-
-Call `list_profile_models(profile=...)` before selecting an override — it returns the target's dispatchable aliases and their resolved models.
-
-This is intentionally stricter than calling Hermes's native API directly: Herald v1 exposes only predeclared aliases for async dispatch. `dispatch_chat` uses the target profile's default runtime, and a profile-level model default makes that profile ineligible for chat.
-
-### Trust boundaries and limitations
-
-- **Target access is powerful.** A valid transport key can invoke a Hermes agent with whatever tools the target exposes to the `api_server` platform, including terminal access.
-- **Herald does not provide TLS.** Use loopback for same-host profiles. For remote hosts, prefer a private network such as Tailscale or put the endpoint behind authenticated TLS; avoid exposing a plain HTTP listener to the public internet.
-- **Targets need their own provider setup.** Herald never copies upstream model keys, skills, memory, or tool credentials from the origin.
-- **Target output is untrusted input.** Async results are reinjected into the origin as a new turn. Use only trusted target profiles, treat hostile documents/web content they process as prompt-injection capable, and do not grant sensitive side effects based solely on a target's prose.
-- **Manual remote approvals are model-mediated and fail closed.** The originating agent receives the notice and may propose `approve_dispatch`; Hermes still requires confirmation through the owning TUI/gateway surface before forwarding a positive choice. No available human surface, a stale request, timeout, or decline sends no approval to the target.
-- **Approvals are session-owned.** Persisted runs remain visible within the origin profile for recovery, but a pending protected command can only be resolved from its originating session with the fresh `approval_id` delivered in that notice. Use separate Hermes profiles when different users must not see one another's run metadata.
-- **Async delivery is not a durable queue.** Call provenance is durable, but an origin restart loses the active SSE listener. Recover with `dispatch_status` and `check_dispatch`, or choose `delivery="none"` when no callback is intended.
-- **Ledger visibility is sensitive.** Full task text and instructions are stored locally for auditability. Keep the DB private and use `include_messages=true` deliberately. Configured bearer keys are never written to it, but secrets embedded by a caller in task text would be.
-- **Bulk positive approval is refused.** `resolve_all=true` is available only with `choice="deny"`; positive commands must be reviewed one at a time.
-- **Target restarts have their own semantics.** A target gateway restart can interrupt an active run even though the origin still knows its `run_id`.
-- **Persistent chat is one session per configured profile name.** Use `new_session=True` to discard Herald's saved handle and start another conversation.
+- A valid target transport key is powerful. Protect it like remote execution access.
+- Herald does not provide TLS. Use loopback, a trusted private network, or authenticated TLS.
+- Target provider credentials, skills, memory, and tool credentials remain on the target.
+- Target responses are untrusted input when reinjected into the origin. Verify consequential side effects independently.
+- Async callback delivery is not a durable queue; recover target state with `dispatch_status` and `check_dispatch` after origin restart.
+- Persistent chat stores one target session handle per configured profile name; use `new_session=True` to start fresh.
+- A target gateway restart can interrupt active work even when the origin still knows the handle.
 
 ---
 
-## Tests
+## Development and tests
 
 ```bash
 cd tests
-HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=~/.hermes/hermes-agent \
+HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-151 tests covering: durable SQLite call provenance, legacy-history migration, private ledger permissions, run/chat post-side-effect recovery failures, detached and callback graph routing with optional hop budgets, directed route policy, stable origin attribution, SSE reconnection with exponential backoff, activity-based polling stall detection, transactional cancellation, session-owned nonce-bound approval relay, redirect credential isolation, profile-local recovery state, chat-session recovery, model resolution, bundled-skill registration, exact TUI parent-agent resolution, delegate_subagent async-delivery and cooperative-interrupt semantics, SOUL inheritance, llm_call validation, ping_profile, and more.
-
----
+The release suite currently contains **158 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 
