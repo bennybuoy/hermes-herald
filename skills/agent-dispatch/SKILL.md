@@ -143,7 +143,7 @@ Use `dispatch_chat` for synchronous dialogue where later messages depend on prio
 - Calls reuse one target session per configured profile name.
 - `new_session=true` creates and stores a fresh target session.
 - The target streams assistant deltas and tool lifecycle events; activity resets the stall timer and is surfaced to the parent UI when it exposes a progress callback.
-- `stall_timeout_seconds` (or deprecated alias `timeout`) overrides `hermes_herald.chat_timeout`. It is an inactivity threshold, not a flat wall-clock cap; productive calls may run longer.
+- `stall_timeout_seconds` overrides `hermes_herald.chat_timeout`. It is an inactivity threshold, not a flat wall-clock cap; productive calls may run longer.
 - `instructions` is sent as a system message for the current request; resend it when later turns still require it.
 - An explicit or profile-level `model` must be an exact target `model_routes` alias verified through authenticated `/v1/models`. Omission preserves the target default.
 - Persistent chat returns one final reply and blocks the current origin agent turn; it does not create a separately pollable Herald run.

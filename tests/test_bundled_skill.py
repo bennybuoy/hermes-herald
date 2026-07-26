@@ -47,6 +47,7 @@ def test_bundled_skill_matches_v1_contract():
 
     stale_claims = (
         "hard_timeout_seconds",
+        "deprecated alias `timeout`",
         "agent_dispatch.profiles",
         "provides ten tools",
         "all ten schemas",
