@@ -19,17 +19,17 @@ jobs:
 
     steps:
       - name: Check out Hermes Herald
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Check out compatible Hermes Agent source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: NousResearch/hermes-agent
-          ref: f1120ada4d487416c3c76fefd73346c70f641835
+          ref: 212e84176dac687247513885b2670600b6e0d1ed
           path: hermes-agent
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
           python-version: "3.11"
           cache: pip
