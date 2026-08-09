@@ -72,6 +72,67 @@ class FakeUsageBare:
         self.total_tokens = total
 
 
+def _install_route_resolution_fakes(
+    monkeypatch,
+    *,
+    resolved_provider="openai-codex",
+    resolved_model="gpt-5.6-sol",
+    available_models=None,
+    resolved_base_url="https://chatgpt.com/backend-api/codex",
+):
+    """Install deterministic current-runtime, resolver, and inventory fakes."""
+    from types import SimpleNamespace
+    import agent.auxiliary_client as auxiliary_client
+    import hermes_cli.inventory as inventory
+    import hermes_cli.model_switch as model_switch
+
+    current_provider = "openai-codex"
+    current_model = "gpt-5.6-sol"
+    current_base_url = "https://chatgpt.com/backend-api/codex"
+    for name, value in (
+        ("_read_main_provider", current_provider),
+        ("_read_main_model", current_model),
+        ("_read_main_base_url", current_base_url),
+        ("_read_main_api_key", ""),
+    ):
+        monkeypatch.setattr(
+            auxiliary_client,
+            name,
+            MagicMock(return_value=value),
+            raising=False,
+        )
+
+    switch = MagicMock(return_value=SimpleNamespace(
+        success=True,
+        new_model=resolved_model,
+        target_provider=resolved_provider,
+        base_url=resolved_base_url,
+        error_message="",
+    ))
+    monkeypatch.setattr(model_switch, "switch_model", switch)
+
+    picker_context = SimpleNamespace(
+        current_provider=current_provider,
+        current_model=current_model,
+        current_base_url=current_base_url,
+        user_providers={},
+        custom_providers=[],
+        with_overrides=lambda **kwargs: picker_context,
+    )
+    monkeypatch.setattr(inventory, "load_picker_context", lambda: picker_context)
+    monkeypatch.setattr(
+        inventory,
+        "build_models_payload",
+        lambda *args, **kwargs: {
+            "providers": [{
+                "slug": resolved_provider,
+                "models": available_models or ["gpt-5.6-sol", "gpt-5.6-terra"],
+            }]
+        },
+    )
+    return switch
+
+
 class TestLlmCallResponseExtraction:
     """Test handle_llm_call response extraction from various response shapes."""
 
@@ -501,10 +562,15 @@ class TestLlmCallModelOverride:
             model="gpt-4o-2024-08-06",
         )
 
-        result = json.loads(tools.handle_llm_call({
-            "messages": [{"role": "user", "content": "Hi"}],
-            "model": "claude-sonnet-4",
-        }))
+        with patch.object(
+            tools,
+            "_resolve_llm_call_route",
+            return_value=("anthropic", "claude-sonnet-4"),
+        ):
+            result = json.loads(tools.handle_llm_call({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "model": "claude-sonnet-4",
+            }))
 
         # response.model still wins (it's the actual model that served the request)
         assert result["model"] == "gpt-4o-2024-08-06"
@@ -772,6 +838,100 @@ class TestLlmCallParameterPassthrough:
     """Test that parameters are correctly passed to call_llm."""
 
     @patch("agent.auxiliary_client.call_llm")
+    def test_model_override_uses_active_provider_model_resolver(
+        self, mock_call_llm, monkeypatch
+    ):
+        """Human model names resolve to an exact wire slug before inference."""
+        mock_call_llm.return_value = FakeResponse(
+            choices=[FakeChoice(message_content="ok")],
+            model="gpt-5.6-sol",
+        )
+        switch = _install_route_resolution_fakes(monkeypatch)
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "model": "gpt5.6sol",
+        }))
+
+        call_args = mock_call_llm.call_args[1]
+        assert call_args["provider"] == "openai-codex"
+        assert call_args["model"] == "gpt-5.6-sol"
+        assert result["requested_model"] == "gpt5.6sol"
+        assert result["resolved_provider"] == "openai-codex"
+        assert result["resolved_model"] == "gpt-5.6-sol"
+        assert switch.call_args.kwargs["explicit_provider"] == "openai-codex"
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_family_model_resolves_to_active_advertised_variant(
+        self, mock_call_llm, monkeypatch
+    ):
+        """A bare family name reuses the active advertised family variant."""
+        _install_route_resolution_fakes(
+            monkeypatch,
+            resolved_model="gpt-5.6",
+        )
+
+        mock_call_llm.return_value = FakeResponse(
+            choices=[FakeChoice(message_content="ok")],
+            model="gpt-5.6-sol",
+        )
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "model": "gpt-5.6",
+        }))
+
+        assert result["text"] == "ok"
+        assert mock_call_llm.call_args.kwargs["provider"] == "openai-codex"
+        assert mock_call_llm.call_args.kwargs["model"] == "gpt-5.6-sol"
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_openai_provider_alias_cannot_silently_select_openrouter(
+        self, mock_call_llm, monkeypatch
+    ):
+        """The ambiguous OpenAI alias must not turn a Codex request into OR."""
+        _install_route_resolution_fakes(
+            monkeypatch,
+            resolved_provider="openrouter",
+            resolved_model="openai/gpt-5.6-sol",
+            available_models=["openai/gpt-5.6-sol"],
+            resolved_base_url="https://openrouter.ai/api/v1",
+        )
+
+        mock_call_llm.return_value = FakeResponse(
+            choices=[FakeChoice(message_content="wrong route")],
+            model="openai/gpt-5.6-sol",
+        )
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "provider": "openai",
+            "model": "gpt5.6sol",
+        }))
+
+        assert result["status"] == "error"
+        assert "OpenRouter" in result["error"]
+        assert "openai-codex" in result["error"]
+        mock_call_llm.assert_not_called()
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_unadvertised_model_is_rejected_before_inference(
+        self, mock_call_llm, monkeypatch
+    ):
+        _install_route_resolution_fakes(
+            monkeypatch,
+            resolved_model="gpt-5.7",
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "model": "gpt-5.7",
+        }))
+
+        assert result["status"] == "error"
+        assert "not advertised" in result["error"]
+        assert "gpt-5.6-sol" in result["error"]
+        mock_call_llm.assert_not_called()
+
+    @patch("agent.auxiliary_client.call_llm")
     def test_temperature_passthrough(self, mock_call_llm):
         """Temperature is passed through to call_llm."""
         mock_call_llm.return_value = FakeResponse(
@@ -791,21 +951,27 @@ class TestLlmCallParameterPassthrough:
 
     @patch("agent.auxiliary_client.call_llm")
     def test_provider_and_model_passthrough(self, mock_call_llm):
-        """Provider and model overrides are passed to call_llm."""
+        """Resolved provider and model are passed to call_llm."""
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
             model="claude-sonnet-4",
         )
 
-        tools.handle_llm_call({
-            "messages": [{"role": "user", "content": "Hi"}],
-            "provider": "anthropic",
-            "model": "claude-sonnet-4",
-        })
+        with patch.object(
+            tools,
+            "_resolve_llm_call_route",
+            return_value=("anthropic", "claude-sonnet-4"),
+        ) as resolve_route:
+            tools.handle_llm_call({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "provider": "anthropic",
+                "model": "claude-sonnet-4",
+            })
 
         call_args = mock_call_llm.call_args[1]
         assert call_args["provider"] == "anthropic"
         assert call_args["model"] == "claude-sonnet-4"
+        resolve_route.assert_called_once_with("claude-sonnet-4", "anthropic")
 
     @patch("agent.auxiliary_client.call_llm")
     def test_provider_and_model_are_normalized(self, mock_call_llm):
@@ -814,16 +980,22 @@ class TestLlmCallParameterPassthrough:
             model="resolved-model",
         )
 
-        result = json.loads(tools.handle_llm_call({
-            "messages": [{"role": "user", "content": "Hi"}],
-            "provider": "   ",
-            "model": "  requested-model  ",
-        }))
+        with patch.object(
+            tools,
+            "_resolve_llm_call_route",
+            return_value=(None, "requested-model"),
+        ) as resolve_route:
+            result = json.loads(tools.handle_llm_call({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "provider": "   ",
+                "model": "  requested-model  ",
+            }))
 
         call_args = mock_call_llm.call_args[1]
         assert call_args["provider"] is None
         assert call_args["model"] == "requested-model"
         assert result["requested_provider"] == ""
+        resolve_route.assert_called_once_with("requested-model", "")
 
     @patch("agent.auxiliary_client.call_llm")
     def test_timeout_passthrough(self, mock_call_llm):
