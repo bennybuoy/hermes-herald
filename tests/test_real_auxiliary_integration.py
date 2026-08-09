@@ -445,6 +445,82 @@ def test_custom_anthropic_request_cannot_outlive_total_deadline(monkeypatch):
     assert time.monotonic() - started < 2.0
 
 
+def test_custom_anthropic_late_queue_wakeup_cannot_accept_late_success(monkeypatch):
+    """A scheduler wake-up race cannot turn a post-deadline result into success."""
+    from types import SimpleNamespace
+    from agent import anthropic_adapter
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    endpoint = "https://anthropic-custom.selected.example/anthropic"
+
+    class LateDeliveringQueue:
+        def __init__(self, maxsize=0):
+            self.item = None
+
+        def put(self, item):
+            self.item = item
+
+        def get(self, timeout=None):
+            while self.item is None:
+                time.sleep(0.001)
+            return self.item
+
+    monkeypatch.setattr(tools.queue, "Queue", LateDeliveringQueue)
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "build_anthropic_client",
+        lambda api_key, base_url, timeout=None: object(),
+    )
+
+    def wrapped_client(real, model, api_key, base_url, is_oauth=False):
+        def create(**kwargs):
+            time.sleep(0.03)
+            return "late-success"
+
+        return SimpleNamespace(
+            base_url=base_url,
+            close=lambda: None,
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create),
+            ),
+        )
+
+    monkeypatch.setattr(aux, "AnthropicAuxiliaryClient", wrapped_client)
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("custom Anthropic route must not enter generic routing")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+
+    with pytest.raises(TimeoutError, match="strict deadline"):
+        tools._create_strict_llm_stream(
+            aux,
+            tools._LlmCallRoute(
+                provider="custom:anthropic-wrapper",
+                model="claude-test",
+                base_url=endpoint,
+                api_key="test-token",
+                api_mode="anthropic_messages",
+            ),
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=None,
+            max_tokens=16,
+            extra_body=None,
+            timeout=0.02,
+        )
+
+
 def test_custom_anthropic_request_error_survives_bounded_raising_close(monkeypatch):
     """Owned-client cleanup cannot mask or prolong the provider failure."""
     from types import SimpleNamespace

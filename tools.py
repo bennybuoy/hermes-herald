@@ -4053,13 +4053,14 @@ def _create_strict_llm_stream(
         if not owns_client:
             return client.chat.completions.create(**kwargs)
 
-        request_events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+        request_events: queue.Queue[tuple[str, Any, float]] = queue.Queue(maxsize=1)
 
         def _request_owned_client() -> None:
             try:
-                request_events.put(("result", client.chat.completions.create(**kwargs)))
+                value = client.chat.completions.create(**kwargs)
+                request_events.put(("result", value, time.monotonic()))
             except Exception as exc:
-                request_events.put(("error", exc))
+                request_events.put(("error", exc, time.monotonic()))
 
         request_thread = threading.Thread(
             target=_request_owned_client,
@@ -4068,7 +4069,7 @@ def _create_strict_llm_stream(
         )
         request_thread.start()
         try:
-            event, value = request_events.get(
+            event, value, completed_at = request_events.get(
                 timeout=max(0.0, deadline - time.monotonic())
             )
         except queue.Empty as exc:
@@ -4076,6 +4077,11 @@ def _create_strict_llm_stream(
                 "Selected custom Anthropic request exceeded its strict deadline; "
                 "no alternate provider was tried."
             ) from exc
+        if completed_at > deadline:
+            raise TimeoutError(
+                "Selected custom Anthropic request exceeded its strict deadline; "
+                "no alternate provider was tried."
+            )
         if event == "error":
             raise value
         return value
