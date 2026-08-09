@@ -676,20 +676,24 @@ PING_PROFILE_SCHEMA: Dict[str, Any] = {
 LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
     "name": "list_profile_models",
     "description": (
-        "List the models a target profile can safely accept for dispatch_agent. "
-        "Returns the target's advertised primary identity for information and "
-        "separately lists exact "
-        "model_routes aliases that may be passed as dispatch_agent(model=...)."
+        "Discover exact fail-closed model routes before inference or dispatch. "
+        "Omit profile to list only provider/model routes explicitly configured "
+        "for this calling profile; use those exact pairs with llm_call. Supply "
+        "profile to query a target's authenticated model_routes aliases for "
+        "dispatch_agent. Ambient credentials and unconfigured fallback providers "
+        "are excluded from local results."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "profile": {
                 "type": "string",
-                "description": "Profile name from hermes_herald.profiles config.",
+                "description": (
+                    "Optional target name from hermes_herald.profiles. Omit for "
+                    "the calling profile's exact local llm_call routes."
+                ),
             },
         },
-        "required": ["profile"],
     },
 }
 
@@ -3363,6 +3367,86 @@ def _extract_content_or_reasoning_fallback(response: Any) -> str:
     return "\n\n".join(parts)
 
 
+def _configured_local_model_inventory(
+    *,
+    current_provider: str = "",
+    current_model: str = "",
+    current_base_url: str = "",
+) -> dict:
+    """Return model routes explicitly owned by the active profile.
+
+    Hermes's ``explicit_only`` inventory intentionally includes ambient OAuth
+    and provider-specific environment credentials.  That is appropriate for a
+    human model picker but too permissive for autonomous routing.  Herald's
+    allowlist is narrower: the live current provider plus custom endpoints
+    declared in this profile's YAML.  API keys and base URLs never leave this
+    helper.
+    """
+    from hermes_cli.inventory import ConfigContext, build_models_payload, load_picker_context
+    from hermes_cli.providers import custom_provider_slug
+
+    configured = load_picker_context()
+    live_provider = (current_provider or configured.current_provider or "").strip()
+    live_model = (current_model or configured.current_model or "").strip()
+    live_base_url = (current_base_url or configured.current_base_url or "").strip()
+    user_providers = getattr(configured, "user_providers", {}) or {}
+    custom_providers = getattr(configured, "custom_providers", []) or []
+
+    allowed = {live_provider.lower()} if live_provider else set()
+    for provider_key, provider_config in user_providers.items():
+        if not isinstance(provider_config, dict):
+            continue
+        display_name = str(provider_config.get("name") or provider_key).strip()
+        if display_name:
+            allowed.add(custom_provider_slug(display_name, str(provider_key)).lower())
+    for provider_config in custom_providers:
+        if not isinstance(provider_config, dict):
+            continue
+        display_name = str(provider_config.get("name") or "").strip()
+        if display_name:
+            allowed.add(custom_provider_slug(display_name).lower())
+
+    context = ConfigContext(
+        current_provider=live_provider,
+        # Do not force the active model into the catalog. It must be genuinely
+        # advertised, not accepted because it is already selected.
+        current_model="",
+        current_base_url=live_base_url,
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+        excluded_providers=getattr(configured, "excluded_providers", []) or [],
+    )
+    payload = build_models_payload(
+        context,
+        explicit_only=True,
+        include_unconfigured=False,
+        for_picker=False,
+        probe_custom_providers=True,
+        probe_current_custom_provider=True,
+    )
+    providers = []
+    for row in payload.get("providers", []):
+        if not isinstance(row, dict):
+            continue
+        provider = str(row.get("slug") or "").strip()
+        if not provider or provider.lower() not in allowed:
+            continue
+        models = sorted({
+            str(model).strip()
+            for model in (row.get("models") or [])
+            if isinstance(model, str) and model.strip()
+        })
+        providers.append({"provider": provider, "models": models})
+    providers.sort(key=lambda row: row["provider"])
+
+    return {
+        "configured_default": {"provider": live_provider, "model": live_model},
+        "providers": providers,
+        "user_providers": user_providers,
+        "custom_providers": custom_providers,
+    }
+
+
 def _resolve_llm_call_route(
     model_override: Optional[str],
     provider_override: Optional[str],
@@ -3385,16 +3469,7 @@ def _resolve_llm_call_route(
             "is intentional; for ChatGPT Codex OAuth use provider='openai-codex'. "
             "No inference request was sent."
         )
-    if not requested_model:
-        return requested_provider or None, None
-
     from agent import auxiliary_client as auxiliary
-    from hermes_cli.config import get_compatible_custom_providers, load_config
-    from hermes_cli.inventory import (
-        ConfigContext,
-        build_models_payload,
-        load_picker_context,
-    )
     from hermes_cli.model_normalize import normalize_model_for_provider
     from hermes_cli.model_switch import switch_model
 
@@ -3419,11 +3494,34 @@ def _resolve_llm_call_route(
             "'provider' value. No inference request was sent."
         )
 
-    cfg = load_config()
-    user_providers = cfg.get("providers")
-    if not isinstance(user_providers, dict):
-        user_providers = {}
-    custom_providers = get_compatible_custom_providers(cfg)
+    if requested_provider and not requested_model:
+        if requested_provider.lower() != current_provider.lower():
+            raise ValueError(
+                f"Provider '{requested_provider}' is not the active provider and "
+                "therefore requires an explicit model. Call "
+                "list_profile_models() first and pass one exact local route. "
+                "No inference request was sent."
+            )
+        requested_model = current_model
+    elif not requested_model:
+        requested_model = current_model
+    if not requested_model:
+        raise ValueError(
+            f"Provider '{target_request}' has no active model. Call "
+            "list_profile_models() and pass an exact provider/model route. "
+            "No inference request was sent."
+        )
+
+    local_inventory = _configured_local_model_inventory(
+        current_provider=current_provider,
+        current_model=current_model,
+        current_base_url=current_base_url,
+    )
+    configured_provider_ids = {
+        str(row.get("provider") or "").strip().lower()
+        for row in local_inventory["providers"]
+        if isinstance(row, dict) and str(row.get("provider") or "").strip()
+    }
 
     result = switch_model(
         raw_input=requested_model,
@@ -3436,8 +3534,8 @@ def _resolve_llm_call_route(
         # Pinning the provider also prevents OpenRouter vendor slugs from
         # silently changing endpoints when the active provider is Codex.
         explicit_provider=target_request,
-        user_providers=user_providers,
-        custom_providers=custom_providers,
+        user_providers=local_inventory["user_providers"],
+        custom_providers=local_inventory["custom_providers"],
     )
     if not result.success:
         detail = (result.error_message or "model resolution failed").strip()
@@ -3462,36 +3560,20 @@ def _resolve_llm_call_route(
             "No inference request was sent."
         )
 
-    # Build the same curated/authenticated inventory used by Hermes model
-    # pickers.  Overlay the target route so an explicit custom provider is the
-    # one endpoint eligible for the targeted live probe.
-    configured_context = load_picker_context()
-    target_base_url = getattr(result, "base_url", "") or current_base_url
-    # Do not inject the candidate as ``current_model``: inventory keeps an
-    # active model visible even when it is absent from the provider catalog,
-    # which would turn this validation into a tautology.
-    picker_context = ConfigContext(
-        current_provider=resolved_provider,
-        current_model="",
-        current_base_url=target_base_url,
-        user_providers=getattr(configured_context, "user_providers", {}) or {},
-        custom_providers=getattr(configured_context, "custom_providers", []) or [],
-        excluded_providers=(
-            getattr(configured_context, "excluded_providers", []) or []
-        ),
-    )
-    payload = build_models_payload(
-        picker_context,
-        include_unconfigured=False,
-        for_picker=True,
-        probe_custom_providers=False,
-        probe_current_custom_provider=True,
-    )
+    if resolved_provider.lower() not in configured_provider_ids:
+        available = ", ".join(sorted(configured_provider_ids)) or "none"
+        raise ValueError(
+            f"Provider '{resolved_provider}' is not configured for this profile. "
+            f"Configured llm_call providers: {available}. Call "
+            "list_profile_models() before choosing a route. No inference request "
+            "was sent."
+        )
+
     provider_row = next(
         (
-            row for row in payload.get("providers", [])
+            row for row in local_inventory["providers"]
             if isinstance(row, dict)
-            and str(row.get("slug") or "").strip().lower()
+            and str(row.get("provider") or "").strip().lower()
             == resolved_provider.lower()
         ),
         None,
@@ -3641,7 +3723,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         extra_body = {"response_format": {"type": "json_object"}}
 
     try:
-        from agent.auxiliary_client import call_llm
+        from agent import auxiliary_client as auxiliary
 
         resolved_provider, resolved_model = _resolve_llm_call_route(
             model_override,
@@ -3653,7 +3735,12 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         except ImportError:
             extract_content_or_reasoning = _extract_content_or_reasoning_fallback
 
-        response = call_llm(
+        # ``auxiliary_client`` deliberately falls back to unrelated providers
+        # for several non-streaming failure classes, even when a provider was
+        # explicit. Its streaming path does not perform provider fallback.
+        # Consume that path synchronously so a failed Ollama/custom route can
+        # never escape to OpenRouter, Nous, or another ambient credential.
+        response: Any = auxiliary.call_llm(
             task=None,
             provider=resolved_provider,
             model=resolved_model,
@@ -3662,7 +3749,28 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             max_tokens=max_tokens,
             timeout=120.0,
             extra_body=extra_body,
+            stream=True,
         )
+        complete_response = (
+            isinstance(response, (dict, str, bytes))
+            or hasattr(response, "choices")
+            or hasattr(response, "content")
+        )
+        if not complete_response:
+            aggregate = getattr(auxiliary, "_aggregate_chat_stream", None)
+            if not callable(aggregate):
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError(
+                    "This Hermes runtime cannot aggregate a strict no-fallback "
+                    "LLM stream. Upgrade Hermes; no alternate provider was tried."
+                )
+            response = aggregate(
+                response,
+                model=resolved_model or "",
+                total_ceiling=120.0,
+            )
     except ImportError as e:
         return _tool_error(
             f"Cannot import call_llm from agent.auxiliary_client: {e}. "
@@ -3897,10 +4005,40 @@ def handle_ping_profile(args: dict, **kwargs) -> str:
 
 
 def handle_list_profile_models(args: dict, **kwargs) -> str:
-    """Return the target default and verified dispatchable model route aliases."""
+    """Return exact local llm_call routes or remote dispatch aliases."""
     profile = args.get("profile", "").strip()
     if not profile:
-        return _tool_error("'profile' is required.")
+        try:
+            from agent import auxiliary_client as auxiliary
+
+            inventory = _configured_local_model_inventory(
+                current_provider=(auxiliary._read_main_provider() or "").strip(),
+                current_model=(auxiliary._read_main_model() or "").strip(),
+                current_base_url=(auxiliary._read_main_base_url() or "").strip(),
+            )
+        except Exception as e:
+            return _tool_error(
+                f"Cannot list local llm_call routes: {type(e).__name__}: {e}"
+            )
+
+        routes = sorted(
+            (
+                {"provider": row["provider"], "model": model}
+                for row in inventory["providers"]
+                for model in row["models"]
+            ),
+            key=lambda route: (route["provider"], route["model"]),
+        )
+        return json.dumps({
+            "scope": "local",
+            "configured_default": inventory["configured_default"],
+            "available_routes": routes,
+            "route_count": len(routes),
+            "contract": (
+                "Pass one exact provider/model pair to llm_call. Unlisted "
+                "providers are rejected and inference never falls back."
+            ),
+        })
 
     pcfg, err = _resolve_profile(profile)
     if err:

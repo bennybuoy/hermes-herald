@@ -10,6 +10,46 @@ from unittest.mock import patch, MagicMock, ANY
 from hermes_herald import tools
 
 
+@pytest.fixture(autouse=True)
+def _declared_default_llm_route(monkeypatch):
+    """Most tests exercise response handling, not route discovery."""
+    from types import SimpleNamespace
+    import agent.auxiliary_client as auxiliary_client
+    import hermes_cli.model_switch as model_switch
+
+    monkeypatch.setattr(auxiliary_client, "_read_main_provider", lambda: "openai-codex")
+    monkeypatch.setattr(auxiliary_client, "_read_main_model", lambda: "gpt-5.6-sol")
+    monkeypatch.setattr(auxiliary_client, "_read_main_base_url", lambda: "")
+    monkeypatch.setattr(auxiliary_client, "_read_main_api_key", lambda: "")
+    monkeypatch.setattr(
+        tools,
+        "_configured_local_model_inventory",
+        lambda **kwargs: {
+            "configured_default": {
+                "provider": kwargs.get("current_provider") or "openai-codex",
+                "model": kwargs.get("current_model") or "gpt-5.6-sol",
+            },
+            "providers": [{
+                "provider": kwargs.get("current_provider") or "openai-codex",
+                "models": [kwargs.get("current_model") or "gpt-5.6-sol"],
+            }],
+            "user_providers": {},
+            "custom_providers": [],
+        },
+    )
+    monkeypatch.setattr(
+        model_switch,
+        "switch_model",
+        lambda raw_input, explicit_provider, **kwargs: SimpleNamespace(
+            success=True,
+            new_model=raw_input,
+            target_provider=explicit_provider,
+            base_url="",
+            error_message="",
+        ),
+    )
+
+
 class FakeChoice:
     """Simulates an OpenAI API response choice."""
     def __init__(self, text="", message_content=None):
@@ -75,6 +115,8 @@ class FakeUsageBare:
 def _install_route_resolution_fakes(
     monkeypatch,
     *,
+    current_provider="openai-codex",
+    current_model="gpt-5.6-sol",
     resolved_provider="openai-codex",
     resolved_model="gpt-5.6-sol",
     available_models=None,
@@ -86,8 +128,6 @@ def _install_route_resolution_fakes(
     import hermes_cli.inventory as inventory
     import hermes_cli.model_switch as model_switch
 
-    current_provider = "openai-codex"
-    current_model = "gpt-5.6-sol"
     current_base_url = "https://chatgpt.com/backend-api/codex"
     for name, value in (
         ("_read_main_provider", current_provider),
@@ -124,10 +164,38 @@ def _install_route_resolution_fakes(
         inventory,
         "build_models_payload",
         lambda *args, **kwargs: {
+            "providers": [
+                {
+                    "slug": current_provider,
+                    "models": [current_model],
+                },
+                {
+                    "slug": resolved_provider,
+                    "models": available_models or [
+                        "gpt-5.6-sol", "gpt-5.6-terra"
+                    ],
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        tools,
+        "_configured_local_model_inventory",
+        lambda **kwargs: {
+            "configured_default": {
+                "provider": current_provider,
+                "model": current_model,
+            },
             "providers": [{
-                "slug": resolved_provider,
-                "models": available_models or ["gpt-5.6-sol", "gpt-5.6-terra"],
-            }]
+                "provider": current_provider,
+                "models": (
+                    available_models
+                    if resolved_provider == current_provider and available_models
+                    else [current_model]
+                ),
+            }],
+            "user_providers": {},
+            "custom_providers": [],
         },
     )
     return switch
@@ -487,7 +555,7 @@ class TestLlmCallProviderProvenance:
     @patch("agent.auxiliary_client.call_llm")
     @patch("agent.auxiliary_client._read_main_provider")
     def test_requested_provider_is_not_claimed_as_actual(self, mock_read_main, mock_call_llm):
-        mock_read_main.return_value = "ollama-cloud"
+        mock_read_main.return_value = "openai-codex"
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
             model="claude-sonnet-4",
@@ -495,13 +563,13 @@ class TestLlmCallProviderProvenance:
 
         result = json.loads(tools.handle_llm_call({
             "messages": [{"role": "user", "content": "Hi"}],
-            "provider": "anthropic",
+            "provider": "openai-codex",
         }))
 
         assert result["provider"] == ""
-        assert result["requested_provider"] == "anthropic"
-        assert result["configured_provider"] == "ollama-cloud"
-        mock_read_main.assert_called_once_with()
+        assert result["requested_provider"] == "openai-codex"
+        assert result["configured_provider"] == "openai-codex"
+        assert mock_read_main.call_count == 2
 
     @patch("agent.auxiliary_client.call_llm")
     def test_explicit_response_provider_is_reported_as_actual(self, mock_call_llm):
@@ -514,15 +582,15 @@ class TestLlmCallProviderProvenance:
 
         result = json.loads(tools.handle_llm_call({
             "messages": [{"role": "user", "content": "Hi"}],
-            "provider": "openrouter",
+            "provider": "openai-codex",
         }))
 
         assert result["provider"] == "openai"
-        assert result["requested_provider"] == "openrouter"
+        assert result["requested_provider"] == "openai-codex"
 
     @patch("agent.auxiliary_client.call_llm")
     @patch("agent.auxiliary_client._read_main_provider")
-    def test_configured_provider_lookup_failure_is_graceful(self, mock_read_main, mock_call_llm):
+    def test_configured_provider_lookup_failure_fails_closed(self, mock_read_main, mock_call_llm):
         mock_read_main.side_effect = ImportError("not in Hermes session")
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
@@ -533,8 +601,9 @@ class TestLlmCallProviderProvenance:
             "messages": [{"role": "user", "content": "Hi"}],
         }))
 
-        assert result["provider"] == ""
-        assert result["configured_provider"] == ""
+        assert result["status"] == "error"
+        assert "No inference request was sent" in result["error"]
+        mock_call_llm.assert_not_called()
 
 
 class TestLlmCallModelOverride:
@@ -742,7 +811,7 @@ class TestLlmCallErrorHandling:
         original_import = builtins.__import__
 
         def mock_import(name, *args, **kwargs):
-            if name == "agent.auxiliary_client":
+            if name == "agent":
                 raise ImportError("No module named 'agent'")
             return original_import(name, *args, **kwargs)
 
@@ -860,6 +929,135 @@ class TestLlmCallParameterPassthrough:
         assert result["resolved_provider"] == "openai-codex"
         assert result["resolved_model"] == "gpt-5.6-sol"
         assert switch.call_args.kwargs["explicit_provider"] == "openai-codex"
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_no_overrides_pin_the_profile_default_route(
+        self, mock_call_llm, monkeypatch
+    ):
+        """An omitted route must never enter auxiliary_client's auto chain."""
+        mock_call_llm.return_value = FakeResponse(
+            choices=[FakeChoice(message_content="ok")],
+            model="glm-5.2",
+        )
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="ollama-cloud",
+            resolved_model="glm-5.2",
+            available_models=["glm-5.2", "qwen3.5:397b"],
+        )
+        import agent.auxiliary_client as auxiliary_client
+        monkeypatch.setattr(
+            auxiliary_client, "_read_main_provider", MagicMock(return_value="ollama-cloud")
+        )
+        monkeypatch.setattr(
+            auxiliary_client, "_read_main_model", MagicMock(return_value="glm-5.2")
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["resolved_provider"] == "ollama-cloud"
+        assert result["resolved_model"] == "glm-5.2"
+        assert mock_call_llm.call_args.kwargs["provider"] == "ollama-cloud"
+        assert mock_call_llm.call_args.kwargs["model"] == "glm-5.2"
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_llm_call_uses_no_fallback_streaming_path(
+        self, mock_call_llm, monkeypatch
+    ):
+        """Strict routing must bypass auxiliary_client's provider fallbacks."""
+        mock_call_llm.return_value = FakeResponse(
+            choices=[FakeChoice(message_content="ok")],
+            model="glm-5.2",
+        )
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="ollama-cloud",
+            resolved_model="glm-5.2",
+            available_models=["glm-5.2"],
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "model": "glm-5.2",
+        }))
+
+        assert result["text"] == "ok"
+        assert mock_call_llm.call_args.kwargs["stream"] is True
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_selected_route_failure_is_noisy_and_not_retried(
+        self, mock_call_llm, monkeypatch
+    ):
+        """A failed strict stream surfaces its error after one inference call."""
+        def broken_stream():
+            raise RuntimeError("selected Ollama route unavailable")
+            yield  # pragma: no cover - makes this a stream iterator
+
+        mock_call_llm.return_value = broken_stream()
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="ollama-cloud",
+            resolved_model="glm-5.2",
+            available_models=["glm-5.2"],
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["status"] == "error"
+        assert "selected Ollama route unavailable" in result["error"]
+        mock_call_llm.assert_called_once()
+        assert mock_call_llm.call_args.kwargs["stream"] is True
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_unconfigured_openrouter_route_is_rejected_before_inference(
+        self, mock_call_llm, monkeypatch
+    ):
+        """Ambient OpenRouter credentials are not a profile route declaration."""
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="openrouter",
+            resolved_model="z-ai/glm-5.2",
+            available_models=["z-ai/glm-5.2"],
+            resolved_base_url="https://openrouter.ai/api/v1",
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "provider": "openrouter",
+            "model": "glm-5.2",
+        }))
+
+        assert result["status"] == "error"
+        assert "not configured for this profile" in result["error"]
+        assert "ollama-cloud" in result["error"]
+        mock_call_llm.assert_not_called()
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_alternate_provider_requires_an_explicit_model(
+        self, mock_call_llm, monkeypatch
+    ):
+        _install_route_resolution_fakes(monkeypatch)
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+            "provider": "anthropic",
+        }))
+
+        assert result["status"] == "error"
+        assert "requires an explicit model" in result["error"]
+        mock_call_llm.assert_not_called()
 
     @patch("agent.auxiliary_client.call_llm")
     def test_family_model_resolves_to_active_advertised_variant(

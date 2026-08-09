@@ -42,7 +42,7 @@ Do not use Herald for non-Hermes A2A peers. Use Hermes's A2A tooling for Agent C
 | Audit calls or inspect topology | `dispatch_status` | Queries SQLite; full task text is opt-in |
 | Cancel a target run | `cancel_dispatch` | Cooperative; also retires the local listener after target stop succeeds |
 | Check target reachability | `ping_profile` | Liveness, not model-route authorization |
-| Discover safe model aliases | `list_profile_models` | Call before using either dispatch tool with `model=...` |
+| Discover safe model routes | `list_profile_models` | Omit `profile` for local `llm_call`; name a profile for remote dispatch |
 | Deny a relayed protected command | `approve_dispatch` | Deny-only in v1; requires the fresh Herald approval ID and human confirmation |
 
 ## Installation and Configuration
@@ -186,21 +186,30 @@ Use `llm_call` when you need only inference, not an agent loop:
 
 - `messages` must contain at least one `{role, content}` item.
 - Use either `system_prompt` or a system-role message, not both.
+- Call `list_profile_models()` before choosing a route. Its local mode returns
+  only the calling profile's configured default, user-provider, and
+  custom-provider routes; ambient OpenRouter, Nous Portal, and OAuth credentials
+  are not routing authority.
+- With no routing arguments, the request is pinned to the calling profile's
+  configured default provider and model.
 - `model` and `provider` are optional routing requests. A model-only request is
   pinned to the active provider; it does not infer a different endpoint from a
-  vendor-prefixed model name.
+  vendor-prefixed model name. A provider-only request may name only the active
+  provider; selecting another configured provider requires an explicit model.
 - Model overrides pass through Hermes's `/model` resolver and must match the
   selected provider's advertised authenticated inventory before the inference
   request. The inventory check may itself query that provider. Human forms such
   as `gpt5.6sol` normalize to `gpt-5.6-sol`; a family
   form such as `gpt-5.6` reuses the active advertised family variant. Unknown
-  models fail before a provider fallback can run.
+  models fail before inference.
 - Use exact provider IDs. Hermes maps bare `openai` to OpenRouter, so Herald
   refuses that ambiguous alias. Use `openai-codex` for ChatGPT Codex OAuth or
   `openrouter` only when OpenRouter is intentional.
 - `max_tokens` is a best-effort provider-dependent hint, not a universal cap.
 - `json_mode=true` adds a JSON-only instruction, requests structured output where supported, and rejects output that is not a valid JSON object.
-- `provider` is reported only when the response identifies the serving provider. `requested_provider` and `configured_provider` describe routing intent, not necessarily the fallback route that served the response.
+- A route failure is returned noisily. `llm_call` does not retry through an
+  unrelated configured or ambient provider.
+- `provider` is reported only when the response identifies the serving provider. `requested_provider` and `configured_provider` describe routing intent.
 - `requested_model`, `resolved_provider`, and `resolved_model` expose route
   resolution separately from the response-reported `model`.
 

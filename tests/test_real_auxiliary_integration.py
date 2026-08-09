@@ -111,10 +111,14 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
         )
 
         original_call = aux.call_llm
+        original_resolve = tools._resolve_llm_call_route
         def fake_call_llm(**kwargs):
             captured.update(kwargs)
             return response
         aux.call_llm = fake_call_llm
+        tools._resolve_llm_call_route = lambda provider, model: (
+            "requested-provider", "requested-model"
+        )
         try:
             result = json.loads(tools.handle_llm_call({{
                 "messages": [{{"role": "user", "content": "Solve"}}],
@@ -123,9 +127,12 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
             }}))
         finally:
             aux.call_llm = original_call
+            tools._resolve_llm_call_route = original_resolve
 
         assert captured["task"] is None
         assert captured["provider"] == "requested-provider"
+        assert captured["model"] == "requested-model"
+        assert captured["stream"] is True
         assert captured["extra_body"] == {{
             "response_format": {{"type": "json_object"}}
         }}

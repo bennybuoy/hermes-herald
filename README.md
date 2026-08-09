@@ -163,6 +163,14 @@ ping_profile(profile="tutor")
 list_profile_models(profile="tutor")
 ```
 
+For local `llm_call` routing, omit `profile`. The result is a fail-closed
+allowlist built from the calling profile's configured default, user providers,
+and custom providers; ambient OAuth or fallback credentials are excluded:
+
+```python
+list_profile_models()
+```
+
 The plugin also bundles an opt-in operating skill:
 
 ```python
@@ -316,7 +324,9 @@ Because the child is in-process, it is not durable across parent-process exit. U
 
 ## Pillar 3 — A lightweight inference lane
 
-`llm_call` goes directly through Hermes provider routing without an agent loop, tool schemas, terminal access, or subagent overhead.
+`llm_call` goes directly to one preflighted Hermes provider route without an
+agent loop, tool schemas, terminal access, subagent overhead, or cross-provider
+fallback.
 
 ```python
 # Classification
@@ -344,6 +354,12 @@ llm_call(
 
 Use it for tasks where tools and iterative reasoning would be overhead: routing, scoring, rewriting, extraction, translation, compact summarisation, and schema-constrained JSON.
 
+With no routing arguments, `llm_call` pins the calling profile's configured
+default provider and model. Before choosing an override, call
+`list_profile_models()` and use an exact returned `{provider, model}` pair. A
+provider-only override is accepted only for the active provider; selecting a
+different provider requires an explicit model.
+
 Model overrides are resolved through the same model-switch pipeline as Hermes's
 `/model` command, but Herald then requires the resolved wire slug to appear in
 the selected provider's authenticated model inventory **before the inference
@@ -351,7 +367,8 @@ request**. The inventory check may itself query the selected provider. A
 model-only request stays on the active provider; it cannot silently
 select OpenRouter from a vendor-prefixed slug. Family shorthand such as
 `gpt-5.6` resolves to the active advertised family variant (`gpt-5.6-sol` here).
-Unadvertised models fail before Hermes can enter a provider fallback chain.
+Unadvertised models and failed inference routes return a noisy error; Herald
+does not retry them through OpenRouter, Nous Portal, or another provider.
 
 Use exact provider IDs. In Hermes, bare `openai` is an alias for OpenRouter, so
 Herald refuses that ambiguous alias: use `openai-codex` for ChatGPT Codex OAuth
@@ -375,7 +392,7 @@ response-reported `model` and serving `provider` metadata.
 | `cancel_dispatch` | Request cooperative target cancellation and suppress late local delivery |
 | `approve_dispatch` | Deny the exact visible protected-command notice through human confirmation |
 | `ping_profile` | Check target API reachability |
-| `list_profile_models` | Discover exact target `model_routes` aliases accepted by both dispatch modes |
+| `list_profile_models` | Discover configured local `llm_call` routes, or exact remote `model_routes` aliases accepted by both dispatch modes |
 
 ---
 
@@ -505,7 +522,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **171 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **178 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 
