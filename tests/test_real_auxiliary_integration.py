@@ -320,7 +320,7 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
         )
         def close():
             built["closed"] = True
-            time.sleep(0.2)
+            time.sleep(3.0)
 
         return SimpleNamespace(
             base_url=base_url,
@@ -369,7 +369,7 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
     )
 
     assert list(stream) == []
-    assert time.monotonic() - started < 0.1
+    assert time.monotonic() - started < 2.0
     assert built["base_url"] == endpoint
     assert built["wrapper_base_url"] == endpoint
     assert built["api_key"] == "test-token"
@@ -377,6 +377,141 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
     assert built["timeout"] == 0.01
     assert built["closed"] is True
     assert captured["stream"] is True
+
+
+def test_custom_anthropic_request_cannot_outlive_total_deadline(monkeypatch):
+    """A progressively active native Anthropic call still has a hard deadline."""
+    from types import SimpleNamespace
+    from agent import anthropic_adapter
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    endpoint = "https://anthropic-custom.selected.example/anthropic"
+
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "build_anthropic_client",
+        lambda api_key, base_url, timeout=None: object(),
+    )
+
+    def wrapped_client(real, model, api_key, base_url, is_oauth=False):
+        def create(**kwargs):
+            time.sleep(3.0)
+            return "late-success"
+
+        return SimpleNamespace(
+            base_url=base_url,
+            close=lambda: None,
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create),
+            ),
+        )
+
+    monkeypatch.setattr(aux, "AnthropicAuxiliaryClient", wrapped_client)
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("custom Anthropic route must not enter generic routing")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="strict deadline"):
+        tools._create_strict_llm_stream(
+            aux,
+            tools._LlmCallRoute(
+                provider="custom:anthropic-wrapper",
+                model="claude-test",
+                base_url=endpoint,
+                api_key="test-token",
+                api_mode="anthropic_messages",
+            ),
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=None,
+            max_tokens=16,
+            extra_body=None,
+            timeout=0.02,
+        )
+
+    assert time.monotonic() - started < 2.0
+
+
+def test_custom_anthropic_request_error_survives_bounded_raising_close(monkeypatch):
+    """Owned-client cleanup cannot mask or prolong the provider failure."""
+    from types import SimpleNamespace
+    from agent import anthropic_adapter
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    endpoint = "https://anthropic-custom.selected.example/anthropic"
+
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "build_anthropic_client",
+        lambda api_key, base_url, timeout=None: object(),
+    )
+
+    def wrapped_client(real, model, api_key, base_url, is_oauth=False):
+        def create(**kwargs):
+            raise RuntimeError("provider-failure")
+
+        def close():
+            time.sleep(3.0)
+            raise RuntimeError("close-failure")
+
+        return SimpleNamespace(
+            base_url=base_url,
+            close=close,
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=create),
+            ),
+        )
+
+    monkeypatch.setattr(aux, "AnthropicAuxiliaryClient", wrapped_client)
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("custom Anthropic route must not enter generic routing")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="provider-failure"):
+        tools._create_strict_llm_stream(
+            aux,
+            tools._LlmCallRoute(
+                provider="custom:anthropic-wrapper",
+                model="claude-test",
+                base_url=endpoint,
+                api_key="test-token",
+                api_mode="anthropic_messages",
+            ),
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=None,
+            max_tokens=16,
+            extra_body=None,
+            timeout=0.02,
+        )
+
+    assert time.monotonic() - started < 2.0
 
 
 def test_plugin_strict_creation_rejects_unverifiable_endpoint(monkeypatch):

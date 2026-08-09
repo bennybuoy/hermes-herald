@@ -404,6 +404,8 @@ select OpenRouter from a vendor-prefixed slug. Family shorthand such as
 `gpt-5.6` resolves to the active advertised family variant (`gpt-5.6-sol` here).
 Unadvertised models and failed inference routes return a noisy error; Herald
 does not retry them through OpenRouter, Nous Portal, or another provider.
+Native custom-Anthropic requests are also bounded by the same hard monotonic
+deadline even when an SSE peer keeps sending progressive events.
 
 Use exact provider IDs. In Hermes, bare `openai` is an alias for OpenRouter, so
 Herald refuses that ambiguous alias: use `openai-codex` for ChatGPT Codex OAuth
@@ -557,7 +559,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **202 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **204 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

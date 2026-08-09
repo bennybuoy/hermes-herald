@@ -14,6 +14,8 @@ Plus management tools:
   - dispatch_status: list persisted runs from state file
   - cancel_dispatch: cooperative cancellation via /v1/runs/{id}/stop
   - ping_profile: health check for target profile reachability
+  - approve_dispatch: deny a pending remote approval request
+  - list_profile_models: discover executable local or remote model routes
 
 Config (config.yaml):
   hermes_herald:

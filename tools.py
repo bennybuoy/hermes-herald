@@ -4050,7 +4050,35 @@ def _create_strict_llm_stream(
         route.api_mode.lower() == "anthropic_messages"
     )
     try:
-        return client.chat.completions.create(**kwargs)
+        if not owns_client:
+            return client.chat.completions.create(**kwargs)
+
+        request_events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def _request_owned_client() -> None:
+            try:
+                request_events.put(("result", client.chat.completions.create(**kwargs)))
+            except Exception as exc:
+                request_events.put(("error", exc))
+
+        request_thread = threading.Thread(
+            target=_request_owned_client,
+            daemon=True,
+            name="herald-strict-anthropic-request",
+        )
+        request_thread.start()
+        try:
+            event, value = request_events.get(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        except queue.Empty as exc:
+            raise TimeoutError(
+                "Selected custom Anthropic request exceeded its strict deadline; "
+                "no alternate provider was tried."
+            ) from exc
+        if event == "error":
+            raise value
+        return value
     finally:
         if owns_client:
             close_fn = getattr(client, "close", None)
