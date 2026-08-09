@@ -282,6 +282,121 @@ def test_plugin_strict_creation_rejects_endpoint_mutation(monkeypatch):
         )
 
 
+def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch):
+    """Named custom Anthropic routes keep their raw /anthropic endpoint."""
+    from types import SimpleNamespace
+    from agent import anthropic_adapter
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    built = {}
+    captured = {}
+    real_client = object()
+
+    def build_anthropic_client(api_key, base_url):
+        built.update(api_key=api_key, base_url=base_url)
+        return real_client
+
+    def wrapped_client(real, model, api_key, base_url, is_oauth=False):
+        assert real is real_client
+        built.update(
+            model=model,
+            wrapper_api_key=api_key,
+            wrapper_base_url=base_url,
+            is_oauth=is_oauth,
+        )
+        return SimpleNamespace(
+            base_url=base_url,
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: captured.update(kwargs) or iter(())
+                )
+            ),
+        )
+
+    monkeypatch.setattr(anthropic_adapter, "build_anthropic_client", build_anthropic_client)
+    monkeypatch.setattr(aux, "AnthropicAuxiliaryClient", wrapped_client)
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("custom Anthropic route must not enter generic routing")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+
+    endpoint = "https://anthropic-custom.selected.example/anthropic"
+    stream = tools._create_strict_llm_stream(
+        aux,
+        tools._LlmCallRoute(
+            provider="custom:anthropic-wrapper",
+            model="claude-test",
+            base_url=endpoint,
+            api_key="test-token",
+            api_mode="anthropic_messages",
+        ),
+        messages=[{"role": "user", "content": "Hi"}],
+        temperature=None,
+        max_tokens=16,
+        extra_body=None,
+        timeout=120.0,
+    )
+
+    assert list(stream) == []
+    assert built["base_url"] == endpoint
+    assert built["wrapper_base_url"] == endpoint
+    assert built["api_key"] == "test-token"
+    assert built["wrapper_api_key"] == "test-token"
+    assert captured["stream"] is True
+
+
+def test_plugin_strict_creation_rejects_unverifiable_endpoint(monkeypatch):
+    """Matching malformed endpoint strings are not treated as verified URLs."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    calls = []
+    client = SimpleNamespace(
+        base_url="not-a-valid-http-endpoint",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: calls.append(kwargs))
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model=None, **kwargs: (client, model),
+    )
+    monkeypatch.setattr(aux, "_build_call_kwargs", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="cannot be verified"):
+        tools._create_strict_llm_stream(
+            aux,
+            tools._LlmCallRoute(
+                provider="custom:invalid",
+                model="strict-model",
+                base_url="not-a-valid-http-endpoint",
+                api_key="test-token",
+                api_mode="chat_completions",
+            ),
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=None,
+            max_tokens=None,
+            extra_body=None,
+            timeout=120.0,
+        )
+
+    assert calls == []
+
+
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
     """Load real auxiliary_client and exercise the plugin's production imports."""
     script = textwrap.dedent(

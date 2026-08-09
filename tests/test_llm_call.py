@@ -127,6 +127,7 @@ def _install_route_resolution_fakes(
     resolved_model="gpt-5.6-sol",
     available_models=None,
     resolved_base_url="https://chatgpt.com/backend-api/codex",
+    resolved_api_key="test-token",
 ):
     """Install deterministic current-runtime, resolver, and inventory fakes."""
     from types import SimpleNamespace
@@ -153,7 +154,7 @@ def _install_route_resolution_fakes(
         new_model=resolved_model,
         target_provider=resolved_provider,
         base_url=resolved_base_url,
-        api_key="test-token",
+        api_key=resolved_api_key,
         api_mode="chat_completions",
         error_message="",
     ))
@@ -1205,6 +1206,24 @@ class TestLlmCallParameterPassthrough:
 
         assert result["status"] == "error"
         assert "test-token" not in result["error"]
+        assert "[REDACTED]" in result["error"]
+
+    @patch("hermes_herald.tools._create_strict_llm_stream")
+    def test_selected_route_error_redacts_short_api_key(self, mock_call_llm, monkeypatch):
+        _install_route_resolution_fakes(
+            monkeypatch,
+            resolved_api_key="abc",
+        )
+        mock_call_llm.side_effect = RuntimeError(
+            "401 reflected Authorization: Bearer abc"
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["status"] == "error"
+        assert "abc" not in result["error"]
         assert "[REDACTED]" in result["error"]
 
     @patch("hermes_herald.tools._create_strict_llm_stream")

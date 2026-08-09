@@ -3848,6 +3848,29 @@ def _aggregate_llm_call_stream(
     }
 
 
+def _strict_base_url_identity(value: Any) -> Optional[tuple[str, str, int, str]]:
+    """Return a comparable HTTP endpoint identity, or None when unverifiable."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or any(character.isspace() for character in parsed.netloc)
+    ):
+        return None
+    effective_port = port or (443 if scheme == "https" else 80)
+    return (scheme, hostname, effective_port, parsed.path.rstrip("/"))
+
+
 def _create_strict_llm_stream(
     auxiliary: Any,
     route: _LlmCallRoute,
@@ -3874,15 +3897,54 @@ def _create_strict_llm_stream(
     client_provider = (
         "custom" if route.provider.lower().startswith("custom:") else route.provider
     )
-    client_result = cast(Any, get_client(
-        client_provider,
-        route.model,
-        base_url=route.base_url,
-        api_key=route.api_key,
-        api_mode=route.api_mode,
-        task=None,
-    ))
-    client, final_model = client_result
+    route_endpoint = _strict_base_url_identity(route.base_url)
+    if route_endpoint is None:
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' has an endpoint that cannot be "
+            "verified; no inference request was sent."
+        )
+    if client_provider == "custom" and route.api_mode.lower() == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+        except ImportError as exc:
+            raise RuntimeError(
+                "Installed Hermes core lacks the Anthropic client builder required "
+                "for this strict custom route; upgrade Hermes. No inference request "
+                "was sent."
+            ) from exc
+        anthropic_wrapper = cast(
+            Any, getattr(auxiliary, "AnthropicAuxiliaryClient", None)
+        )
+        if not callable(anthropic_wrapper):
+            raise RuntimeError(
+                "Installed Hermes core lacks the Anthropic wrapper required for this "
+                "strict custom route; upgrade Hermes. No inference request was sent."
+            )
+        real_client = build_anthropic_client(route.api_key, route.base_url)
+        if real_client is None:
+            raise RuntimeError(
+                f"Selected provider '{route.provider}' could not construct an "
+                "Anthropic client; no alternate provider was tried."
+            )
+        client = anthropic_wrapper(
+            real_client,
+            route.model,
+            route.api_key,
+            route.base_url,
+            is_oauth=False,
+        )
+        final_model = route.model
+    else:
+        client_result = cast(Any, get_client(
+            client_provider,
+            route.model,
+            base_url=route.base_url,
+            api_key=route.api_key,
+            api_mode=route.api_mode,
+            task=None,
+        ))
+        client, final_model = client_result
+    client = cast(Any, client)
     if client is None:
         raise RuntimeError(
             f"Selected provider '{route.provider}' could not construct a client; "
@@ -3894,14 +3956,6 @@ def _create_strict_llm_stream(
             f"Selected provider changed model '{route.model}' to '{final_model}'; "
             "no inference request was sent and no alternate provider was tried."
         )
-    def _base_url_identity(value: Any) -> tuple[str, str, str]:
-        parsed = urlsplit(str(value or "").strip())
-        return (
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
-            parsed.path.rstrip("/"),
-        )
-
     client_base_url = ""
     for candidate in (
         client,
@@ -3917,7 +3971,13 @@ def _create_strict_llm_stream(
             f"Selected provider '{route.provider}' returned a client whose endpoint "
             "cannot be verified; no inference request was sent."
         )
-    if _base_url_identity(client_base_url) != _base_url_identity(route.base_url):
+    client_endpoint = _strict_base_url_identity(client_base_url)
+    if client_endpoint is None:
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' returned a client whose endpoint "
+            "cannot be verified; no inference request was sent."
+        )
+    if client_endpoint != route_endpoint:
         raise RuntimeError(
             f"Selected provider '{route.provider}' changed endpoint during client "
             "construction; no inference request was sent and no alternate provider "
@@ -4068,7 +4128,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         )
     except Exception as e:
         error_text = str(e)
-        if route is not None and len(route.api_key) >= 4:
+        if route is not None and route.api_key:
             error_text = error_text.replace(route.api_key, "[REDACTED]")
         return _tool_error(f"LLM call failed: {type(e).__name__}: {error_text}")
 
