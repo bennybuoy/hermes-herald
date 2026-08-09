@@ -601,13 +601,12 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional model name or alias. It is resolved against the "
-                    "explicit provider, or the active provider when provider "
-                    "is omitted, then checked against that provider's "
-                    "advertised models before inference. Examples: "
+                    "Optional exact model ID from an available_routes entry. "
+                    "For an override, provider and model must be supplied together "
+                    "and match the same advertised entry. Examples: "
                     "'gpt-5.6-sol' on 'openai-codex', "
-                    "'claude-sonnet-4-6' on 'anthropic'. Uses the active "
-                    "model by default."
+                    "'claude-sonnet-4-6' on 'anthropic'. Omit both routing "
+                    "fields to use the host's active route."
                 ),
             },
             "provider": {
@@ -616,10 +615,10 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
                     "Optional provider override (e.g. 'openrouter', "
                     "'openai-codex', 'anthropic', 'ollama-cloud'). Use the "
                     "exact provider ID: Hermes's ambiguous 'openai' alias "
-                    "resolves to OpenRouter and is refused here. An alternate "
-                    "provider must be returned by list_profile_models and "
-                    "requires an explicit model. Uses the active provider by "
-                    "default."
+                    "resolves to OpenRouter and is refused here. For an override, "
+                    "provider and model must be supplied together and match one "
+                    "available_routes entry. Omit both routing fields to use "
+                    "the host's active route."
                 ),
             },
             "temperature": {
@@ -641,8 +640,8 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
                 "type": "boolean",
                 "description": (
                     "If true, add a cross-provider JSON-only instruction, "
-                    "request response_format where supported, and reject "
-                    "responses that are not valid JSON objects. Default: false."
+                    "then reject responses that are not valid JSON objects. "
+                    "Default: false."
                 ),
             },
         },

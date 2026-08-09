@@ -233,6 +233,10 @@ def test_invalid_inputs_do_not_reach_host(args, host_llm):
 
 def test_schema_teaches_discovery_before_exact_pair_execution():
     description = tools.LLM_CALL_SCHEMA["description"]
+    properties = tools.LLM_CALL_SCHEMA["parameters"]["properties"]
     assert "list_profile_models" in description
     assert "provider/model pair" in description
-    assert tools.LLM_CALL_SCHEMA["parameters"]["properties"]["messages"]["minItems"] == 1
+    assert properties["messages"]["minItems"] == 1
+    assert "must be supplied together" in properties["model"]["description"]
+    assert "must be supplied together" in properties["provider"]["description"]
+    assert "response_format" not in properties["json_mode"]["description"]
