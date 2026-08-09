@@ -188,35 +188,27 @@ Use `llm_call` when you need only inference, not an agent loop:
 - Use either `system_prompt` or a system-role message, not both.
 - Call `list_profile_models()` before choosing a route. Its local mode returns
   the calling profile's configured default plus every provider explicitly
-  configured by the user, filtered to concrete pairs that round-trip through
-  Hermes's resolver as complete executable routes. Virtual MoA routes,
-  unresolvable picker identities, ambient or auto-discovered credentials, and
-  fallback-only routes are not routing authority.
-- With no routing arguments, the request is pinned to the calling profile's
-  configured default provider and model.
+  configured by the user as exact provider/model slugs. Virtual MoA routes,
+  ambient or auto-discovered credentials, and fallback-only routes are not
+  routing authority.
+- With no routing arguments, Hermes uses the host's active configured route.
 - Prefer that configured default. Do not choose another provider merely because
   it advertises the same model; override only when the task or user explicitly
   calls for that endpoint.
-- `model` and `provider` are optional routing requests. A model-only request is
-  pinned to the active provider; it does not infer a different endpoint from a
-  vendor-prefixed model name. A provider-only request may name only the active
-  provider; selecting another configured provider requires an explicit model.
-- Model overrides pass through Hermes's `/model` resolver and must match the
-  selected provider's advertised authenticated inventory before the inference
-  request. The inventory check may itself query that provider. Human forms such
-  as `gpt5.6sol` normalize to `gpt-5.6-sol`; a family
-  form such as `gpt-5.6` reuses the active advertised family variant. Unknown
-  models fail before inference.
-- Use exact provider IDs. Hermes maps bare `openai` to OpenRouter, so Herald
-  refuses that ambiguous alias. Use `openai-codex` for ChatGPT Codex OAuth or
-  `openrouter` only when OpenRouter is intentional.
+- `model` and `provider` are optional only as a pair: supply both by copying one
+  exact `available_routes` entry, or omit both.
+- Herald checks that pair against configured discovery and passes it unchanged
+  to Hermes's public `ctx.llm.complete()` facade. Hermes owns credentials,
+  transport, provider resolution, timeout behavior, and fallback policy.
+- Explicit selection also requires the host's
+  `plugins.entries.hermes-herald.llm` trust policy to permit provider and model
+  overrides. Missing trust configuration fails closed.
 - `max_tokens` is a best-effort provider-dependent hint, not a universal cap.
-- `json_mode=true` adds a JSON-only instruction, requests structured output where supported, and rejects output that is not a valid JSON object.
-- A route failure is returned noisily. `llm_call` does not retry through an
-  unrelated configured or ambient provider.
-- `provider` is reported only when the response identifies the serving provider. `requested_provider` and `configured_provider` describe routing intent.
-- `requested_model`, `resolved_provider`, and `resolved_model` expose route
-  resolution separately from the response-reported `model`.
+- `json_mode=true` adds a JSON-only instruction and rejects output that is not a valid JSON object.
+- A route failure is returned noisily. Herald itself does not retry the call;
+  host behavior remains governed by Hermes.
+- Results report the requested pair separately from the provider/model returned
+  by the host facade.
 
 ## Run Recovery and Cancellation
 

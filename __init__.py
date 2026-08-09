@@ -66,12 +66,15 @@ _TOOLS = (
 
 def register(ctx) -> None:
     """Register all Hermes Herald tools. Called once by the plugin loader."""
+    def _host_llm_handler(args: dict, **kwargs) -> str:
+        return handle_llm_call(args, _llm=ctx.llm, **kwargs)
+
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(
             name=name,
             toolset="hermes_herald",
             schema=schema,
-            handler=handler,
+            handler=_host_llm_handler if name == "llm_call" else handler,
             emoji=emoji,
         )
     logger.info(

@@ -127,14 +127,8 @@ class TestLocalModelRouteDiscovery:
         monkeypatch.setattr(
             model_switch,
             "switch_model",
-            lambda raw_input, explicit_provider, **kwargs: SimpleNamespace(
-                success=explicit_provider != "custom:openai-2",
-                target_provider=explicit_provider,
-                new_model=raw_input,
-                base_url=f"http://{explicit_provider}.example/v1",
-                api_key="test-key",
-                api_mode="chat_completions",
-                error_message="",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("discovery must report configured slugs without resolving them")
             ),
         )
         captured = {}
@@ -163,9 +157,10 @@ class TestLocalModelRouteDiscovery:
         assert result["available_routes"] == [
             {"provider": "backup", "model": "backup-model"},
             {"provider": "custom:llamaherd", "model": "glm-5.2"},
+            {"provider": "custom:openai-2", "model": "model-b"},
             {"provider": "ollama-cloud", "model": "glm-5.2"},
         ]
-        assert result["route_count"] == 3
+        assert result["route_count"] == 4
         assert captured["explicit_only"] is True
         assert captured["include_unconfigured"] is False
 

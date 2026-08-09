@@ -19,20 +19,17 @@ except delegate_subagent which runs in a background thread.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import math
 import os
-import queue
 import time
 import tempfile
 import threading
 import uuid
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
-from urllib.parse import parse_qsl, urlsplit
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
 
@@ -550,22 +547,17 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
     "description": (
         "Make a bare LLM inference call without the full agent loop, tool "
         "schemas, or subagent overhead. Send messages and get text back. "
-        "Runs synchronously on one preflighted provider/model route and never "
-        "falls back to another provider. Call list_profile_models without a "
-        "profile first to see this calling profile's configured routes. With "
-        "no routing overrides, the configured default provider and model are "
-        "used exactly.\n\n"
+        "Call list_profile_models without a profile first to see this calling "
+        "profile's configured routes, then copy one exact provider/model pair. "
+        "Omit both routing fields to use the host's active configured route. "
+        "Hermes's public plugin LLM service owns authentication, transport, "
+        "routing policy, and provider execution.\n\n"
         "Use this for: classification, translation, summarization, scoring, "
         "extraction, or any task where you just need the model's response "
         "without tool-calling or agentic context.\n\n"
-        "The returned provider is populated only when the provider response "
-        "explicitly identifies itself; requested_provider and "
-        "configured_provider preserve routing intent without guessing which "
-        "server handled the call. "
-        "Model overrides are resolved through Hermes's /model pipeline and "
-        "must exist in the selected provider's advertised inventory before "
-        "the inference request is sent. Inventory validation may query the "
-        "selected provider's model catalog.\n\n"
+        "An explicit provider/model pair must exactly match one configured "
+        "available_routes entry. The host may reject overrides under its "
+        "plugin trust policy.\n\n"
         "For a full agent with tools and terminal access, use "
         "delegate_subagent or dispatch_agent instead."
     ),
@@ -3336,64 +3328,20 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _strip_inline_reasoning_blocks(content: str) -> str:
-    """Remove inline reasoning wrappers from model-visible output."""
-    import re
-
-    return re.sub(
-        r"<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>"
-        r".*?"
-        r"</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>",
-        "",
-        content,
-        flags=re.DOTALL | re.IGNORECASE,
-    ).strip()
-
-
-def _extract_content_or_reasoning_fallback(response: Any) -> str:
-    """Compatibility fallback for Hermes cores without the shared extractor."""
-    choices = getattr(response, "choices", None)
-    if not choices:
-        return ""
-    message = choices[0].message
-    content = getattr(message, "content", "") or ""
-    if isinstance(content, str) and content.strip():
-        cleaned = _strip_inline_reasoning_blocks(content)
-        if cleaned:
-            return cleaned
-
-    parts = []
-    for field in ("reasoning", "reasoning_content"):
-        value = getattr(message, field, None)
-        if isinstance(value, str) and value.strip() and value.strip() not in parts:
-            parts.append(value.strip())
-    details = getattr(message, "reasoning_details", None)
-    if isinstance(details, list):
-        for detail in details:
-            if isinstance(detail, dict):
-                value = detail.get("summary") or detail.get("content") or detail.get("text")
-                if isinstance(value, str) and value.strip() and value.strip() not in parts:
-                    parts.append(value.strip())
-    return "\n\n".join(parts)
-
-
 def _configured_local_model_inventory(
     *,
     current_provider: str = "",
     current_model: str = "",
     current_base_url: str = "",
-    current_api_key: str = "",
 ) -> dict:
-    """Return model routes explicitly owned by the active profile.
+    """Return provider/model slugs explicitly configured for this profile.
 
     The host inventory's ``explicit_only`` contract excludes ambient/auto-
-    discovered credentials while retaining the current provider and every
-    provider explicitly configured by the user. API keys and base URLs never
-    leave this helper.
+    discovered credentials while retaining the active provider and user-
+    configured providers. Discovery reports the host's slugs; Hermes owns
+    route resolution and credentials when a selected pair is executed.
     """
     from hermes_cli.inventory import ConfigContext, build_models_payload, load_picker_context
-    from hermes_cli.model_normalize import normalize_model_for_provider
-    from hermes_cli.model_switch import switch_model
 
     configured = load_picker_context()
     live_provider = (current_provider or configured.current_provider or "").strip()
@@ -3433,48 +3381,13 @@ def _configured_local_model_inventory(
             for model in (row.get("models") or [])
             if isinstance(model, str) and model.strip()
         })
-        # MoA is a virtual orchestration facade. auxiliary_client unwraps it
-        # after preflight and discards the supplied endpoint credentials, so it
-        # cannot satisfy llm_call's one-route contract. Synthetic picker IDs
-        # are retained only when they round-trip through the host resolver as
-        # the same complete executable provider/model pair.
+        # MoA is a virtual orchestration facade rather than a configured model
+        # endpoint, so it is not a provider/model pair an agent can copy into
+        # llm_call.
         if provider.lower() == "moa":
             continue
-        models = []
-        for model in advertised_models:
-            result = switch_model(
-                raw_input=model,
-                current_provider=live_provider or provider,
-                current_model=live_model,
-                current_base_url=live_base_url,
-                current_api_key=current_api_key,
-                is_global=False,
-                explicit_provider=provider,
-                user_providers=user_providers,
-                custom_providers=custom_providers,
-            )
-            if not result.success:
-                continue
-            resolved_provider = str(result.target_provider or provider).strip()
-            resolved_model = str(result.new_model or "").strip()
-            if resolved_provider.lower() != provider.lower():
-                continue
-            advertised_key = (
-                normalize_model_for_provider(model, provider) or model
-            ).strip().lower()
-            resolved_key = (
-                normalize_model_for_provider(resolved_model, provider) or resolved_model
-            ).strip().lower()
-            if advertised_key != resolved_key:
-                continue
-            if not all(
-                str(getattr(result, field_name, "") or "").strip()
-                for field_name in ("base_url", "api_key", "api_mode")
-            ):
-                continue
-            models.append(model)
-        if models:
-            providers.append({"provider": provider, "models": models})
+        if advertised_models:
+            providers.append({"provider": provider, "models": advertised_models})
     providers.sort(key=lambda row: row["provider"])
 
     configured_default = {"provider": live_provider, "model": live_model}
@@ -3492,725 +3405,8 @@ def _configured_local_model_inventory(
     }
 
 
-@dataclass(frozen=True)
-class _LlmCallRoute:
-    provider: str
-    model: str
-    base_url: str
-    api_key: str = field(repr=False)
-    api_mode: str
-
-
-def _resolve_llm_call_route(
-    model_override: Optional[str],
-    provider_override: Optional[str],
-) -> _LlmCallRoute:
-    """Resolve and validate an ``llm_call`` route before inference.
-
-    ``call_llm`` expects a provider wire-model ID; it does not apply the
-    interactive ``/model`` alias/fuzzy resolver.  Resolve against the explicit
-    provider, or pin model-only requests to the active provider, then require
-    the resolved model to be present in that provider's advertised inventory.
-    This prevents an invalid slug from failing on the intended route and then
-    escaping through an unrelated fallback provider.
-    """
-    requested_model = (model_override or "").strip()
-    requested_provider = (provider_override or "").strip()
-    if requested_provider.lower() == "openai":
-        raise ValueError(
-            "Provider 'openai' is ambiguous in Hermes and may select OpenRouter "
-            "or direct OpenAI. Use provider='openrouter' only when that endpoint "
-            "is intentional; for ChatGPT Codex OAuth use provider='openai-codex'. "
-            "No inference request was sent."
-        )
-    from agent import auxiliary_client as auxiliary
-    from hermes_cli.model_normalize import normalize_model_for_provider
-    from hermes_cli.model_switch import switch_model
-
-    def _read_runtime(name: str) -> str:
-        reader = getattr(auxiliary, name, None)
-        if not callable(reader):
-            return ""
-        try:
-            value = reader()
-        except Exception:
-            return ""
-        return value.strip() if isinstance(value, str) else ""
-
-    current_provider = _read_runtime("_read_main_provider")
-    current_model = _read_runtime("_read_main_model")
-    current_base_url = _read_runtime("_read_main_base_url")
-    current_api_key = _read_runtime("_read_main_api_key")
-    target_request = requested_provider or current_provider
-    if not target_request:
-        raise ValueError(
-            "A model override requires an active provider or an explicit "
-            "'provider' value. No inference request was sent."
-        )
-
-    if requested_provider and not requested_model:
-        if requested_provider.lower() != current_provider.lower():
-            raise ValueError(
-                f"Provider '{requested_provider}' is not the active provider and "
-                "therefore requires an explicit model. Call "
-                "list_profile_models() first and pass one exact local route. "
-                "No inference request was sent."
-            )
-        requested_model = current_model
-    elif not requested_model:
-        requested_model = current_model
-    if not requested_model:
-        raise ValueError(
-            f"Provider '{target_request}' has no active model. Call "
-            "list_profile_models() and pass an exact provider/model route. "
-            "No inference request was sent."
-        )
-
-    local_inventory = _configured_local_model_inventory(
-        current_provider=current_provider,
-        current_model=current_model,
-        current_base_url=current_base_url,
-        current_api_key=current_api_key,
-    )
-    configured_provider_ids = {
-        str(row.get("provider") or "").strip().lower()
-        for row in local_inventory["providers"]
-        if isinstance(row, dict) and str(row.get("provider") or "").strip()
-    }
-
-    result = switch_model(
-        raw_input=requested_model,
-        current_provider=current_provider or target_request,
-        current_model=current_model,
-        current_base_url=current_base_url,
-        current_api_key=current_api_key,
-        is_global=False,
-        # A model-only llm_call means "this model on my active provider".
-        # Pinning the provider also prevents OpenRouter vendor slugs from
-        # silently changing endpoints when the active provider is Codex.
-        explicit_provider=target_request,
-        user_providers=local_inventory["user_providers"],
-        custom_providers=local_inventory["custom_providers"],
-    )
-    if not result.success:
-        detail = (result.error_message or "model resolution failed").strip()
-        raise ValueError(f"Could not resolve model '{requested_model}': {detail}")
-
-    resolved_provider = (result.target_provider or target_request).strip()
-    resolved_model = (result.new_model or "").strip()
-    if (
-        requested_provider
-        and resolved_provider.lower() == "openrouter"
-        and requested_provider.lower() != "openrouter"
-    ):
-        raise ValueError(
-            f"Provider '{requested_provider}' resolves to OpenRouter in Hermes. "
-            "Use provider='openrouter' only when that endpoint is intentional; "
-            "for ChatGPT Codex OAuth use provider='openai-codex'. No inference "
-            "request was sent."
-        )
-    if not resolved_provider or not resolved_model:
-        raise ValueError(
-            f"Model resolver returned an incomplete route for '{requested_model}'. "
-            "No inference request was sent."
-        )
-
-    if resolved_provider.lower() not in configured_provider_ids:
-        available = ", ".join(sorted(configured_provider_ids)) or "none"
-        raise ValueError(
-            f"Provider '{resolved_provider}' is not configured for this profile. "
-            f"Configured llm_call providers: {available}. Call "
-            "list_profile_models() before choosing a route. No inference request "
-            "was sent."
-        )
-
-    provider_row = next(
-        (
-            row for row in local_inventory["providers"]
-            if isinstance(row, dict)
-            and str(row.get("provider") or "").strip().lower()
-            == resolved_provider.lower()
-        ),
-        None,
-    )
-    available = [
-        str(model).strip()
-        for model in ((provider_row or {}).get("models") or [])
-        if isinstance(model, str) and model.strip()
-    ]
-
-    candidate_key = (
-        normalize_model_for_provider(resolved_model, resolved_provider)
-        or resolved_model
-    ).strip().lower()
-    canonical_model = next(
-        (
-            model for model in available
-            if (
-                normalize_model_for_provider(model, resolved_provider) or model
-            ).strip().lower() == candidate_key
-        ),
-        None,
-    )
-    if canonical_model is None and resolved_provider.lower() == current_provider.lower():
-        current_key = (
-            normalize_model_for_provider(current_model, resolved_provider)
-            or current_model
-        ).strip().lower()
-        active_variant = next(
-            (
-                model for model in available
-                if (
-                    normalize_model_for_provider(model, resolved_provider) or model
-                ).strip().lower() == current_key
-            ),
-            None,
-        )
-        if active_variant is not None and current_key.startswith(f"{candidate_key}-"):
-            canonical_model = active_variant
-    if canonical_model is None:
-        import difflib
-
-        suggestions = difflib.get_close_matches(
-            resolved_model,
-            available,
-            n=4,
-            cutoff=0.3,
-        )
-        hint = (
-            f" Close matches: {', '.join(suggestions)}."
-            if suggestions else ""
-        )
-        raise ValueError(
-            f"Model '{resolved_model}' is not advertised by provider "
-            f"'{resolved_provider}'.{hint} No inference request was sent."
-        )
-
-    route_base_url = str(getattr(result, "base_url", "") or "").strip()
-    route_api_key = str(getattr(result, "api_key", "") or "").strip()
-    route_api_mode = str(getattr(result, "api_mode", "") or "").strip()
-    missing = [
-        name for name, value in (
-            ("base_url", route_base_url),
-            ("api_key", route_api_key),
-            ("api_mode", route_api_mode),
-        )
-        if not value
-    ]
-    if missing:
-        raise ValueError(
-            f"Provider '{resolved_provider}' did not resolve a complete executable "
-            f"route ({', '.join(missing)} missing). Re-authenticate or select a "
-            "different route with `hermes model`. No inference request was sent."
-        )
-
-    return _LlmCallRoute(
-        provider=resolved_provider,
-        model=canonical_model,
-        base_url=route_base_url,
-        api_key=route_api_key,
-        api_mode=route_api_mode,
-    )
-
-
-def _aggregate_llm_call_stream(
-    chunks: Any,
-    *,
-    model: str,
-    total_ceiling: float = 120.0,
-) -> Dict[str, Any]:
-    """Consume one strict chat stream without depending on core private helpers."""
-    started = time.monotonic()
-    content_parts: List[str] = []
-    reasoning_parts: List[str] = []
-    usage: Any = None
-    response_model = model
-    saw_chunk = False
-
-    events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=64)
-    stop_producer = threading.Event()
-
-    def _put_event(event: str, payload: Any) -> bool:
-        while not stop_producer.is_set():
-            try:
-                events.put((event, payload), timeout=0.1)
-                return True
-            except queue.Full:
-                continue
-        return False
-
-    def _produce() -> None:
-        try:
-            for chunk in chunks:
-                if not _put_event("chunk", chunk):
-                    return
-        except BaseException as exc:
-            _put_event("error", exc)
-        finally:
-            _put_event("done", None)
-
-    threading.Thread(
-        target=_produce,
-        name="herald-llm-stream",
-        daemon=True,
-    ).start()
-    deadline = started + total_ceiling
-
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Strict llm_call stream timed out after {total_ceiling:.0f}s"
-                )
-            try:
-                event, payload = events.get(timeout=remaining)
-            except queue.Empty as exc:
-                raise TimeoutError(
-                    f"Strict llm_call stream timed out after {total_ceiling:.0f}s"
-                ) from exc
-            if event == "done":
-                break
-            if event == "error":
-                raise payload
-            chunk = payload
-            saw_chunk = True
-            if isinstance(chunk, dict):
-                chunk_model = chunk.get("model")
-                chunk_usage = chunk.get("usage")
-                choices = chunk.get("choices") or []
-            else:
-                chunk_model = getattr(chunk, "model", None)
-                chunk_usage = getattr(chunk, "usage", None)
-                choices = getattr(chunk, "choices", None) or []
-            if isinstance(chunk_model, str) and chunk_model.strip():
-                response_model = chunk_model.strip()
-            if chunk_usage is not None:
-                usage = chunk_usage
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = (
-                choice.get("delta")
-                if isinstance(choice, dict)
-                else getattr(choice, "delta", None)
-            )
-            if delta is None:
-                continue
-            if isinstance(delta, dict):
-                content = delta.get("content")
-                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
-            else:
-                content = getattr(delta, "content", None)
-                reasoning = (
-                    getattr(delta, "reasoning", None)
-                    or getattr(delta, "reasoning_content", None)
-                )
-            if isinstance(content, str) and content:
-                content_parts.append(content)
-            if isinstance(reasoning, str) and reasoning:
-                reasoning_parts.append(reasoning)
-    finally:
-        stop_producer.set()
-        close = getattr(chunks, "close", None)
-        if callable(close):
-            def _close() -> None:
-                try:
-                    close()
-                except Exception:
-                    pass
-
-            close_thread = threading.Thread(
-                target=_close,
-                name="herald-llm-stream-close",
-                daemon=True,
-            )
-            close_thread.start()
-            close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-
-    content = "".join(content_parts)
-    reasoning = "".join(reasoning_parts)
-    if not saw_chunk or not (content or reasoning):
-        raise RuntimeError(
-            "Selected provider returned an empty or malformed stream; no alternate "
-            "provider was tried."
-        )
-    return {
-        "model": response_model,
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": content,
-                "reasoning": reasoning or None,
-            },
-            "finish_reason": "stop",
-        }],
-        "usage": usage,
-    }
-
-
-def _strict_query_identity(
-    query: str,
-) -> Optional[tuple[tuple[str, str], ...]]:
-    """Normalize a non-duplicated URL query without losing routing semantics."""
-    if not query:
-        return ()
-    for index, character in enumerate(query):
-        if character == "%" and (
-            index + 2 >= len(query)
-            or any(
-                digit not in "0123456789abcdefABCDEF"
-                for digit in query[index + 1:index + 3]
-            )
-        ):
-            return None
-    try:
-        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
-    except ValueError:
-        return None
-    keys = [key for key, _value in pairs]
-    if len(keys) != len(set(keys)):
-        # Hermes core stores custom endpoint queries in a dict, so duplicate
-        # keys cannot be proven to survive client construction unchanged.
-        return None
-    return tuple(sorted(pairs))
-
-
-def _strict_default_query_identity(
-    value: Any,
-) -> Optional[tuple[tuple[str, str], ...]]:
-    """Normalize an SDK client's separated default_query value."""
-    if value is None:
-        return ()
-    try:
-        if callable(getattr(value, "multi_items", None)):
-            raw_pairs = value.multi_items()
-        elif isinstance(value, dict):
-            raw_pairs = value.items()
-        else:
-            return _strict_query_identity(str(value))
-        pairs = tuple(sorted((str(key), str(item)) for key, item in raw_pairs))
-    except Exception:
-        return None
-    keys = [key for key, _item in pairs]
-    if len(keys) != len(set(keys)):
-        return None
-    return pairs
-
-
-def _strict_base_url_identity(
-    value: Any,
-) -> Optional[tuple[str, str, int, str, tuple[tuple[str, str], ...]]]:
-    """Return a comparable HTTP endpoint identity, or None when unverifiable."""
-    raw_value = str(value or "").strip()
-    if not raw_value or any(character.isspace() for character in raw_value):
-        return None
-    try:
-        parsed = urlsplit(raw_value)
-        scheme = parsed.scheme.lower()
-        hostname = (parsed.hostname or "").lower()
-        port = parsed.port
-    except (TypeError, ValueError):
-        return None
-    if (
-        scheme not in {"http", "https"}
-        or not parsed.netloc
-        or not hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-        or any(character.isspace() for character in parsed.netloc)
-    ):
-        return None
-    authority = parsed.netloc
-    if authority.startswith("["):
-        closing_bracket = authority.find("]")
-        suffix = authority[closing_bracket + 1:] if closing_bracket >= 0 else ""
-        if closing_bracket < 0 or (suffix and not suffix.startswith(":")):
-            return None
-        if suffix == ":":
-            return None
-    elif authority.count(":") > 1:
-        return None
-    elif ":" in authority and not authority.rsplit(":", 1)[1]:
-        return None
-    if port is not None and not 1 <= port <= 65535:
-        return None
-    try:
-        ipaddress.ip_address(hostname)
-        normalized_hostname = hostname
-    except ValueError:
-        numeric_labels = hostname.rstrip(".").split(".")
-        if numeric_labels and all(label.isdigit() for label in numeric_labels):
-            # Do not reinterpret invalid or ambiguous IPv4 literals as DNS names.
-            return None
-        try:
-            normalized_hostname = hostname.rstrip(".").encode("idna").decode("ascii")
-        except UnicodeError:
-            return None
-        labels = normalized_hostname.split(".")
-        if (
-            not normalized_hostname
-            or len(normalized_hostname) > 253
-            or any(
-                not label
-                or len(label) > 63
-                or label.startswith("-")
-                or label.endswith("-")
-                or any(not (character.isalnum() or character == "-") for character in label)
-                for label in labels
-            )
-        ):
-            return None
-    effective_port = port if port is not None else (443 if scheme == "https" else 80)
-    query_identity = _strict_query_identity(parsed.query)
-    if query_identity is None:
-        return None
-    return (
-        scheme,
-        normalized_hostname,
-        effective_port,
-        parsed.path.rstrip("/"),
-        query_identity,
-    )
-
-
-def _create_strict_llm_stream(
-    auxiliary: Any,
-    route: _LlmCallRoute,
-    *,
-    messages: List[Dict[str, str]],
-    temperature: Any,
-    max_tokens: Any,
-    extra_body: Any,
-    timeout: float,
-) -> Any:
-    """Create one request on the resolved route without entering fallback logic."""
-    deadline = time.monotonic() + timeout
-    get_client = cast(Any, getattr(auxiliary, "_get_cached_client", None))
-    build_kwargs = cast(Any, getattr(auxiliary, "_build_call_kwargs", None))
-    if not callable(get_client) or not callable(build_kwargs):
-        raise RuntimeError(
-            "Installed Hermes core lacks the strict client construction helpers "
-            "required by Herald; upgrade Hermes. No inference request was sent."
-        )
-    # Named custom-provider slugs are picker identities, not safe inputs to
-    # auxiliary_client's provider router: ``custom:auto`` normalizes to
-    # ``auto`` and ``custom:openrouter`` to the built-in OpenRouter branch.
-    # Resolve every preflighted custom route through the literal custom branch
-    # with its already-selected endpoint and credentials.
-    client_provider = (
-        "custom" if route.provider.lower().startswith("custom:") else route.provider
-    )
-    route_endpoint = _strict_base_url_identity(route.base_url)
-    if route_endpoint is None:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' has an endpoint that cannot be "
-            "verified; no inference request was sent."
-        )
-    if client_provider == "custom" and route.api_mode.lower() == "anthropic_messages":
-        try:
-            from agent.anthropic_adapter import build_anthropic_client
-        except ImportError as exc:
-            raise RuntimeError(
-                "Installed Hermes core lacks the Anthropic client builder required "
-                "for this strict custom route; upgrade Hermes. No inference request "
-                "was sent."
-            ) from exc
-        anthropic_wrapper = cast(
-            Any, getattr(auxiliary, "AnthropicAuxiliaryClient", None)
-        )
-        if not callable(anthropic_wrapper):
-            raise RuntimeError(
-                "Installed Hermes core lacks the Anthropic wrapper required for this "
-                "strict custom route; upgrade Hermes. No inference request was sent."
-            )
-        real_client = build_anthropic_client(
-            route.api_key,
-            route.base_url,
-            timeout=timeout,
-        )
-        if real_client is None:
-            raise RuntimeError(
-                f"Selected provider '{route.provider}' could not construct an "
-                "Anthropic client; no alternate provider was tried."
-            )
-        client = anthropic_wrapper(
-            real_client,
-            route.model,
-            route.api_key,
-            route.base_url,
-            is_oauth=False,
-        )
-        final_model = route.model
-    else:
-        client_result = cast(Any, get_client(
-            client_provider,
-            route.model,
-            base_url=route.base_url,
-            api_key=route.api_key,
-            api_mode=route.api_mode,
-            task=None,
-        ))
-        client, final_model = client_result
-    client = cast(Any, client)
-    if client is None:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' could not construct a client; "
-            "no alternate provider was tried."
-        )
-    final_model = str(final_model or "").strip()
-    if final_model != route.model:
-        raise RuntimeError(
-            f"Selected provider changed model '{route.model}' to '{final_model}'; "
-            "no inference request was sent and no alternate provider was tried."
-        )
-    client_candidates = (
-        client,
-        getattr(client, "_client", None),
-        getattr(client, "client", None),
-    )
-    client_base_url = ""
-    for candidate in client_candidates:
-        value = str(getattr(candidate, "base_url", "") or "").strip()
-        if value:
-            client_base_url = value
-            break
-    if not client_base_url:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' returned a client whose endpoint "
-            "cannot be verified; no inference request was sent."
-        )
-    client_endpoint = _strict_base_url_identity(client_base_url)
-    if client_endpoint is None:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' returned a client whose endpoint "
-            "cannot be verified; no inference request was sent."
-        )
-    default_queries = []
-    for candidate in client_candidates:
-        if candidate is None or not hasattr(candidate, "default_query"):
-            continue
-        default_query = getattr(candidate, "default_query", None)
-        if default_query is not None:
-            query_identity = _strict_default_query_identity(default_query)
-            if query_identity is None:
-                raise RuntimeError(
-                    f"Selected provider '{route.provider}' returned a client whose "
-                    "query cannot be verified; no inference request was sent."
-                )
-            if query_identity and query_identity not in default_queries:
-                default_queries.append(query_identity)
-    if len(default_queries) > 1:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' returned conflicting client "
-            "queries; no inference request was sent."
-        )
-    client_query = client_endpoint[4]
-    if default_queries:
-        if client_query:
-            combined_query = tuple(sorted(client_query + default_queries[0]))
-            if len({key for key, _value in combined_query}) != len(combined_query):
-                raise RuntimeError(
-                    f"Selected provider '{route.provider}' returned an ambiguous client "
-                    "query; no inference request was sent."
-                )
-            client_query = combined_query
-        else:
-            client_query = default_queries[0]
-    client_endpoint = (*client_endpoint[:4], client_query)
-    if client_endpoint != route_endpoint:
-        raise RuntimeError(
-            f"Selected provider '{route.provider}' changed endpoint during client "
-            "construction; no inference request was sent and no alternate provider "
-            "was tried."
-        )
-    kwargs = cast(Dict[str, Any], build_kwargs(
-        client_provider,
-        route.model,
-        messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        timeout=timeout,
-        extra_body=extra_body,
-        base_url=client_base_url,
-        task=None,
-    ))
-    kwargs["stream"] = True
-    kwargs["stream_options"] = {"include_usage": True}
-    owns_client = client_provider == "custom" and (
-        route.api_mode.lower() == "anthropic_messages"
-    )
-    try:
-        if not owns_client:
-            return client.chat.completions.create(**kwargs)
-
-        request_events: queue.Queue[tuple[str, Any, float]] = queue.Queue(maxsize=1)
-
-        def _request_owned_client() -> None:
-            try:
-                value = client.chat.completions.create(**kwargs)
-                request_events.put(("result", value, time.monotonic()))
-            except Exception as exc:
-                request_events.put(("error", exc, time.monotonic()))
-
-        request_thread = threading.Thread(
-            target=_request_owned_client,
-            daemon=True,
-            name="herald-strict-anthropic-request",
-        )
-        request_thread.start()
-        try:
-            event, value, completed_at = request_events.get(
-                timeout=max(0.0, deadline - time.monotonic())
-            )
-        except queue.Empty as exc:
-            raise TimeoutError(
-                "Selected custom Anthropic request exceeded its strict deadline; "
-                "no alternate provider was tried."
-            ) from exc
-        if completed_at > deadline:
-            raise TimeoutError(
-                "Selected custom Anthropic request exceeded its strict deadline; "
-                "no alternate provider was tried."
-            )
-        if event == "error":
-            raise value
-        return value
-    finally:
-        if owns_client:
-            close_fn = getattr(client, "close", None)
-            if callable(close_fn):
-                def _close_owned_client() -> None:
-                    try:
-                        close_fn()
-                    except Exception:
-                        pass
-
-                close_thread = threading.Thread(
-                    target=_close_owned_client,
-                    daemon=True,
-                    name="herald-strict-anthropic-close",
-                )
-                close_thread.start()
-                close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-
-
-def _redact_llm_route_api_key(error: Exception, route: Optional[_LlmCallRoute]) -> str:
-    """Remove the selected route credential from model-visible exception text."""
-    error_text = str(error)
-    if route is not None and route.api_key:
-        error_text = error_text.replace(route.api_key, "[REDACTED]")
-    return error_text
-
-
-def _handle_llm_call(
-    args: dict,
-    *,
-    _route_ref: list[_LlmCallRoute],
-    **kwargs,
-) -> str:
-    """Make one bare inference request on a preflighted Hermes provider route."""
+def handle_llm_call(args: dict, **kwargs) -> str:
+    """Run one host-owned completion using an advertised configured route."""
     messages = args.get("messages", [])
     system_prompt = args.get("system_prompt")
     model_override = args.get("model")
@@ -4268,10 +3464,6 @@ def _handle_llm_call(
         full_messages.append({"role": "system", "content": system_prompt})
     full_messages.extend(dict(message) for message in messages)
 
-    # response_format is honored by OpenAI-compatible routes but ignored by
-    # Codex Responses and native Anthropic adapters. A system instruction gives
-    # those routes the same behavioral contract; output is validated below.
-    extra_body = None
     if json_mode:
         json_instruction = (
             "Return only one valid JSON object. Do not use Markdown fences or "
@@ -4290,166 +3482,57 @@ def _handle_llm_call(
             full_messages[system_index]["content"] = (
                 f"{existing}{separator}{json_instruction}"
             )
-        extra_body = {"response_format": {"type": "json_object"}}
 
-    route: Optional[_LlmCallRoute] = None
-    try:
-        from agent import auxiliary_client as auxiliary
-
-        route = _resolve_llm_call_route(
-            model_override,
-            provider_override,
+    if bool(provider_override) != bool(model_override):
+        return _tool_error(
+            "Pass both 'provider' and 'model' from one list_profile_models "
+            "available_routes entry, or omit both to use configured_default."
         )
-        _route_ref.append(route)
-        resolved_provider = route.provider
-        resolved_model = route.model
 
+    if provider_override and model_override:
         try:
-            from agent.auxiliary_client import extract_content_or_reasoning
-        except ImportError:
-            extract_content_or_reasoning = _extract_content_or_reasoning_fallback
+            inventory = _configured_local_model_inventory()
+        except Exception as error:
+            return _tool_error(
+                f"Cannot verify configured model routes: {type(error).__name__}: {error}"
+            )
+        advertised = {
+            (str(row.get("provider") or ""), str(model))
+            for row in inventory.get("providers", [])
+            if isinstance(row, dict)
+            for model in row.get("models", [])
+            if isinstance(model, str)
+        }
+        if (provider_override, model_override) not in advertised:
+            return _tool_error(
+                f"Route provider='{provider_override}', model='{model_override}' is "
+                "not configured for this profile. Call list_profile_models without "
+                "a profile and copy one exact available_routes pair."
+            )
 
-        # Construct the selected client directly. Entering call_llm would let
-        # pre-stream setup unwrap virtual providers or enter configured and
-        # automatic provider fallbacks before its stream=True branch.
-        response: Any = _create_strict_llm_stream(
-            auxiliary,
-            route,
+    host_llm = kwargs.get("_llm")
+    if host_llm is None or not callable(getattr(host_llm, "complete", None)):
+        return _tool_error(
+            "Hermes host LLM service is unavailable. Reload the plugin inside a "
+            "supported Hermes session."
+        )
+
+    try:
+        result = host_llm.complete(
             messages=full_messages,
+            provider=provider_override or None,
+            model=model_override or None,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=120.0,
-            extra_body=extra_body,
+            purpose="hermes-herald.llm_call",
         )
-        complete_response = (
-            isinstance(response, (dict, str, bytes))
-            or hasattr(response, "choices")
-            or hasattr(response, "content")
-        )
-        if not complete_response:
-            response = _aggregate_llm_call_stream(
-                response,
-                model=route.model,
-                total_ceiling=120.0,
-            )
-    except ImportError as e:
-        error_text = _redact_llm_route_api_key(e, route)
-        return _tool_error(
-            f"Cannot import Hermes auxiliary provider support: {error_text}. "
-            "This tool requires running inside a Hermes agent session."
-        )
-    except Exception as e:
-        error_text = _redact_llm_route_api_key(e, route)
-        return _tool_error(f"LLM call failed: {type(e).__name__}: {error_text}")
+    except Exception as error:
+        return _tool_error(f"LLM call failed: {type(error).__name__}: {error}")
 
-    # Extract text from the response
-    text = ""
-    requested_provider = provider_override or ""
-    configured_provider = ""
-    model = model_override or ""
-
-    # Try response.model first (most providers return it)
-    response_model = (
-        response.get("model")
-        if isinstance(response, dict)
-        else getattr(response, "model", None)
-    )
-    if isinstance(response_model, str) and response_model.strip():
-        model = response_model.strip()
-
-    # Preserve the profile's configured provider independently from any
-    # per-call override. Neither value is claimed as response provenance.
-    try:
-        from agent.auxiliary_client import _read_main_provider
-        configured_provider = (_read_main_provider() or "").strip()
-    except Exception:
-        pass
-
-    # Only claim an actual provider when the returned response explicitly
-    # reports one. Core call_llm does not currently annotate fallback responses.
-    response_provider = (
-        response.get("provider")
-        if isinstance(response, dict)
-        else getattr(response, "provider", None)
-    )
-    provider = (
-        response_provider.strip()
-        if isinstance(response_provider, str) and response_provider.strip()
-        else ""
-    )
-
-    # Extract text from various response shapes
-    if isinstance(response, dict):
-        dict_text = response.get("content")
-        if dict_text is None:
-            dict_text = response.get("text")
-        if isinstance(dict_text, str):
-            dict_text = _strip_inline_reasoning_blocks(dict_text)
-        if dict_text is None or (
-            isinstance(dict_text, str) and not dict_text.strip()
-        ):
-            choices = response.get("choices")
-            if isinstance(choices, list) and choices:
-                choice = choices[0]
-                if isinstance(choice, dict):
-                    message = choice.get("message")
-                    if isinstance(message, dict):
-                        dict_text = message.get("content")
-                        if isinstance(dict_text, str):
-                            dict_text = _strip_inline_reasoning_blocks(dict_text)
-                        if dict_text is None or (
-                            isinstance(dict_text, str) and not dict_text.strip()
-                        ):
-                            reasoning_parts = []
-                            for field in ("reasoning", "reasoning_content"):
-                                value = message.get(field)
-                                if isinstance(value, str) and value.strip():
-                                    reasoning_parts.append(value.strip())
-                            details = message.get("reasoning_details")
-                            if isinstance(details, list):
-                                for detail in details:
-                                    if isinstance(detail, dict):
-                                        value = (
-                                            detail.get("summary")
-                                            or detail.get("content")
-                                            or detail.get("text")
-                                        )
-                                        if isinstance(value, str) and value.strip():
-                                            reasoning_parts.append(value.strip())
-                            if reasoning_parts:
-                                dict_text = "\n\n".join(dict.fromkeys(reasoning_parts))
-                    if dict_text is None or (
-                        isinstance(dict_text, str) and not dict_text.strip()
-                    ):
-                        dict_text = choice.get("text")
-        if isinstance(dict_text, str):
-            text = dict_text
-    elif hasattr(response, "choices"):
-        # OpenAI-compatible response
-        choices = response.choices
-        if choices and len(choices) > 0:
-            choice = choices[0]
-            if hasattr(choice, "message"):
-                text = extract_content_or_reasoning(response)
-            elif hasattr(choice, "text"):
-                text = choice.text or ""
-    elif hasattr(response, "content"):
-        # Anthropic-style response
-        text = response.content or ""
-        if isinstance(text, list):
-            text = " ".join(
-                block_text
-                for block in text
-                if isinstance((block_text := getattr(block, "text", None)), str)
-            )
-    elif isinstance(response, (str, bytes)):
-        text = response.decode(errors="replace") if isinstance(response, bytes) else response
-
+    text = getattr(result, "text", "")
     if not isinstance(text, str) or not text.strip():
-        return _tool_error(
-            "Selected provider returned an empty or malformed response. No "
-            "alternate provider was tried."
-        )
+        return _tool_error("Hermes returned an empty or malformed LLM response.")
 
     if json_mode:
         candidate = text.strip()
@@ -4469,50 +3552,24 @@ def _handle_llm_call(
             )
         text = json.dumps(parsed_json, ensure_ascii=False, separators=(",", ":"))
 
-    # Extract usage info
-    usage = {}
-    if isinstance(response, dict):
-        u = response.get("usage")
-    else:
-        u = getattr(response, "usage", None)
-    if u is not None:
-        if hasattr(u, "model_dump"):
-            usage = u.model_dump()
-        elif hasattr(u, "dict"):
-            usage = u.dict()
-        elif isinstance(u, dict):
-            usage = u
-        else:
-            usage = {
-                "prompt_tokens": getattr(u, "prompt_tokens", 0),
-                "completion_tokens": getattr(u, "completion_tokens", 0),
-                "total_tokens": getattr(u, "total_tokens", 0),
-            }
+    host_usage = getattr(result, "usage", None)
+    usage = {
+        "input_tokens": getattr(host_usage, "input_tokens", 0),
+        "output_tokens": getattr(host_usage, "output_tokens", 0),
+        "total_tokens": getattr(host_usage, "total_tokens", 0),
+        "cache_read_tokens": getattr(host_usage, "cache_read_tokens", 0),
+        "cache_write_tokens": getattr(host_usage, "cache_write_tokens", 0),
+        "cost_usd": getattr(host_usage, "cost_usd", None),
+    }
 
     return json.dumps({
         "text": text,
-        "provider": provider,
-        "requested_provider": requested_provider,
-        "configured_provider": configured_provider,
+        "provider": str(getattr(result, "provider", "") or ""),
+        "requested_provider": provider_override or "",
         "requested_model": model_override or "",
-        "resolved_provider": resolved_provider or "",
-        "resolved_model": resolved_model or "",
-        "model": model,
+        "model": str(getattr(result, "model", "") or ""),
         "usage": usage,
     })
-
-
-def handle_llm_call(args: dict, **kwargs) -> str:
-    """Make one bare inference request with route-aware error redaction."""
-    route_ref: list[_LlmCallRoute] = []
-    try:
-        return _handle_llm_call(args, _route_ref=route_ref, **kwargs)
-    except Exception as error:
-        route = route_ref[0] if route_ref else None
-        error_text = _redact_llm_route_api_key(error, route)
-        return _tool_error(
-            f"LLM response processing failed: {type(error).__name__}: {error_text}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -4591,7 +3648,6 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 current_provider=(auxiliary._read_main_provider() or "").strip(),
                 current_model=(auxiliary._read_main_model() or "").strip(),
                 current_base_url=(auxiliary._read_main_base_url() or "").strip(),
-                current_api_key=(auxiliary._read_main_api_key() or "").strip(),
             )
         except Exception as e:
             return _tool_error(
