@@ -3674,15 +3674,26 @@ def _aggregate_llm_call_stream(
     saw_chunk = False
 
     events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=64)
+    stop_producer = threading.Event()
+
+    def _put_event(event: str, payload: Any) -> bool:
+        while not stop_producer.is_set():
+            try:
+                events.put((event, payload), timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def _produce() -> None:
         try:
             for chunk in chunks:
-                events.put(("chunk", chunk))
+                if not _put_event("chunk", chunk):
+                    return
         except BaseException as exc:
-            events.put(("error", exc))
+            _put_event("error", exc)
         finally:
-            events.put(("done", None))
+            _put_event("done", None)
 
     threading.Thread(
         target=_produce,
@@ -3746,6 +3757,7 @@ def _aggregate_llm_call_stream(
             if isinstance(reasoning, str) and reasoning:
                 reasoning_parts.append(reasoning)
     finally:
+        stop_producer.set()
         close = getattr(chunks, "close", None)
         if callable(close):
             try:
