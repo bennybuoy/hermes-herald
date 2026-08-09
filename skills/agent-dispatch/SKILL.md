@@ -190,8 +190,9 @@ Use `llm_call` when you need only inference, not an agent loop:
   pinned to the active provider; it does not infer a different endpoint from a
   vendor-prefixed model name.
 - Model overrides pass through Hermes's `/model` resolver and must match the
-  selected provider's advertised authenticated inventory before network
-  contact. Human forms such as `gpt5.6sol` normalize to `gpt-5.6-sol`; a family
+  selected provider's advertised authenticated inventory before the inference
+  request. The inventory check may itself query that provider. Human forms such
+  as `gpt5.6sol` normalize to `gpt-5.6-sol`; a family
   form such as `gpt-5.6` reuses the active advertised family variant. Unknown
   models fail before a provider fallback can run.
 - Use exact provider IDs. Hermes maps bare `openai` to OpenRouter, so Herald

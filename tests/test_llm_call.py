@@ -912,6 +912,26 @@ class TestLlmCallParameterPassthrough:
         assert "openai-codex" in result["error"]
         mock_call_llm.assert_not_called()
 
+    def test_openai_provider_alias_without_model_is_rejected_before_inference(
+        self
+    ):
+        import agent.auxiliary_client as auxiliary_client
+
+        with patch.object(auxiliary_client, "call_llm") as mock_call_llm:
+            mock_call_llm.return_value = FakeResponse(
+                choices=[FakeChoice(message_content="wrong route")],
+                model="gpt-5.6-sol",
+            )
+            result = json.loads(tools.handle_llm_call({
+                "messages": [{"role": "user", "content": "Hi"}],
+                "provider": "openai",
+            }))
+
+        assert result["status"] == "error"
+        assert "openai-codex" in result["error"]
+        assert "openrouter" in result["error"]
+        mock_call_llm.assert_not_called()
+
     @patch("agent.auxiliary_client.call_llm")
     def test_unadvertised_model_is_rejected_before_inference(
         self, mock_call_llm, monkeypatch

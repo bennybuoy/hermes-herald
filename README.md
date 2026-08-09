@@ -346,8 +346,9 @@ Use it for tasks where tools and iterative reasoning would be overhead: routing,
 
 Model overrides are resolved through the same model-switch pipeline as Hermes's
 `/model` command, but Herald then requires the resolved wire slug to appear in
-the selected provider's authenticated model inventory **before network
-contact**. A model-only request stays on the active provider; it cannot silently
+the selected provider's authenticated model inventory **before the inference
+request**. The inventory check may itself query the selected provider. A
+model-only request stays on the active provider; it cannot silently
 select OpenRouter from a vendor-prefixed slug. Family shorthand such as
 `gpt-5.6` resolves to the active advertised family variant (`gpt-5.6-sol` here).
 Unadvertised models fail before Hermes can enter a provider fallback chain.
@@ -504,7 +505,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **166 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **171 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

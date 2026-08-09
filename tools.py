@@ -3367,7 +3367,7 @@ def _resolve_llm_call_route(
     model_override: Optional[str],
     provider_override: Optional[str],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Resolve and validate an ``llm_call`` model before network contact.
+    """Resolve and validate an ``llm_call`` route before inference.
 
     ``call_llm`` expects a provider wire-model ID; it does not apply the
     interactive ``/model`` alias/fuzzy resolver.  Resolve against the explicit
@@ -3378,6 +3378,13 @@ def _resolve_llm_call_route(
     """
     requested_model = (model_override or "").strip()
     requested_provider = (provider_override or "").strip()
+    if requested_provider.lower() == "openai":
+        raise ValueError(
+            "Provider 'openai' is ambiguous in Hermes and may select OpenRouter "
+            "or direct OpenAI. Use provider='openrouter' only when that endpoint "
+            "is intentional; for ChatGPT Codex OAuth use provider='openai-codex'. "
+            "No inference request was sent."
+        )
     if not requested_model:
         return requested_provider or None, None
 
