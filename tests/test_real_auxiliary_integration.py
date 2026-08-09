@@ -246,14 +246,26 @@ def test_plugin_strict_creation_bypasses_call_llm_and_requests_usage(monkeypatch
     assert captured["stream_options"] == {"include_usage": True}
 
 
-def test_plugin_strict_creation_rejects_endpoint_mutation(monkeypatch):
+@pytest.mark.parametrize(
+    ("selected_endpoint", "client_endpoint"),
+    [
+        ("https://selected.invalid/v1", "https://openrouter.ai/api/v1"),
+        (
+            "https://selected.invalid/v1?tenant=selected",
+            "https://selected.invalid/v1?tenant=other",
+        ),
+    ],
+)
+def test_plugin_strict_creation_rejects_endpoint_mutation(
+    monkeypatch, selected_endpoint, client_endpoint
+):
     """Client resolution may not replace the preflighted endpoint."""
     from types import SimpleNamespace
     from agent import auxiliary_client as aux
     from hermes_herald import tools  # type: ignore[import-not-found]
 
     escaped_client = SimpleNamespace(
-        base_url="https://openrouter.ai/api/v1",
+        base_url=client_endpoint,
         chat=SimpleNamespace(
             completions=SimpleNamespace(create=lambda **kwargs: iter(()))
         ),
@@ -271,7 +283,7 @@ def test_plugin_strict_creation_rejects_endpoint_mutation(monkeypatch):
             tools._LlmCallRoute(
                 provider="custom:auto",
                 model="strict-model",
-                base_url="https://selected.invalid/v1",
+                base_url=selected_endpoint,
                 api_key="test-token",
                 api_mode="chat_completions",
             ),
@@ -405,6 +417,21 @@ def test_plugin_strict_creation_rejects_unverifiable_endpoint(monkeypatch):
         )
 
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://example.com:/v1",
+        "https://example.com:0/v1",
+        "https://-/v1",
+    ],
+)
+def test_strict_endpoint_identity_rejects_malformed_authority(endpoint):
+    """Ambiguous ports and malformed DNS labels are not executable endpoints."""
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    assert tools._strict_base_url_identity(endpoint) is None
 
 
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):

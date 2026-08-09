@@ -19,6 +19,7 @@ except delegate_subagent which runs in a background thread.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import math
@@ -3848,7 +3849,9 @@ def _aggregate_llm_call_stream(
     }
 
 
-def _strict_base_url_identity(value: Any) -> Optional[tuple[str, str, int, str]]:
+def _strict_base_url_identity(
+    value: Any,
+) -> Optional[tuple[str, str, int, str, str]]:
     """Return a comparable HTTP endpoint identity, or None when unverifiable."""
     try:
         parsed = urlsplit(str(value or "").strip())
@@ -3867,8 +3870,50 @@ def _strict_base_url_identity(value: Any) -> Optional[tuple[str, str, int, str]]
         or any(character.isspace() for character in parsed.netloc)
     ):
         return None
-    effective_port = port or (443 if scheme == "https" else 80)
-    return (scheme, hostname, effective_port, parsed.path.rstrip("/"))
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        suffix = authority[closing_bracket + 1:] if closing_bracket >= 0 else ""
+        if closing_bracket < 0 or (suffix and not suffix.startswith(":")):
+            return None
+        if suffix == ":":
+            return None
+    elif authority.count(":") > 1:
+        return None
+    elif ":" in authority and not authority.rsplit(":", 1)[1]:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+    try:
+        ipaddress.ip_address(hostname)
+        normalized_hostname = hostname
+    except ValueError:
+        try:
+            normalized_hostname = hostname.rstrip(".").encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+        labels = normalized_hostname.split(".")
+        if (
+            not normalized_hostname
+            or len(normalized_hostname) > 253
+            or any(
+                not label
+                or len(label) > 63
+                or label.startswith("-")
+                or label.endswith("-")
+                or any(not (character.isalnum() or character == "-") for character in label)
+                for label in labels
+            )
+        ):
+            return None
+    effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    return (
+        scheme,
+        normalized_hostname,
+        effective_port,
+        parsed.path.rstrip("/"),
+        parsed.query,
+    )
 
 
 def _create_strict_llm_stream(
@@ -4025,6 +4070,14 @@ def _create_strict_llm_stream(
                 close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
+def _redact_llm_route_api_key(error: Exception, route: Optional[_LlmCallRoute]) -> str:
+    """Remove the selected route credential from model-visible exception text."""
+    error_text = str(error)
+    if route is not None and route.api_key:
+        error_text = error_text.replace(route.api_key, "[REDACTED]")
+    return error_text
+
+
 def handle_llm_call(args: dict, **kwargs) -> str:
     """Make one bare inference request on a preflighted Hermes provider route."""
     messages = args.get("messages", [])
@@ -4148,14 +4201,13 @@ def handle_llm_call(args: dict, **kwargs) -> str:
                 total_ceiling=120.0,
             )
     except ImportError as e:
+        error_text = _redact_llm_route_api_key(e, route)
         return _tool_error(
-            f"Cannot import Hermes auxiliary provider support: {e}. "
+            f"Cannot import Hermes auxiliary provider support: {error_text}. "
             "This tool requires running inside a Hermes agent session."
         )
     except Exception as e:
-        error_text = str(e)
-        if route is not None and route.api_key:
-            error_text = error_text.replace(route.api_key, "[REDACTED]")
+        error_text = _redact_llm_route_api_key(e, route)
         return _tool_error(f"LLM call failed: {type(e).__name__}: {error_text}")
 
     # Extract text from the response

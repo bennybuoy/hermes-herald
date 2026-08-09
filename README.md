@@ -557,7 +557,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **197 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **202 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

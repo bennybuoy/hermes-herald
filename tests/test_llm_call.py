@@ -1227,6 +1227,20 @@ class TestLlmCallParameterPassthrough:
         assert "[REDACTED]" in result["error"]
 
     @patch("hermes_herald.tools._create_strict_llm_stream")
+    def test_selected_route_import_error_redacts_api_key(self, mock_call_llm):
+        mock_call_llm.side_effect = ImportError(
+            "provider import reflected Authorization: Bearer test-token"
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["status"] == "error"
+        assert "test-token" not in result["error"]
+        assert "[REDACTED]" in result["error"]
+
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_unconfigured_openrouter_route_is_rejected_before_inference(
         self, mock_call_llm, monkeypatch
     ):
