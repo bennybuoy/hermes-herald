@@ -187,11 +187,14 @@ Use `llm_call` when you need only inference, not an agent loop:
 - `messages` must contain at least one `{role, content}` item.
 - Use either `system_prompt` or a system-role message, not both.
 - Call `list_profile_models()` before choosing a route. Its local mode returns
-  only the calling profile's configured default, user-provider, and
-  custom-provider routes; ambient OpenRouter, Nous Portal, and OAuth credentials
-  are not routing authority.
+  the calling profile's configured default plus every provider explicitly
+  configured by the user. Ambient or auto-discovered credentials and
+  fallback-only routes are not routing authority.
 - With no routing arguments, the request is pinned to the calling profile's
   configured default provider and model.
+- Prefer that configured default. Do not choose another provider merely because
+  it advertises the same model; override only when the task or user explicitly
+  calls for that endpoint.
 - `model` and `provider` are optional routing requests. A model-only request is
   pinned to the active provider; it does not infer a different endpoint from a
   vendor-prefixed model name. A provider-only request may name only the active

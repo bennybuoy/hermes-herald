@@ -90,7 +90,7 @@ class TestLocalModelRouteDiscovery:
             "required", []
         )
 
-    def test_local_inventory_excludes_ambient_openrouter_and_nous(self, monkeypatch):
+    def test_local_inventory_uses_core_explicit_only_contract(self, monkeypatch):
         import agent.auxiliary_client as auxiliary_client
         import hermes_cli.inventory as inventory
 
@@ -116,18 +116,18 @@ class TestLocalModelRouteDiscovery:
             "_read_main_base_url",
             lambda: "http://ollama-cloud.example/v1",
         )
-        monkeypatch.setattr(
-            inventory,
-            "build_models_payload",
-            lambda *args, **kwargs: {
+        captured = {}
+
+        def explicit_payload(*args, **kwargs):
+            captured.update(kwargs)
+            return {
                 "providers": [
                     {"slug": "ollama-cloud", "models": ["glm-5.2"]},
                     {"slug": "custom:llamaherd", "models": ["glm-5.2"]},
-                    {"slug": "openrouter", "models": ["z-ai/glm-5.2"]},
-                    {"slug": "nous", "models": ["z-ai/glm-5.2"]},
                 ]
-            },
-        )
+            }
+
+        monkeypatch.setattr(inventory, "build_models_payload", explicit_payload)
 
         result = json.loads(tools.handle_list_profile_models({}))
 
@@ -141,3 +141,56 @@ class TestLocalModelRouteDiscovery:
             {"provider": "ollama-cloud", "model": "glm-5.2"},
         ]
         assert result["route_count"] == 2
+        assert captured["explicit_only"] is True
+        assert captured["include_unconfigured"] is False
+
+    def test_named_profile_preserves_remote_authenticated_alias_contract(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            tools,
+            "_resolve_profile",
+            lambda profile: ({
+                "url": "https://reviewer.example",
+                "api_key": "remote-secret",
+            }, None),
+        )
+        request = {}
+
+        def remote_models(url, api_key, timeout):
+            request.update(url=url, api_key=api_key, timeout=timeout)
+            return {
+                "data": [
+                    {"id": "glm-5.2", "root": "glm-5.2"},
+                    {
+                        "id": "review-fast",
+                        "root": "glm-5.2",
+                        "parent": "glm-5.2",
+                    },
+                ]
+            }
+
+        monkeypatch.setattr(tools, "_get_json", remote_models)
+
+        raw = tools.handle_list_profile_models({"profile": "reviewer"})
+        result = json.loads(raw)
+
+        assert request == {
+            "url": "https://reviewer.example/v1/models",
+            "api_key": "remote-secret",
+            "timeout": 10.0,
+        }
+        assert result == {
+            "profile": "reviewer",
+            "advertised_primary": {
+                "model": "glm-5.2",
+                "dispatchable_as_override": False,
+                "is_runtime_evidence": False,
+            },
+            "dispatchable_models": [{
+                "alias": "review-fast",
+                "resolved_model": "glm-5.2",
+            }],
+            "dispatchable_model_count": 1,
+        }
+        assert "remote-secret" not in raw

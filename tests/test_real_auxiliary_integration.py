@@ -7,6 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 
 HERMES_CORE = Path(os.environ.get(
     "HERMES_SOURCE_DIR",
@@ -35,6 +37,151 @@ def _resolve_hermes_python() -> Path:
 
 
 HERMES_PYTHON = _resolve_hermes_python()
+
+
+def test_streaming_route_bundle_does_not_request_auto_client(monkeypatch):
+    """A supplied strict route must fail instead of entering core auto discovery."""
+    from agent import auxiliary_client as aux
+
+    requested = []
+
+    def unavailable(provider, model=None, **kwargs):
+        requested.append(provider)
+        return None, model
+
+    monkeypatch.setattr(aux, "_get_cached_client", unavailable)
+    with pytest.raises(RuntimeError, match="No LLM provider configured"):
+        aux.call_llm(
+            task=None,
+            provider="custom",
+            model="strict-model",
+            base_url="https://strict.invalid/v1",
+            api_key="test-token",
+            api_mode="chat_completions",
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+
+    assert requested == ["custom"]
+
+
+def test_stream_iterator_failure_bypasses_core_fallback_helpers(monkeypatch):
+    """Failures after stream creation propagate without payment/provider fallback."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+
+    def broken_stream():
+        raise ConnectionError("selected route disconnected")
+        yield
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: broken_stream())
+        )
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model=None, **kwargs: (client, model),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_payment_fallback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("payment fallback must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_configured_fallback_chain",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configured fallback must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_main_agent_model_fallback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("main-agent fallback must not run")
+        ),
+    )
+
+    stream = aux.call_llm(
+        task=None,
+        provider="custom",
+        model="strict-model",
+        base_url="https://strict.invalid/v1",
+        api_key="test-token",
+        api_mode="chat_completions",
+        messages=[{"role": "user", "content": "Hi"}],
+        stream=True,
+    )
+    with pytest.raises(ConnectionError, match="selected route disconnected"):
+        list(stream)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "401 unauthorized",
+        "402 insufficient credits",
+        "429 rate limit",
+        "model is incompatible with route",
+    ],
+)
+def test_stream_creation_failures_bypass_core_fallback_helpers(
+    monkeypatch, message
+):
+    """Classified setup failures unwind before core's fallback chain."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+
+    def fail_create(**kwargs):
+        raise RuntimeError(message)
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fail_create)
+        )
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model=None, **kwargs: (client, model),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_payment_fallback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider fallback must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_configured_fallback_chain",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("configured fallback must not run")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_try_main_agent_model_fallback",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("main-agent fallback must not run")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        aux.call_llm(
+            task=None,
+            provider="custom",
+            model="strict-model",
+            base_url="https://strict.invalid/v1",
+            api_key="test-token",
+            api_mode="chat_completions",
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
 
 
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
@@ -116,8 +263,12 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
             captured.update(kwargs)
             return response
         aux.call_llm = fake_call_llm
-        tools._resolve_llm_call_route = lambda provider, model: (
-            "requested-provider", "requested-model"
+        tools._resolve_llm_call_route = lambda provider, model: tools._LlmCallRoute(
+            provider="requested-provider",
+            model="requested-model",
+            base_url="https://example.invalid/v1",
+            api_key="test-token",
+            api_mode="chat_completions",
         )
         try:
             result = json.loads(tools.handle_llm_call({{
@@ -132,6 +283,9 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
         assert captured["task"] is None
         assert captured["provider"] == "requested-provider"
         assert captured["model"] == "requested-model"
+        assert captured["base_url"] == "https://example.invalid/v1"
+        assert captured["api_key"] == "test-token"
+        assert captured["api_mode"] == "chat_completions"
         assert captured["stream"] is True
         assert captured["extra_body"] == {{
             "response_format": {{"type": "json_object"}}

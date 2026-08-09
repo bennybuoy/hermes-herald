@@ -23,10 +23,12 @@ import json
 import logging
 import math
 import os
+import queue
 import time
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -683,7 +685,8 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
     "description": (
         "Discover exact fail-closed model routes before inference or dispatch. "
         "Omit profile to list only provider/model routes explicitly configured "
-        "for this calling profile; use those exact pairs with llm_call. Supply "
+        "for this calling profile. Prefer configured_default; choose another "
+        "exact pair only when the task explicitly needs an override. Supply "
         "profile to query a target's authenticated model_routes aliases for "
         "dispatch_agent. Ambient credentials and unconfigured fallback providers "
         "are excluded from local results."
@@ -3380,15 +3383,12 @@ def _configured_local_model_inventory(
 ) -> dict:
     """Return model routes explicitly owned by the active profile.
 
-    Hermes's ``explicit_only`` inventory intentionally includes ambient OAuth
-    and provider-specific environment credentials.  That is appropriate for a
-    human model picker but too permissive for autonomous routing.  Herald's
-    allowlist is narrower: the live current provider plus custom endpoints
-    declared in this profile's YAML.  API keys and base URLs never leave this
-    helper.
+    The host inventory's ``explicit_only`` contract excludes ambient/auto-
+    discovered credentials while retaining the current provider and every
+    provider explicitly configured by the user. API keys and base URLs never
+    leave this helper.
     """
     from hermes_cli.inventory import ConfigContext, build_models_payload, load_picker_context
-    from hermes_cli.providers import custom_provider_slug
 
     configured = load_picker_context()
     live_provider = (current_provider or configured.current_provider or "").strip()
@@ -3397,19 +3397,6 @@ def _configured_local_model_inventory(
     user_providers = getattr(configured, "user_providers", {}) or {}
     custom_providers = getattr(configured, "custom_providers", []) or []
 
-    allowed = {live_provider.lower()} if live_provider else set()
-    for provider_key, provider_config in user_providers.items():
-        if not isinstance(provider_config, dict):
-            continue
-        display_name = str(provider_config.get("name") or provider_key).strip()
-        if display_name:
-            allowed.add(custom_provider_slug(display_name, str(provider_key)).lower())
-    for provider_config in custom_providers:
-        if not isinstance(provider_config, dict):
-            continue
-        display_name = str(provider_config.get("name") or "").strip()
-        if display_name:
-            allowed.add(custom_provider_slug(display_name).lower())
 
     context = ConfigContext(
         current_provider=live_provider,
@@ -3434,7 +3421,7 @@ def _configured_local_model_inventory(
         if not isinstance(row, dict):
             continue
         provider = str(row.get("slug") or "").strip()
-        if not provider or provider.lower() not in allowed:
+        if not provider:
             continue
         models = sorted({
             str(model).strip()
@@ -3452,10 +3439,19 @@ def _configured_local_model_inventory(
     }
 
 
+@dataclass(frozen=True)
+class _LlmCallRoute:
+    provider: str
+    model: str
+    base_url: str
+    api_key: str = field(repr=False)
+    api_mode: str
+
+
 def _resolve_llm_call_route(
     model_override: Optional[str],
     provider_override: Optional[str],
-) -> tuple[str, str]:
+) -> _LlmCallRoute:
     """Resolve and validate an ``llm_call`` route before inference.
 
     ``call_llm`` expects a provider wire-model ID; it does not apply the
@@ -3636,7 +3632,146 @@ def _resolve_llm_call_route(
             f"'{resolved_provider}'.{hint} No inference request was sent."
         )
 
-    return resolved_provider, canonical_model
+    route_base_url = str(getattr(result, "base_url", "") or "").strip()
+    route_api_key = str(getattr(result, "api_key", "") or "").strip()
+    route_api_mode = str(getattr(result, "api_mode", "") or "").strip()
+    missing = [
+        name for name, value in (
+            ("base_url", route_base_url),
+            ("api_key", route_api_key),
+            ("api_mode", route_api_mode),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(
+            f"Provider '{resolved_provider}' did not resolve a complete executable "
+            f"route ({', '.join(missing)} missing). Re-authenticate or select a "
+            "different route with `hermes model`. No inference request was sent."
+        )
+
+    return _LlmCallRoute(
+        provider=resolved_provider,
+        model=canonical_model,
+        base_url=route_base_url,
+        api_key=route_api_key,
+        api_mode=route_api_mode,
+    )
+
+
+def _aggregate_llm_call_stream(
+    chunks: Any,
+    *,
+    model: str,
+    total_ceiling: float = 120.0,
+) -> Dict[str, Any]:
+    """Consume one strict chat stream without depending on core private helpers."""
+    started = time.monotonic()
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    usage: Any = None
+    response_model = model
+    saw_chunk = False
+
+    events: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=64)
+
+    def _produce() -> None:
+        try:
+            for chunk in chunks:
+                events.put(("chunk", chunk))
+        except BaseException as exc:
+            events.put(("error", exc))
+        finally:
+            events.put(("done", None))
+
+    threading.Thread(
+        target=_produce,
+        name="herald-llm-stream",
+        daemon=True,
+    ).start()
+    deadline = started + total_ceiling
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Strict llm_call stream timed out after {total_ceiling:.0f}s"
+                )
+            try:
+                event, payload = events.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError(
+                    f"Strict llm_call stream timed out after {total_ceiling:.0f}s"
+                ) from exc
+            if event == "done":
+                break
+            if event == "error":
+                raise payload
+            chunk = payload
+            saw_chunk = True
+            if isinstance(chunk, dict):
+                chunk_model = chunk.get("model")
+                chunk_usage = chunk.get("usage")
+                choices = chunk.get("choices") or []
+            else:
+                chunk_model = getattr(chunk, "model", None)
+                chunk_usage = getattr(chunk, "usage", None)
+                choices = getattr(chunk, "choices", None) or []
+            if isinstance(chunk_model, str) and chunk_model.strip():
+                response_model = chunk_model.strip()
+            if chunk_usage is not None:
+                usage = chunk_usage
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = (
+                choice.get("delta")
+                if isinstance(choice, dict)
+                else getattr(choice, "delta", None)
+            )
+            if delta is None:
+                continue
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+            else:
+                content = getattr(delta, "content", None)
+                reasoning = (
+                    getattr(delta, "reasoning", None)
+                    or getattr(delta, "reasoning_content", None)
+                )
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+            if isinstance(reasoning, str) and reasoning:
+                reasoning_parts.append(reasoning)
+    finally:
+        close = getattr(chunks, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    content = "".join(content_parts)
+    reasoning = "".join(reasoning_parts)
+    if not saw_chunk or not (content or reasoning):
+        raise RuntimeError(
+            "Selected provider returned an empty or malformed stream; no alternate "
+            "provider was tried."
+        )
+    return {
+        "model": response_model,
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "reasoning": reasoning or None,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": usage,
+    }
 
 
 def handle_llm_call(args: dict, **kwargs) -> str:
@@ -3730,10 +3865,12 @@ def handle_llm_call(args: dict, **kwargs) -> str:
     try:
         from agent import auxiliary_client as auxiliary
 
-        resolved_provider, resolved_model = _resolve_llm_call_route(
+        route = _resolve_llm_call_route(
             model_override,
             provider_override,
         )
+        resolved_provider = route.provider
+        resolved_model = route.model
 
         try:
             from agent.auxiliary_client import extract_content_or_reasoning
@@ -3747,8 +3884,11 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         # never escape to OpenRouter, Nous, or another ambient credential.
         response: Any = auxiliary.call_llm(
             task=None,
-            provider=resolved_provider,
-            model=resolved_model,
+            provider=route.provider,
+            model=route.model,
+            base_url=route.base_url,
+            api_key=route.api_key,
+            api_mode=route.api_mode,
             messages=full_messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -3762,18 +3902,9 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             or hasattr(response, "content")
         )
         if not complete_response:
-            aggregate = getattr(auxiliary, "_aggregate_chat_stream", None)
-            if not callable(aggregate):
-                close = getattr(response, "close", None)
-                if callable(close):
-                    close()
-                raise RuntimeError(
-                    "This Hermes runtime cannot aggregate a strict no-fallback "
-                    "LLM stream. Upgrade Hermes; no alternate provider was tried."
-                )
-            response = aggregate(
+            response = _aggregate_llm_call_stream(
                 response,
-                model=resolved_model or "",
+                model=route.model,
                 total_ceiling=120.0,
             )
     except ImportError as e:
@@ -3800,8 +3931,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         model = response_model.strip()
 
     # Preserve the profile's configured provider independently from any
-    # per-call override. call_llm may still fall back internally, so neither
-    # value is reported as the provider that actually served the response.
+    # per-call override. Neither value is claimed as response provenance.
     try:
         from agent.auxiliary_client import _read_main_provider
         configured_provider = (_read_main_provider() or "").strip()
@@ -4040,8 +4170,10 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
             "available_routes": routes,
             "route_count": len(routes),
             "contract": (
-                "Pass one exact provider/model pair to llm_call. Unlisted "
-                "providers are rejected and inference never falls back."
+                "Prefer configured_default. Only when the task explicitly needs "
+                "an override, pass one exact available_routes provider/model pair "
+                "to llm_call. Unlisted providers are rejected and inference never "
+                "falls back."
             ),
         })
 

@@ -19,8 +19,12 @@ def _declared_default_llm_route(monkeypatch):
 
     monkeypatch.setattr(auxiliary_client, "_read_main_provider", lambda: "openai-codex")
     monkeypatch.setattr(auxiliary_client, "_read_main_model", lambda: "gpt-5.6-sol")
-    monkeypatch.setattr(auxiliary_client, "_read_main_base_url", lambda: "")
-    monkeypatch.setattr(auxiliary_client, "_read_main_api_key", lambda: "")
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_read_main_base_url",
+        lambda: "https://chatgpt.com/backend-api/codex",
+    )
+    monkeypatch.setattr(auxiliary_client, "_read_main_api_key", lambda: "test-token")
     monkeypatch.setattr(
         tools,
         "_configured_local_model_inventory",
@@ -44,7 +48,9 @@ def _declared_default_llm_route(monkeypatch):
             success=True,
             new_model=raw_input,
             target_provider=explicit_provider,
-            base_url="",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_key="test-token",
+            api_mode="codex_responses",
             error_message="",
         ),
     )
@@ -147,6 +153,8 @@ def _install_route_resolution_fakes(
         new_model=resolved_model,
         target_provider=resolved_provider,
         base_url=resolved_base_url,
+        api_key="test-token",
+        api_mode="chat_completions",
         error_message="",
     ))
     monkeypatch.setattr(model_switch, "switch_model", switch)
@@ -634,7 +642,13 @@ class TestLlmCallModelOverride:
         with patch.object(
             tools,
             "_resolve_llm_call_route",
-            return_value=("anthropic", "claude-sonnet-4"),
+            return_value=tools._LlmCallRoute(
+                provider="anthropic",
+                model="claude-sonnet-4",
+                base_url="https://api.anthropic.com",
+                api_key="test-token",
+                api_mode="chat_completions",
+            ),
         ):
             result = json.loads(tools.handle_llm_call({
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -936,6 +950,44 @@ class TestLlmCallParameterPassthrough:
         assert switch.call_args.kwargs["explicit_provider"] == "openai-codex"
 
     @patch("agent.auxiliary_client.call_llm")
+    def test_incomplete_executable_route_fails_before_inference(
+        self, mock_call_llm, monkeypatch
+    ):
+        from types import SimpleNamespace
+        import hermes_cli.model_switch as model_switch
+
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="ollama-cloud",
+            resolved_model="glm-5.2",
+            available_models=["glm-5.2"],
+        )
+        monkeypatch.setattr(
+            model_switch,
+            "switch_model",
+            lambda **kwargs: SimpleNamespace(
+                success=True,
+                new_model="glm-5.2",
+                target_provider="ollama-cloud",
+                base_url="https://ollama.example/v1",
+                api_key="",
+                api_mode="chat_completions",
+                error_message="",
+            ),
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["status"] == "error"
+        assert "api_key missing" in result["error"]
+        assert "No inference request was sent" in result["error"]
+        mock_call_llm.assert_not_called()
+
+    @patch("agent.auxiliary_client.call_llm")
     def test_no_overrides_pin_the_profile_default_route(
         self, mock_call_llm, monkeypatch
     ):
@@ -994,6 +1046,102 @@ class TestLlmCallParameterPassthrough:
 
         assert result["text"] == "ok"
         assert mock_call_llm.call_args.kwargs["stream"] is True
+
+    @patch("agent.auxiliary_client.call_llm")
+    def test_stream_chunks_are_aggregated_and_closed(
+        self, mock_call_llm, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        class ClosingStream:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                yield SimpleNamespace(
+                    model="glm-5.2",
+                    usage=None,
+                    choices=[SimpleNamespace(delta=SimpleNamespace(
+                        content="HERALD-", reasoning=None,
+                    ))],
+                )
+                yield SimpleNamespace(
+                    model="glm-5.2",
+                    usage=FakeUsage(prompt=2, completion=3, total=5),
+                    choices=[SimpleNamespace(delta=SimpleNamespace(
+                        content="OK", reasoning=None,
+                    ))],
+                )
+
+            def close(self):
+                self.closed = True
+
+        stream = ClosingStream()
+        mock_call_llm.return_value = stream
+        _install_route_resolution_fakes(
+            monkeypatch,
+            current_provider="ollama-cloud",
+            current_model="glm-5.2",
+            resolved_provider="ollama-cloud",
+            resolved_model="glm-5.2",
+            available_models=["glm-5.2"],
+        )
+
+        result = json.loads(tools.handle_llm_call({
+            "messages": [{"role": "user", "content": "Hi"}],
+        }))
+
+        assert result["text"] == "HERALD-OK"
+        assert result["model"] == "glm-5.2"
+        assert result["usage"]["total_tokens"] == 5
+        assert stream.closed is True
+
+    def test_reasoning_only_stream_and_empty_stream_contract(self):
+        from types import SimpleNamespace
+
+        reasoning = iter([SimpleNamespace(
+            model="reasoning-model",
+            usage=None,
+            choices=[SimpleNamespace(delta=SimpleNamespace(
+                content=None, reasoning_content="reasoned answer",
+            ))],
+        )])
+        response = tools._aggregate_llm_call_stream(
+            reasoning,
+            model="requested-model",
+        )
+        assert response["model"] == "reasoning-model"
+        assert response["choices"][0]["message"]["content"] == ""
+        assert response["choices"][0]["message"]["reasoning"] == "reasoned answer"
+
+        with pytest.raises(RuntimeError, match="empty or malformed stream"):
+            tools._aggregate_llm_call_stream(iter(()), model="requested-model")
+
+    def test_stream_aggregation_enforces_wall_clock_timeout(self):
+        import threading
+
+        class BlockingStream:
+            def __init__(self):
+                self.released = threading.Event()
+                self.closed = False
+
+            def __iter__(self):
+                self.released.wait()
+                return
+                yield
+
+            def close(self):
+                self.closed = True
+                self.released.set()
+
+        stream = BlockingStream()
+        with pytest.raises(TimeoutError, match="timed out"):
+            tools._aggregate_llm_call_stream(
+                stream,
+                model="requested-model",
+                total_ceiling=0.01,
+            )
+        assert stream.closed is True
 
     @patch("agent.auxiliary_client.call_llm")
     def test_selected_route_failure_is_noisy_and_not_retried(
@@ -1183,7 +1331,13 @@ class TestLlmCallParameterPassthrough:
         with patch.object(
             tools,
             "_resolve_llm_call_route",
-            return_value=("anthropic", "claude-sonnet-4"),
+            return_value=tools._LlmCallRoute(
+                provider="anthropic",
+                model="claude-sonnet-4",
+                base_url="https://api.anthropic.com",
+                api_key="test-token",
+                api_mode="chat_completions",
+            ),
         ) as resolve_route:
             tools.handle_llm_call({
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -1194,6 +1348,9 @@ class TestLlmCallParameterPassthrough:
         call_args = mock_call_llm.call_args[1]
         assert call_args["provider"] == "anthropic"
         assert call_args["model"] == "claude-sonnet-4"
+        assert call_args["base_url"] == "https://api.anthropic.com"
+        assert call_args["api_key"] == "test-token"
+        assert call_args["api_mode"] == "chat_completions"
         resolve_route.assert_called_once_with("claude-sonnet-4", "anthropic")
 
     @patch("agent.auxiliary_client.call_llm")
@@ -1206,7 +1363,13 @@ class TestLlmCallParameterPassthrough:
         with patch.object(
             tools,
             "_resolve_llm_call_route",
-            return_value=(None, "requested-model"),
+            return_value=tools._LlmCallRoute(
+                provider="openai-codex",
+                model="requested-model",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="test-token",
+                api_mode="codex_responses",
+            ),
         ) as resolve_route:
             result = json.loads(tools.handle_llm_call({
                 "messages": [{"role": "user", "content": "Hi"}],
@@ -1215,7 +1378,7 @@ class TestLlmCallParameterPassthrough:
             }))
 
         call_args = mock_call_llm.call_args[1]
-        assert call_args["provider"] is None
+        assert call_args["provider"] == "openai-codex"
         assert call_args["model"] == "requested-model"
         assert result["requested_provider"] == ""
         resolve_route.assert_called_once_with("requested-model", "")

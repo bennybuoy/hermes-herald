@@ -164,8 +164,9 @@ list_profile_models(profile="tutor")
 ```
 
 For local `llm_call` routing, omit `profile`. The result is a fail-closed
-allowlist built from the calling profile's configured default, user providers,
-and custom providers; ambient OAuth or fallback credentials are excluded:
+allowlist built from Hermes's explicit-only inventory for the calling profile:
+the configured default plus every provider explicitly configured by the user.
+Ambient or auto-discovered credentials and fallback-only routes are excluded:
 
 ```python
 list_profile_models()
@@ -360,6 +361,10 @@ default provider and model. Before choosing an override, call
 provider-only override is accepted only for the active provider; selecting a
 different provider requires an explicit model.
 
+Prefer `configured_default`. Do not select another provider merely because it
+advertises the same model; override the route only when the task or user
+explicitly calls for that endpoint.
+
 Model overrides are resolved through the same model-switch pipeline as Hermes's
 `/model` command, but Herald then requires the resolved wire slug to appear in
 the selected provider's authenticated model inventory **before the inference
@@ -522,7 +527,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **179 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **190 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 
