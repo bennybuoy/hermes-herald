@@ -30,7 +30,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
@@ -563,7 +563,8 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
         "server handled the call. "
         "Model overrides are resolved through Hermes's /model pipeline and "
         "must exist in the selected provider's advertised inventory before "
-        "any request is sent.\n\n"
+        "the inference request is sent. Inventory validation may query the "
+        "selected provider's model catalog.\n\n"
         "For a full agent with tools and terminal access, use "
         "delegate_subagent or dispatch_agent instead."
     ),
@@ -3380,6 +3381,7 @@ def _configured_local_model_inventory(
     current_provider: str = "",
     current_model: str = "",
     current_base_url: str = "",
+    current_api_key: str = "",
 ) -> dict:
     """Return model routes explicitly owned by the active profile.
 
@@ -3389,6 +3391,8 @@ def _configured_local_model_inventory(
     leave this helper.
     """
     from hermes_cli.inventory import ConfigContext, build_models_payload, load_picker_context
+    from hermes_cli.model_normalize import normalize_model_for_provider
+    from hermes_cli.model_switch import switch_model
 
     configured = load_picker_context()
     live_provider = (current_provider or configured.current_provider or "").strip()
@@ -3423,16 +3427,64 @@ def _configured_local_model_inventory(
         provider = str(row.get("slug") or "").strip()
         if not provider:
             continue
-        models = sorted({
+        advertised_models = sorted({
             str(model).strip()
             for model in (row.get("models") or [])
             if isinstance(model, str) and model.strip()
         })
-        providers.append({"provider": provider, "models": models})
+        # MoA is a virtual orchestration facade. auxiliary_client unwraps it
+        # after preflight and discards the supplied endpoint credentials, so it
+        # cannot satisfy llm_call's one-route contract. Synthetic picker IDs
+        # are retained only when they round-trip through the host resolver as
+        # the same complete executable provider/model pair.
+        if provider.lower() == "moa":
+            continue
+        models = []
+        for model in advertised_models:
+            result = switch_model(
+                raw_input=model,
+                current_provider=live_provider or provider,
+                current_model=live_model,
+                current_base_url=live_base_url,
+                current_api_key=current_api_key,
+                is_global=False,
+                explicit_provider=provider,
+                user_providers=user_providers,
+                custom_providers=custom_providers,
+            )
+            if not result.success:
+                continue
+            resolved_provider = str(result.target_provider or provider).strip()
+            resolved_model = str(result.new_model or "").strip()
+            if resolved_provider.lower() != provider.lower():
+                continue
+            advertised_key = (
+                normalize_model_for_provider(model, provider) or model
+            ).strip().lower()
+            resolved_key = (
+                normalize_model_for_provider(resolved_model, provider) or resolved_model
+            ).strip().lower()
+            if advertised_key != resolved_key:
+                continue
+            if not all(
+                str(getattr(result, field_name, "") or "").strip()
+                for field_name in ("base_url", "api_key", "api_mode")
+            ):
+                continue
+            models.append(model)
+        if models:
+            providers.append({"provider": provider, "models": models})
     providers.sort(key=lambda row: row["provider"])
 
+    configured_default = {"provider": live_provider, "model": live_model}
+    default_is_executable = any(
+        row["provider"].lower() == live_provider.lower()
+        and live_model in row["models"]
+        for row in providers
+    )
+
     return {
-        "configured_default": {"provider": live_provider, "model": live_model},
+        "configured_default": configured_default if default_is_executable else None,
         "providers": providers,
         "user_providers": user_providers,
         "custom_providers": custom_providers,
@@ -3517,6 +3569,7 @@ def _resolve_llm_call_route(
         current_provider=current_provider,
         current_model=current_model,
         current_base_url=current_base_url,
+        current_api_key=current_api_key,
     )
     configured_provider_ids = {
         str(row.get("provider") or "").strip().lower()
@@ -3760,10 +3813,19 @@ def _aggregate_llm_call_stream(
         stop_producer.set()
         close = getattr(chunks, "close", None)
         if callable(close):
-            try:
-                close()
-            except Exception:
-                pass
+            def _close() -> None:
+                try:
+                    close()
+                except Exception:
+                    pass
+
+            close_thread = threading.Thread(
+                target=_close,
+                name="herald-llm-stream-close",
+                daemon=True,
+            )
+            close_thread.start()
+            close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     content = "".join(content_parts)
     reasoning = "".join(reasoning_parts)
@@ -3784,6 +3846,60 @@ def _aggregate_llm_call_stream(
         }],
         "usage": usage,
     }
+
+
+def _create_strict_llm_stream(
+    auxiliary: Any,
+    route: _LlmCallRoute,
+    *,
+    messages: List[Dict[str, str]],
+    temperature: Any,
+    max_tokens: Any,
+    extra_body: Any,
+    timeout: float,
+) -> Any:
+    """Create one request on the resolved route without entering fallback logic."""
+    get_client = cast(Any, getattr(auxiliary, "_get_cached_client", None))
+    build_kwargs = cast(Any, getattr(auxiliary, "_build_call_kwargs", None))
+    if not callable(get_client) or not callable(build_kwargs):
+        raise RuntimeError(
+            "Installed Hermes core lacks the strict client construction helpers "
+            "required by Herald; upgrade Hermes. No inference request was sent."
+        )
+    client, final_model = get_client(
+        route.provider,
+        route.model,
+        base_url=route.base_url,
+        api_key=route.api_key,
+        api_mode=route.api_mode,
+        task=None,
+    )
+    if client is None:
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' could not construct a client; "
+            "no alternate provider was tried."
+        )
+    final_model = str(final_model or "").strip()
+    if final_model != route.model:
+        raise RuntimeError(
+            f"Selected provider changed model '{route.model}' to '{final_model}'; "
+            "no inference request was sent and no alternate provider was tried."
+        )
+    client_base_url = str(getattr(client, "base_url", route.base_url) or route.base_url)
+    kwargs = cast(Dict[str, Any], build_kwargs(
+        route.provider,
+        route.model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        extra_body=extra_body,
+        base_url=client_base_url,
+        task=None,
+    ))
+    kwargs["stream"] = True
+    kwargs["stream_options"] = {"include_usage": True}
+    return client.chat.completions.create(**kwargs)
 
 
 def handle_llm_call(args: dict, **kwargs) -> str:
@@ -3889,24 +4005,17 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         except ImportError:
             extract_content_or_reasoning = _extract_content_or_reasoning_fallback
 
-        # ``auxiliary_client`` deliberately falls back to unrelated providers
-        # for several non-streaming failure classes, even when a provider was
-        # explicit. Its streaming path does not perform provider fallback.
-        # Consume that path synchronously so a failed Ollama/custom route can
-        # never escape to OpenRouter, Nous, or another ambient credential.
-        response: Any = auxiliary.call_llm(
-            task=None,
-            provider=route.provider,
-            model=route.model,
-            base_url=route.base_url,
-            api_key=route.api_key,
-            api_mode=route.api_mode,
+        # Construct the selected client directly. Entering call_llm would let
+        # pre-stream setup unwrap virtual providers or enter configured and
+        # automatic provider fallbacks before its stream=True branch.
+        response: Any = _create_strict_llm_stream(
+            auxiliary,
+            route,
             messages=full_messages,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=120.0,
             extra_body=extra_body,
-            stream=True,
         )
         complete_response = (
             isinstance(response, (dict, str, bytes))
@@ -4163,6 +4272,7 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 current_provider=(auxiliary._read_main_provider() or "").strip(),
                 current_model=(auxiliary._read_main_model() or "").strip(),
                 current_base_url=(auxiliary._read_main_base_url() or "").strip(),
+                current_api_key=(auxiliary._read_main_api_key() or "").strip(),
             )
         except Exception as e:
             return _tool_error(
@@ -4183,7 +4293,7 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
             "available_routes": routes,
             "route_count": len(routes),
             "contract": (
-                "Prefer configured_default. Only when the task explicitly needs "
+                "Prefer configured_default when it is present. Only when the task explicitly needs "
                 "an override, pass one exact available_routes provider/model pair "
                 "to llm_call. Unlisted providers are rejected and inference never "
                 "falls back."

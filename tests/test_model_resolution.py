@@ -121,6 +121,22 @@ class TestLocalModelRouteDiscovery:
             "_read_main_base_url",
             lambda: "http://ollama-cloud.example/v1",
         )
+        monkeypatch.setattr(auxiliary_client, "_read_main_api_key", lambda: "test-key")
+        import hermes_cli.model_switch as model_switch
+
+        monkeypatch.setattr(
+            model_switch,
+            "switch_model",
+            lambda raw_input, explicit_provider, **kwargs: SimpleNamespace(
+                success=explicit_provider != "custom:openai-2",
+                target_provider=explicit_provider,
+                new_model=raw_input,
+                base_url=f"http://{explicit_provider}.example/v1",
+                api_key="test-key",
+                api_mode="chat_completions",
+                error_message="",
+            ),
+        )
         captured = {}
 
         def explicit_payload(*args, **kwargs):
@@ -130,6 +146,8 @@ class TestLocalModelRouteDiscovery:
                     {"slug": "ollama-cloud", "models": ["glm-5.2"]},
                     {"slug": "backup", "models": ["backup-model"]},
                     {"slug": "custom:llamaherd", "models": ["glm-5.2"]},
+                    {"slug": "custom:openai-2", "models": ["model-b"]},
+                    {"slug": "moa", "models": ["default"]},
                 ]
             }
 

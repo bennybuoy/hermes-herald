@@ -212,7 +212,7 @@ def _install_route_resolution_fakes(
 class TestLlmCallResponseExtraction:
     """Test handle_llm_call response extraction from various response shapes."""
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_openai_choices_response(self, mock_call_llm):
         """OpenAI-compatible response with choices[0].message.content."""
         mock_call_llm.return_value = FakeResponse(
@@ -232,7 +232,7 @@ class TestLlmCallResponseExtraction:
         assert result["usage"]["completion_tokens"] == 20
         assert result["usage"]["total_tokens"] == 30
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_reasoning_only_openai_response(self, mock_call_llm):
         response = FakeResponse(
             model="deepseek-r1",
@@ -247,7 +247,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "Reasoning-only answer"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_reasoning_fallback_for_older_hermes_core(self, mock_call_llm, monkeypatch):
         import agent.auxiliary_client as auxiliary_client
 
@@ -265,7 +265,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "compatibility answer"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_anthropic_content_response(self, mock_call_llm):
         """Anthropic-style response with top-level content string."""
         mock_call_llm.return_value = FakeResponse(
@@ -281,7 +281,7 @@ class TestLlmCallResponseExtraction:
         assert result["text"] == "Hello from Claude"
         assert result["model"] == "claude-sonnet-4"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_anthropic_content_list(self, mock_call_llm):
         """Anthropic-style response with content as list of text blocks."""
         block1 = MagicMock()
@@ -299,7 +299,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "Hello world"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_anthropic_content_list_skips_non_text_blocks(self, mock_call_llm):
         block1 = MagicMock()
         block1.text = None
@@ -313,7 +313,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "world"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_response_fallback(self, mock_call_llm):
         """Response as a plain dict (fallback path)."""
         mock_call_llm.return_value = {
@@ -327,7 +327,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "Hello from dict"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_response_extracts_model_and_usage(self, mock_call_llm):
         mock_call_llm.return_value = {
             "content": "Hello from dict",
@@ -342,7 +342,7 @@ class TestLlmCallResponseExtraction:
         assert result["model"] == "dict-model"
         assert result["usage"]["total_tokens"] == 9
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_response_text_fallback(self, mock_call_llm):
         """Dict response with 'text' key instead of 'content'."""
         mock_call_llm.return_value = {
@@ -356,7 +356,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "Hello from text key"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_openai_message_response(self, mock_call_llm):
         mock_call_llm.return_value = {
             "choices": [{"message": {"content": "Hello from choices"}}],
@@ -368,7 +368,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "Hello from choices"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_reasoning_only_response(self, mock_call_llm):
         mock_call_llm.return_value = {
             "choices": [{
@@ -386,7 +386,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "dict reasoning\n\ndetail summary"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_reasoning_wrappers_fall_back_to_structured_reasoning(self, mock_call_llm):
         mock_call_llm.return_value = {
             "choices": [{
@@ -404,7 +404,7 @@ class TestLlmCallResponseExtraction:
         assert result["text"] == "visible fallback"
         assert "private chain" not in result["text"]
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_dict_openai_text_response(self, mock_call_llm):
         mock_call_llm.return_value = {"choices": [{"text": "legacy text"}]}
 
@@ -414,7 +414,7 @@ class TestLlmCallResponseExtraction:
 
         assert result["text"] == "legacy text"
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_unknown_dict_shape_fails_closed(self, mock_call_llm):
         marker = object()
         mock_call_llm.return_value = {"unexpected": marker}
@@ -427,7 +427,7 @@ class TestLlmCallResponseExtraction:
         assert "empty or malformed response" in result["error"]
         assert "No alternate provider was tried" in result["error"]
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_empty_choices(self, mock_call_llm):
         """Response with empty choices list."""
         mock_call_llm.return_value = FakeResponse(
@@ -442,7 +442,7 @@ class TestLlmCallResponseExtraction:
         assert result["status"] == "error"
         assert "empty or malformed response" in result["error"]
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_str_response_fallback(self, mock_call_llm):
         """Response as a plain string (last-resort fallback)."""
         mock_call_llm.return_value = "raw string response"
@@ -457,7 +457,7 @@ class TestLlmCallResponseExtraction:
 class TestLlmCallUsageExtraction:
     """Test usage extraction from various usage object shapes."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_usage_model_dump(self, mock_call_llm):
         """Usage with model_dump() (Pydantic v2)."""
         mock_call_llm.return_value = FakeResponse(
@@ -474,7 +474,7 @@ class TestLlmCallUsageExtraction:
         assert result["usage"]["completion_tokens"] == 20
         assert result["usage"]["total_tokens"] == 30
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_usage_dict_method(self, mock_call_llm):
         """Usage with .dict() (Pydantic v1)."""
         mock_call_llm.return_value = FakeResponse(
@@ -491,7 +491,7 @@ class TestLlmCallUsageExtraction:
         assert result["usage"]["completion_tokens"] == 10
         assert result["usage"]["total_tokens"] == 15
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_usage_bare_attributes(self, mock_call_llm):
         """Usage with only attribute access (no model_dump/dict)."""
         mock_call_llm.return_value = FakeResponse(
@@ -508,7 +508,7 @@ class TestLlmCallUsageExtraction:
         assert result["usage"]["completion_tokens"] == 2
         assert result["usage"]["total_tokens"] == 3
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_usage_dict_direct(self, mock_call_llm):
         """Usage as a plain dict."""
         mock_call_llm.return_value = FakeResponse(
@@ -524,7 +524,7 @@ class TestLlmCallUsageExtraction:
         assert result["usage"]["prompt_tokens"] == 100
         assert result["usage"]["total_tokens"] == 300
 
-    @patch("agent.auxiliary_client.call_llm", create=True)
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_no_usage(self, mock_call_llm):
         """Response with no usage attribute."""
         # Use a SimpleNamespace to avoid MagicMock's auto-attribute creation
@@ -545,7 +545,7 @@ class TestLlmCallUsageExtraction:
 class TestLlmCallProviderProvenance:
     """Test that routing intent is not mislabeled as the serving provider."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     @patch("agent.auxiliary_client._read_main_provider")
     def test_configured_provider_is_separate_from_actual(self, mock_read_main, mock_call_llm):
         mock_read_main.return_value = "ollama-cloud"
@@ -562,7 +562,7 @@ class TestLlmCallProviderProvenance:
         assert result["requested_provider"] == ""
         assert result["configured_provider"] == "ollama-cloud"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     @patch("agent.auxiliary_client._read_main_provider")
     def test_requested_provider_is_not_claimed_as_actual(self, mock_read_main, mock_call_llm):
         mock_read_main.return_value = "openai-codex"
@@ -581,7 +581,7 @@ class TestLlmCallProviderProvenance:
         assert result["configured_provider"] == "openai-codex"
         assert mock_read_main.call_count == 2
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_explicit_response_provider_is_reported_as_actual(self, mock_call_llm):
         response = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
@@ -598,7 +598,7 @@ class TestLlmCallProviderProvenance:
         assert result["provider"] == "openai"
         assert result["requested_provider"] == "openai-codex"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     @patch("agent.auxiliary_client._read_main_provider")
     def test_configured_provider_lookup_failure_fails_closed(self, mock_read_main, mock_call_llm):
         mock_read_main.side_effect = ImportError("not in Hermes session")
@@ -619,7 +619,7 @@ class TestLlmCallProviderProvenance:
 class TestLlmCallModelOverride:
     """Test model resolution from response vs override."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_model_from_response(self, mock_call_llm):
         """Model is read from response.model when no override."""
         mock_call_llm.return_value = FakeResponse(
@@ -633,7 +633,7 @@ class TestLlmCallModelOverride:
 
         assert result["model"] == "gpt-4o-2024-08-06"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_model_override_wins(self, mock_call_llm):
         """Explicit model override is used even when response.model differs."""
         mock_call_llm.return_value = FakeResponse(
@@ -664,7 +664,7 @@ class TestLlmCallModelOverride:
 class TestLlmCallSystemPrompt:
     """Test system prompt handling."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_system_prompt_prepended(self, mock_call_llm):
         """System prompt is prepended as a system-role message."""
         mock_call_llm.return_value = FakeResponse(
@@ -684,7 +684,7 @@ class TestLlmCallSystemPrompt:
         }
         assert call_args["messages"][1] == {"role": "user", "content": "Hi"}
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_empty_system_prompt_is_still_prepended(self, mock_call_llm):
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
@@ -699,7 +699,7 @@ class TestLlmCallSystemPrompt:
         call_args = mock_call_llm.call_args[1]
         assert call_args["messages"][0] == {"role": "system", "content": ""}
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_no_system_prompt(self, mock_call_llm):
         """Without system_prompt, messages pass through unchanged."""
         mock_call_llm.return_value = FakeResponse(
@@ -719,7 +719,7 @@ class TestLlmCallSystemPrompt:
 class TestLlmCallJsonMode:
     """Test cross-provider JSON-mode construction and validation."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_json_mode_adds_instruction_extra_body_and_validates(self, mock_call_llm):
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content='{"ok": true}')],
@@ -735,12 +735,11 @@ class TestLlmCallJsonMode:
         assert call_args["extra_body"] == {
             "response_format": {"type": "json_object"}
         }
-        assert call_args["task"] is None
         assert call_args["messages"][0]["role"] == "system"
         assert "valid JSON object" in call_args["messages"][0]["content"]
         assert result["text"] == '{"ok":true}'
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_json_mode_combines_existing_system_message_without_mutation(self, mock_call_llm):
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content='```json\n{"ok": true}\n```')],
@@ -762,7 +761,7 @@ class TestLlmCallJsonMode:
         assert result["text"] == '{"ok":true}'
 
     @pytest.mark.parametrize("model_text", ["not json", "[1, 2, 3]"])
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_json_mode_rejects_non_object_output(self, mock_call_llm, model_text):
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content=model_text)],
@@ -776,7 +775,7 @@ class TestLlmCallJsonMode:
         assert result["status"] == "error"
         assert "json_mode" in result["error"]
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_no_json_mode_no_extra_body(self, mock_call_llm):
         """json_mode=False (default) does not set extra_body."""
         mock_call_llm.return_value = FakeResponse(
@@ -807,7 +806,7 @@ class TestLlmCallErrorHandling:
         assert result["status"] == "error"
         assert "messages" in result["error"]
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_call_llm_failure(self, mock_call_llm):
         """call_llm raising an exception returns a clean error."""
         mock_call_llm.side_effect = RuntimeError("API timeout")
@@ -927,7 +926,7 @@ class TestLlmCallInputValidation:
 class TestLlmCallParameterPassthrough:
     """Test that parameters are correctly passed to call_llm."""
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_model_override_uses_active_provider_model_resolver(
         self, mock_call_llm, monkeypatch
     ):
@@ -943,15 +942,15 @@ class TestLlmCallParameterPassthrough:
             "model": "gpt5.6sol",
         }))
 
-        call_args = mock_call_llm.call_args[1]
-        assert call_args["provider"] == "openai-codex"
-        assert call_args["model"] == "gpt-5.6-sol"
+        route = mock_call_llm.call_args.args[1]
+        assert route.provider == "openai-codex"
+        assert route.model == "gpt-5.6-sol"
         assert result["requested_model"] == "gpt5.6sol"
         assert result["resolved_provider"] == "openai-codex"
         assert result["resolved_model"] == "gpt-5.6-sol"
         assert switch.call_args.kwargs["explicit_provider"] == "openai-codex"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_incomplete_executable_route_fails_before_inference(
         self, mock_call_llm, monkeypatch
     ):
@@ -989,7 +988,7 @@ class TestLlmCallParameterPassthrough:
         assert "No inference request was sent" in result["error"]
         mock_call_llm.assert_not_called()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_no_overrides_pin_the_profile_default_route(
         self, mock_call_llm, monkeypatch
     ):
@@ -1020,10 +1019,11 @@ class TestLlmCallParameterPassthrough:
 
         assert result["resolved_provider"] == "ollama-cloud"
         assert result["resolved_model"] == "glm-5.2"
-        assert mock_call_llm.call_args.kwargs["provider"] == "ollama-cloud"
-        assert mock_call_llm.call_args.kwargs["model"] == "glm-5.2"
+        route = mock_call_llm.call_args.args[1]
+        assert route.provider == "ollama-cloud"
+        assert route.model == "glm-5.2"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_llm_call_uses_no_fallback_streaming_path(
         self, mock_call_llm, monkeypatch
     ):
@@ -1047,9 +1047,9 @@ class TestLlmCallParameterPassthrough:
         }))
 
         assert result["text"] == "ok"
-        assert mock_call_llm.call_args.kwargs["stream"] is True
+        mock_call_llm.assert_called_once()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_stream_chunks_are_aggregated_and_closed(
         self, mock_call_llm, monkeypatch
     ):
@@ -1145,7 +1145,28 @@ class TestLlmCallParameterPassthrough:
             )
         assert stream.closed is True
 
-    @patch("agent.auxiliary_client.call_llm")
+    def test_blocking_stream_close_cannot_extend_wall_clock_timeout(self):
+        import threading
+        import time
+
+        class BlockingCloseStream:
+            def __iter__(self):
+                threading.Event().wait()
+                yield  # pragma: no cover
+
+            def close(self):
+                threading.Event().wait()
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="timed out"):
+            tools._aggregate_llm_call_stream(
+                BlockingCloseStream(),
+                model="requested-model",
+                total_ceiling=0.01,
+            )
+        assert time.monotonic() - started < 0.1
+
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_selected_route_failure_is_noisy_and_not_retried(
         self, mock_call_llm, monkeypatch
     ):
@@ -1171,9 +1192,8 @@ class TestLlmCallParameterPassthrough:
         assert result["status"] == "error"
         assert "selected Ollama route unavailable" in result["error"]
         mock_call_llm.assert_called_once()
-        assert mock_call_llm.call_args.kwargs["stream"] is True
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_unconfigured_openrouter_route_is_rejected_before_inference(
         self, mock_call_llm, monkeypatch
     ):
@@ -1199,7 +1219,7 @@ class TestLlmCallParameterPassthrough:
         assert "ollama-cloud" in result["error"]
         mock_call_llm.assert_not_called()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_alternate_provider_requires_an_explicit_model(
         self, mock_call_llm, monkeypatch
     ):
@@ -1214,7 +1234,7 @@ class TestLlmCallParameterPassthrough:
         assert "requires an explicit model" in result["error"]
         mock_call_llm.assert_not_called()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_family_model_resolves_to_active_advertised_variant(
         self, mock_call_llm, monkeypatch
     ):
@@ -1234,10 +1254,11 @@ class TestLlmCallParameterPassthrough:
         }))
 
         assert result["text"] == "ok"
-        assert mock_call_llm.call_args.kwargs["provider"] == "openai-codex"
-        assert mock_call_llm.call_args.kwargs["model"] == "gpt-5.6-sol"
+        route = mock_call_llm.call_args.args[1]
+        assert route.provider == "openai-codex"
+        assert route.model == "gpt-5.6-sol"
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_openai_provider_alias_cannot_silently_select_openrouter(
         self, mock_call_llm, monkeypatch
     ):
@@ -1285,7 +1306,7 @@ class TestLlmCallParameterPassthrough:
         assert "openrouter" in result["error"]
         mock_call_llm.assert_not_called()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_unadvertised_model_is_rejected_before_inference(
         self, mock_call_llm, monkeypatch
     ):
@@ -1304,7 +1325,7 @@ class TestLlmCallParameterPassthrough:
         assert "gpt-5.6-sol" in result["error"]
         mock_call_llm.assert_not_called()
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_temperature_passthrough(self, mock_call_llm):
         """Temperature is passed through to call_llm."""
         mock_call_llm.return_value = FakeResponse(
@@ -1322,7 +1343,7 @@ class TestLlmCallParameterPassthrough:
         assert call_args["temperature"] == 0.5
         assert call_args["max_tokens"] == 100
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_provider_and_model_passthrough(self, mock_call_llm):
         """Resolved provider and model are passed to call_llm."""
         mock_call_llm.return_value = FakeResponse(
@@ -1347,15 +1368,15 @@ class TestLlmCallParameterPassthrough:
                 "model": "claude-sonnet-4",
             })
 
-        call_args = mock_call_llm.call_args[1]
-        assert call_args["provider"] == "anthropic"
-        assert call_args["model"] == "claude-sonnet-4"
-        assert call_args["base_url"] == "https://api.anthropic.com"
-        assert call_args["api_key"] == "test-token"
-        assert call_args["api_mode"] == "chat_completions"
+        route = mock_call_llm.call_args.args[1]
+        assert route.provider == "anthropic"
+        assert route.model == "claude-sonnet-4"
+        assert route.base_url == "https://api.anthropic.com"
+        assert route.api_key == "test-token"
+        assert route.api_mode == "chat_completions"
         resolve_route.assert_called_once_with("claude-sonnet-4", "anthropic")
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_provider_and_model_are_normalized(self, mock_call_llm):
         mock_call_llm.return_value = FakeResponse(
             choices=[FakeChoice(message_content="ok")],
@@ -1379,13 +1400,13 @@ class TestLlmCallParameterPassthrough:
                 "model": "  requested-model  ",
             }))
 
-        call_args = mock_call_llm.call_args[1]
-        assert call_args["provider"] == "openai-codex"
-        assert call_args["model"] == "requested-model"
+        route = mock_call_llm.call_args.args[1]
+        assert route.provider == "openai-codex"
+        assert route.model == "requested-model"
         assert result["requested_provider"] == ""
         resolve_route.assert_called_once_with("requested-model", "")
 
-    @patch("agent.auxiliary_client.call_llm")
+    @patch("hermes_herald.tools._create_strict_llm_stream")
     def test_timeout_passthrough(self, mock_call_llm):
         """Timeout is always 120s."""
         mock_call_llm.return_value = FakeResponse(

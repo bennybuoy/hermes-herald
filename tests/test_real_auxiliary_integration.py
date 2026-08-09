@@ -184,6 +184,64 @@ def test_stream_creation_failures_bypass_core_fallback_helpers(
         )
 
 
+def test_plugin_strict_creation_bypasses_call_llm_and_requests_usage(monkeypatch):
+    """Herald dispatches directly on the selected client, before core fallback code."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return iter(())
+
+    client = SimpleNamespace(
+        base_url="https://strict.example/v1",
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    monkeypatch.setattr(
+        aux,
+        "call_llm",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict creation must not enter call_llm")
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model=None, **kwargs: (client, model),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_build_call_kwargs",
+        lambda provider, model, messages, **kwargs: {
+            "model": model,
+            "messages": messages,
+        },
+    )
+
+    stream = tools._create_strict_llm_stream(
+        aux,
+        tools._LlmCallRoute(
+            provider="custom:strict",
+            model="strict-model",
+            base_url="https://strict.example/v1",
+            api_key="test-token",
+            api_mode="chat_completions",
+        ),
+        messages=[{"role": "user", "content": "Hi"}],
+        temperature=None,
+        max_tokens=None,
+        extra_body=None,
+        timeout=120.0,
+    )
+
+    assert list(stream) == []
+    assert captured["stream"] is True
+    assert captured["stream_options"] == {"include_usage": True}
+
+
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
     """Load real auxiliary_client and exercise the plugin's production imports."""
     script = textwrap.dedent(
@@ -257,12 +315,19 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
             usage=None,
         )
 
-        original_call = aux.call_llm
+        original_create = tools._create_strict_llm_stream
         original_resolve = tools._resolve_llm_call_route
-        def fake_call_llm(**kwargs):
+        def fake_create(auxiliary, route, **kwargs):
+            captured.update(
+                provider=route.provider,
+                model=route.model,
+                base_url=route.base_url,
+                api_key=route.api_key,
+                api_mode=route.api_mode,
+            )
             captured.update(kwargs)
             return response
-        aux.call_llm = fake_call_llm
+        tools._create_strict_llm_stream = fake_create
         tools._resolve_llm_call_route = lambda provider, model: tools._LlmCallRoute(
             provider="requested-provider",
             model="requested-model",
@@ -277,16 +342,14 @@ def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):
                 "json_mode": True,
             }}))
         finally:
-            aux.call_llm = original_call
+            tools._create_strict_llm_stream = original_create
             tools._resolve_llm_call_route = original_resolve
 
-        assert captured["task"] is None
         assert captured["provider"] == "requested-provider"
         assert captured["model"] == "requested-model"
         assert captured["base_url"] == "https://example.invalid/v1"
         assert captured["api_key"] == "test-token"
         assert captured["api_mode"] == "chat_completions"
-        assert captured["stream"] is True
         assert captured["extra_body"] == {{
             "response_format": {{"type": "json_object"}}
         }}

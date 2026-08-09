@@ -89,6 +89,13 @@ hermes plugins install bennybuoy/hermes-herald --enable
 
 Install Herald on profiles that will **originate** calls. A target-only profile needs Hermes’s API server, not the plugin. Restart the process that loads the origin profile after installation.
 
+Manual installation is also supported, but user plugins are opt-in:
+
+```bash
+git clone https://github.com/bennybuoy/hermes-herald.git ~/.hermes/plugins/hermes-herald
+hermes plugins enable hermes-herald
+```
+
 For a named origin, prefix the commands below with `hermes -p <origin>`.
 
 ### 2. Prepare a target profile
@@ -166,7 +173,10 @@ list_profile_models(profile="tutor")
 For local `llm_call` routing, omit `profile`. The result is a fail-closed
 allowlist built from Hermes's explicit-only inventory for the calling profile:
 the configured default plus every provider explicitly configured by the user.
-Ambient or auto-discovered credentials and fallback-only routes are excluded:
+Herald then keeps only concrete provider/model pairs that round-trip through
+Hermes's resolver as a complete executable route. Virtual MoA routes, synthetic
+picker identities that cannot round-trip, ambient or auto-discovered credentials,
+and fallback-only routes are excluded:
 
 ```python
 list_profile_models()
@@ -188,6 +198,26 @@ dispatch_chat(
 ```
 
 A follow-up to `tutor` reuses the stored target session unless `new_session=True`.
+
+---
+
+## Upgrading from Agent Dispatch 1.x
+
+Hermes Herald renames the plugin identity from `agent-dispatch` to
+`hermes-herald`. The tool names are unchanged, but Hermes's plugin allow-list
+uses the manifest identity. Replace the old entry before restarting:
+
+```yaml
+plugins:
+  enabled:
+    # Remove: agent-dispatch
+    - hermes-herald
+```
+
+If the old checkout is installed at `~/.hermes/plugins/agent-dispatch`, move it
+to `~/.hermes/plugins/hermes-herald` or reinstall it with the command above. Do
+not keep both checkouts: they advertise the same capabilities and make plugin
+discovery ambiguous.
 
 ---
 
@@ -527,7 +557,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **190 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **192 tests** covering streaming persistent chat, local and remote model-route discovery, fail-closed no-fallback inference, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

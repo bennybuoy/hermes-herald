@@ -188,7 +188,9 @@ Use `llm_call` when you need only inference, not an agent loop:
 - Use either `system_prompt` or a system-role message, not both.
 - Call `list_profile_models()` before choosing a route. Its local mode returns
   the calling profile's configured default plus every provider explicitly
-  configured by the user. Ambient or auto-discovered credentials and
+  configured by the user, filtered to concrete pairs that round-trip through
+  Hermes's resolver as complete executable routes. Virtual MoA routes,
+  unresolvable picker identities, ambient or auto-discovered credentials, and
   fallback-only routes are not routing authority.
 - With no routing arguments, the request is pinned to the calling profile's
   configured default provider and model.
