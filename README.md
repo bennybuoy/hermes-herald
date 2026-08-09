@@ -337,11 +337,26 @@ llm_call(
 # Translation on a selected route
 llm_call(
     messages=[{"role": "user", "content": "Translate to French: Good morning."}],
-    model="gpt-5",
+    provider="openai-codex",
+    model="gpt-5.6-sol",
 )
 ```
 
 Use it for tasks where tools and iterative reasoning would be overhead: routing, scoring, rewriting, extraction, translation, compact summarisation, and schema-constrained JSON.
+
+Model overrides are resolved through the same model-switch pipeline as Hermes's
+`/model` command, but Herald then requires the resolved wire slug to appear in
+the selected provider's authenticated model inventory **before network
+contact**. A model-only request stays on the active provider; it cannot silently
+select OpenRouter from a vendor-prefixed slug. Family shorthand such as
+`gpt-5.6` resolves to the active advertised family variant (`gpt-5.6-sol` here).
+Unadvertised models fail before Hermes can enter a provider fallback chain.
+
+Use exact provider IDs. In Hermes, bare `openai` is an alias for OpenRouter, so
+Herald refuses that ambiguous alias: use `openai-codex` for ChatGPT Codex OAuth
+or `openrouter` when OpenRouter is intentional. Results expose
+`requested_model`, `resolved_provider`, and `resolved_model` separately from the
+response-reported `model` and serving `provider` metadata.
 
 ---
 

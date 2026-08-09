@@ -186,10 +186,22 @@ Use `llm_call` when you need only inference, not an agent loop:
 
 - `messages` must contain at least one `{role, content}` item.
 - Use either `system_prompt` or a system-role message, not both.
-- `model` and `provider` are optional routing requests.
+- `model` and `provider` are optional routing requests. A model-only request is
+  pinned to the active provider; it does not infer a different endpoint from a
+  vendor-prefixed model name.
+- Model overrides pass through Hermes's `/model` resolver and must match the
+  selected provider's advertised authenticated inventory before network
+  contact. Human forms such as `gpt5.6sol` normalize to `gpt-5.6-sol`; a family
+  form such as `gpt-5.6` reuses the active advertised family variant. Unknown
+  models fail before a provider fallback can run.
+- Use exact provider IDs. Hermes maps bare `openai` to OpenRouter, so Herald
+  refuses that ambiguous alias. Use `openai-codex` for ChatGPT Codex OAuth or
+  `openrouter` only when OpenRouter is intentional.
 - `max_tokens` is a best-effort provider-dependent hint, not a universal cap.
 - `json_mode=true` adds a JSON-only instruction, requests structured output where supported, and rejects output that is not a valid JSON object.
 - `provider` is reported only when the response identifies the serving provider. `requested_provider` and `configured_provider` describe routing intent, not necessarily the fallback route that served the response.
+- `requested_model`, `resolved_provider`, and `resolved_model` expose route
+  resolution separately from the response-reported `model`.
 
 ## Run Recovery and Cancellation
 

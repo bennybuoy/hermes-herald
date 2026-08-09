@@ -560,7 +560,10 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
         "The returned provider is populated only when the provider response "
         "explicitly identifies itself; requested_provider and "
         "configured_provider preserve routing intent without mislabeling a "
-        "fallback provider as the server that actually handled the call.\n\n"
+        "fallback provider as the server that actually handled the call. "
+        "Model overrides are resolved through Hermes's /model pipeline and "
+        "must exist in the selected provider's advertised inventory before "
+        "any request is sent.\n\n"
         "For a full agent with tools and terminal access, use "
         "delegate_subagent or dispatch_agent instead."
     ),
@@ -604,8 +607,12 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional model override (e.g. 'gemma4:31b', "
-                    "'gpt-5', 'claude-sonnet-4'). Uses the active "
+                    "Optional model name or alias. It is resolved against the "
+                    "explicit provider, or the active provider when provider "
+                    "is omitted, then checked against that provider's "
+                    "advertised models before inference. Examples: "
+                    "'gpt-5.6-sol' on 'openai-codex', "
+                    "'claude-sonnet-4-6' on 'anthropic'. Uses the active "
                     "model by default."
                 ),
             },
@@ -613,8 +620,10 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Optional provider override (e.g. 'openrouter', "
-                    "'anthropic', 'ollama-cloud'). Uses the active "
-                    "provider by default."
+                    "'openai-codex', 'anthropic', 'ollama-cloud'). Use the "
+                    "exact provider ID: Hermes's ambiguous 'openai' alias "
+                    "resolves to OpenRouter and is refused here. Uses the "
+                    "active provider by default."
                 ),
             },
             "temperature": {
@@ -3340,6 +3349,188 @@ def _extract_content_or_reasoning_fallback(response: Any) -> str:
     return "\n\n".join(parts)
 
 
+def _resolve_llm_call_route(
+    model_override: Optional[str],
+    provider_override: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve and validate an ``llm_call`` model before network contact.
+
+    ``call_llm`` expects a provider wire-model ID; it does not apply the
+    interactive ``/model`` alias/fuzzy resolver.  Resolve against the explicit
+    provider, or pin model-only requests to the active provider, then require
+    the resolved model to be present in that provider's advertised inventory.
+    This prevents an invalid slug from failing on the intended route and then
+    escaping through an unrelated fallback provider.
+    """
+    requested_model = (model_override or "").strip()
+    requested_provider = (provider_override or "").strip()
+    if not requested_model:
+        return requested_provider or None, None
+
+    from agent import auxiliary_client as auxiliary
+    from hermes_cli.config import get_compatible_custom_providers, load_config
+    from hermes_cli.inventory import (
+        ConfigContext,
+        build_models_payload,
+        load_picker_context,
+    )
+    from hermes_cli.model_normalize import normalize_model_for_provider
+    from hermes_cli.model_switch import switch_model
+
+    def _read_runtime(name: str) -> str:
+        reader = getattr(auxiliary, name, None)
+        if not callable(reader):
+            return ""
+        try:
+            value = reader()
+        except Exception:
+            return ""
+        return value.strip() if isinstance(value, str) else ""
+
+    current_provider = _read_runtime("_read_main_provider")
+    current_model = _read_runtime("_read_main_model")
+    current_base_url = _read_runtime("_read_main_base_url")
+    current_api_key = _read_runtime("_read_main_api_key")
+    target_request = requested_provider or current_provider
+    if not target_request:
+        raise ValueError(
+            "A model override requires an active provider or an explicit "
+            "'provider' value. No inference request was sent."
+        )
+
+    cfg = load_config()
+    user_providers = cfg.get("providers")
+    if not isinstance(user_providers, dict):
+        user_providers = {}
+    custom_providers = get_compatible_custom_providers(cfg)
+
+    result = switch_model(
+        raw_input=requested_model,
+        current_provider=current_provider or target_request,
+        current_model=current_model,
+        current_base_url=current_base_url,
+        current_api_key=current_api_key,
+        is_global=False,
+        # A model-only llm_call means "this model on my active provider".
+        # Pinning the provider also prevents OpenRouter vendor slugs from
+        # silently changing endpoints when the active provider is Codex.
+        explicit_provider=target_request,
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+    )
+    if not result.success:
+        detail = (result.error_message or "model resolution failed").strip()
+        raise ValueError(f"Could not resolve model '{requested_model}': {detail}")
+
+    resolved_provider = (result.target_provider or target_request).strip()
+    resolved_model = (result.new_model or "").strip()
+    if (
+        requested_provider
+        and resolved_provider.lower() == "openrouter"
+        and requested_provider.lower() != "openrouter"
+    ):
+        raise ValueError(
+            f"Provider '{requested_provider}' resolves to OpenRouter in Hermes. "
+            "Use provider='openrouter' only when that endpoint is intentional; "
+            "for ChatGPT Codex OAuth use provider='openai-codex'. No inference "
+            "request was sent."
+        )
+    if not resolved_provider or not resolved_model:
+        raise ValueError(
+            f"Model resolver returned an incomplete route for '{requested_model}'. "
+            "No inference request was sent."
+        )
+
+    # Build the same curated/authenticated inventory used by Hermes model
+    # pickers.  Overlay the target route so an explicit custom provider is the
+    # one endpoint eligible for the targeted live probe.
+    configured_context = load_picker_context()
+    target_base_url = getattr(result, "base_url", "") or current_base_url
+    # Do not inject the candidate as ``current_model``: inventory keeps an
+    # active model visible even when it is absent from the provider catalog,
+    # which would turn this validation into a tautology.
+    picker_context = ConfigContext(
+        current_provider=resolved_provider,
+        current_model="",
+        current_base_url=target_base_url,
+        user_providers=getattr(configured_context, "user_providers", {}) or {},
+        custom_providers=getattr(configured_context, "custom_providers", []) or [],
+        excluded_providers=(
+            getattr(configured_context, "excluded_providers", []) or []
+        ),
+    )
+    payload = build_models_payload(
+        picker_context,
+        include_unconfigured=False,
+        for_picker=True,
+        probe_custom_providers=False,
+        probe_current_custom_provider=True,
+    )
+    provider_row = next(
+        (
+            row for row in payload.get("providers", [])
+            if isinstance(row, dict)
+            and str(row.get("slug") or "").strip().lower()
+            == resolved_provider.lower()
+        ),
+        None,
+    )
+    available = [
+        str(model).strip()
+        for model in ((provider_row or {}).get("models") or [])
+        if isinstance(model, str) and model.strip()
+    ]
+
+    candidate_key = (
+        normalize_model_for_provider(resolved_model, resolved_provider)
+        or resolved_model
+    ).strip().lower()
+    canonical_model = next(
+        (
+            model for model in available
+            if (
+                normalize_model_for_provider(model, resolved_provider) or model
+            ).strip().lower() == candidate_key
+        ),
+        None,
+    )
+    if canonical_model is None and resolved_provider.lower() == current_provider.lower():
+        current_key = (
+            normalize_model_for_provider(current_model, resolved_provider)
+            or current_model
+        ).strip().lower()
+        active_variant = next(
+            (
+                model for model in available
+                if (
+                    normalize_model_for_provider(model, resolved_provider) or model
+                ).strip().lower() == current_key
+            ),
+            None,
+        )
+        if active_variant is not None and current_key.startswith(f"{candidate_key}-"):
+            canonical_model = active_variant
+    if canonical_model is None:
+        import difflib
+
+        suggestions = difflib.get_close_matches(
+            resolved_model,
+            available,
+            n=4,
+            cutoff=0.3,
+        )
+        hint = (
+            f" Close matches: {', '.join(suggestions)}."
+            if suggestions else ""
+        )
+        raise ValueError(
+            f"Model '{resolved_model}' is not advertised by provider "
+            f"'{resolved_provider}'.{hint} No inference request was sent."
+        )
+
+    return resolved_provider, canonical_model
+
+
 def handle_llm_call(args: dict, **kwargs) -> str:
     """Make a bare LLM inference call through the host's provider routing.
 
@@ -3431,6 +3622,11 @@ def handle_llm_call(args: dict, **kwargs) -> str:
     try:
         from agent.auxiliary_client import call_llm
 
+        resolved_provider, resolved_model = _resolve_llm_call_route(
+            model_override,
+            provider_override,
+        )
+
         try:
             from agent.auxiliary_client import extract_content_or_reasoning
         except ImportError:
@@ -3438,8 +3634,8 @@ def handle_llm_call(args: dict, **kwargs) -> str:
 
         response = call_llm(
             task=None,
-            provider=provider_override or None,
-            model=model_override or None,
+            provider=resolved_provider,
+            model=resolved_model,
             messages=full_messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -3606,6 +3802,9 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         "provider": provider,
         "requested_provider": requested_provider,
         "configured_provider": configured_provider,
+        "requested_model": model_override or "",
+        "resolved_provider": resolved_provider or "",
+        "resolved_model": resolved_model or "",
         "model": model,
         "usage": usage,
     })
