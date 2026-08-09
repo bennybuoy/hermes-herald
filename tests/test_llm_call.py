@@ -415,7 +415,7 @@ class TestLlmCallResponseExtraction:
         assert result["text"] == "legacy text"
 
     @patch("agent.auxiliary_client.call_llm", create=True)
-    def test_dict_fallback_handles_non_json_values(self, mock_call_llm):
+    def test_unknown_dict_shape_fails_closed(self, mock_call_llm):
         marker = object()
         mock_call_llm.return_value = {"unexpected": marker}
 
@@ -423,8 +423,9 @@ class TestLlmCallResponseExtraction:
             "messages": [{"role": "user", "content": "Hi"}],
         }))
 
-        assert isinstance(result["text"], str)
-        assert "unexpected" in result["text"]
+        assert result["status"] == "error"
+        assert "empty or malformed response" in result["error"]
+        assert "No alternate provider was tried" in result["error"]
 
     @patch("agent.auxiliary_client.call_llm", create=True)
     def test_empty_choices(self, mock_call_llm):
@@ -438,7 +439,8 @@ class TestLlmCallResponseExtraction:
             "messages": [{"role": "user", "content": "Hi"}],
         }))
 
-        assert result["text"] == ""
+        assert result["status"] == "error"
+        assert "empty or malformed response" in result["error"]
 
     @patch("agent.auxiliary_client.call_llm", create=True)
     def test_str_response_fallback(self, mock_call_llm):

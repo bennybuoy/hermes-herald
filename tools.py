@@ -4009,11 +4009,6 @@ def handle_llm_call(args: dict, **kwargs) -> str:
                         dict_text = choice.get("text")
         if isinstance(dict_text, str):
             text = dict_text
-        else:
-            text = json.dumps(
-                response if dict_text is None else dict_text,
-                default=str,
-            )
     elif hasattr(response, "choices"):
         # OpenAI-compatible response
         choices = response.choices
@@ -4032,8 +4027,14 @@ def handle_llm_call(args: dict, **kwargs) -> str:
                 for block in text
                 if isinstance((block_text := getattr(block, "text", None)), str)
             )
-    else:
-        text = str(response)
+    elif isinstance(response, (str, bytes)):
+        text = response.decode(errors="replace") if isinstance(response, bytes) else response
+
+    if not isinstance(text, str) or not text.strip():
+        return _tool_error(
+            "Selected provider returned an empty or malformed response. No "
+            "alternate provider was tried."
+        )
 
     if json_mode:
         candidate = text.strip()
