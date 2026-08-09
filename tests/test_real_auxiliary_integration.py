@@ -636,13 +636,77 @@ def test_plugin_strict_creation_rejects_unverifiable_endpoint(monkeypatch):
         "https://example.com:/v1",
         "https://example.com:0/v1",
         "https://-/v1",
+        "https://256.0.0.1/v1",
+        "https://999.999.999.999/v1",
+        "https://127.000.000.001/v1",
+        "https://example.com/a b",
+        "https://example.com/v1?q=a b",
     ],
 )
 def test_strict_endpoint_identity_rejects_malformed_authority(endpoint):
-    """Ambiguous ports and malformed DNS labels are not executable endpoints."""
+    """Malformed authorities and raw URL whitespace are not executable endpoints."""
     from hermes_herald import tools  # type: ignore[import-not-found]
 
     assert tools._strict_base_url_identity(endpoint) is None
+
+
+def test_plugin_strict_creation_accepts_query_preserved_as_client_default_query(
+    monkeypatch,
+):
+    """Core may split a custom route query from SDK base_url into default_query."""
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    calls = []
+    observed = {}
+    original_get_client = aux._get_cached_client
+
+    def get_client(provider, model="", **kwargs):
+        client, final_model = original_get_client(provider, model, **kwargs)
+        assert client is not None
+        observed["base_url"] = str(client.base_url)
+        observed["default_query"] = dict(client.default_query)
+        monkeypatch.setattr(
+            client.chat.completions,
+            "create",
+            lambda **call_kwargs: calls.append(call_kwargs) or "strict-response",
+        )
+        return client, final_model
+
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        get_client,
+    )
+    monkeypatch.setattr(aux, "_build_call_kwargs", lambda *args, **kwargs: {})
+
+    response = tools._create_strict_llm_stream(
+        aux,
+        tools._LlmCallRoute(
+            provider="custom:query-route",
+            model="strict-model",
+            base_url=(
+                "https://strict.example/v1?tenant=selected&api-version=2025-01-01"
+            ),
+            api_key="test-token",
+            api_mode="chat_completions",
+        ),
+        messages=[{"role": "user", "content": "Hi"}],
+        temperature=None,
+        max_tokens=None,
+        extra_body=None,
+        timeout=120.0,
+    )
+
+    assert response == "strict-response"
+    assert len(calls) == 1
+    assert observed == {
+        "base_url": "https://strict.example/v1/",
+        "default_query": {
+            "tenant": "selected",
+            "api-version": "2025-01-01",
+        },
+    }
 
 
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):

@@ -32,7 +32,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.error import HTTPError, URLError
 
@@ -3849,12 +3849,64 @@ def _aggregate_llm_call_stream(
     }
 
 
+def _strict_query_identity(
+    query: str,
+) -> Optional[tuple[tuple[str, str], ...]]:
+    """Normalize a non-duplicated URL query without losing routing semantics."""
+    if not query:
+        return ()
+    for index, character in enumerate(query):
+        if character == "%" and (
+            index + 2 >= len(query)
+            or any(
+                digit not in "0123456789abcdefABCDEF"
+                for digit in query[index + 1:index + 3]
+            )
+        ):
+            return None
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        # Hermes core stores custom endpoint queries in a dict, so duplicate
+        # keys cannot be proven to survive client construction unchanged.
+        return None
+    return tuple(sorted(pairs))
+
+
+def _strict_default_query_identity(
+    value: Any,
+) -> Optional[tuple[tuple[str, str], ...]]:
+    """Normalize an SDK client's separated default_query value."""
+    if value is None:
+        return ()
+    try:
+        if callable(getattr(value, "multi_items", None)):
+            raw_pairs = value.multi_items()
+        elif isinstance(value, dict):
+            raw_pairs = value.items()
+        else:
+            return _strict_query_identity(str(value))
+        pairs = tuple(sorted((str(key), str(item)) for key, item in raw_pairs))
+    except Exception:
+        return None
+    keys = [key for key, _item in pairs]
+    if len(keys) != len(set(keys)):
+        return None
+    return pairs
+
+
 def _strict_base_url_identity(
     value: Any,
-) -> Optional[tuple[str, str, int, str, str]]:
+) -> Optional[tuple[str, str, int, str, tuple[tuple[str, str], ...]]]:
     """Return a comparable HTTP endpoint identity, or None when unverifiable."""
+    raw_value = str(value or "").strip()
+    if not raw_value or any(character.isspace() for character in raw_value):
+        return None
     try:
-        parsed = urlsplit(str(value or "").strip())
+        parsed = urlsplit(raw_value)
         scheme = parsed.scheme.lower()
         hostname = (parsed.hostname or "").lower()
         port = parsed.port
@@ -3888,6 +3940,10 @@ def _strict_base_url_identity(
         ipaddress.ip_address(hostname)
         normalized_hostname = hostname
     except ValueError:
+        numeric_labels = hostname.rstrip(".").split(".")
+        if numeric_labels and all(label.isdigit() for label in numeric_labels):
+            # Do not reinterpret invalid or ambiguous IPv4 literals as DNS names.
+            return None
         try:
             normalized_hostname = hostname.rstrip(".").encode("idna").decode("ascii")
         except UnicodeError:
@@ -3907,12 +3963,15 @@ def _strict_base_url_identity(
         ):
             return None
     effective_port = port if port is not None else (443 if scheme == "https" else 80)
+    query_identity = _strict_query_identity(parsed.query)
+    if query_identity is None:
+        return None
     return (
         scheme,
         normalized_hostname,
         effective_port,
         parsed.path.rstrip("/"),
-        parsed.query,
+        query_identity,
     )
 
 
@@ -4006,12 +4065,13 @@ def _create_strict_llm_stream(
             f"Selected provider changed model '{route.model}' to '{final_model}'; "
             "no inference request was sent and no alternate provider was tried."
         )
-    client_base_url = ""
-    for candidate in (
+    client_candidates = (
         client,
         getattr(client, "_client", None),
         getattr(client, "client", None),
-    ):
+    )
+    client_base_url = ""
+    for candidate in client_candidates:
         value = str(getattr(candidate, "base_url", "") or "").strip()
         if value:
             client_base_url = value
@@ -4027,6 +4087,38 @@ def _create_strict_llm_stream(
             f"Selected provider '{route.provider}' returned a client whose endpoint "
             "cannot be verified; no inference request was sent."
         )
+    default_queries = []
+    for candidate in client_candidates:
+        if candidate is None or not hasattr(candidate, "default_query"):
+            continue
+        default_query = getattr(candidate, "default_query", None)
+        if default_query is not None:
+            query_identity = _strict_default_query_identity(default_query)
+            if query_identity is None:
+                raise RuntimeError(
+                    f"Selected provider '{route.provider}' returned a client whose "
+                    "query cannot be verified; no inference request was sent."
+                )
+            if query_identity and query_identity not in default_queries:
+                default_queries.append(query_identity)
+    if len(default_queries) > 1:
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' returned conflicting client "
+            "queries; no inference request was sent."
+        )
+    client_query = client_endpoint[4]
+    if default_queries:
+        if client_query:
+            combined_query = tuple(sorted(client_query + default_queries[0]))
+            if len({key for key, _value in combined_query}) != len(combined_query):
+                raise RuntimeError(
+                    f"Selected provider '{route.provider}' returned an ambiguous client "
+                    "query; no inference request was sent."
+                )
+            client_query = combined_query
+        else:
+            client_query = default_queries[0]
+    client_endpoint = (*client_endpoint[:4], client_query)
     if client_endpoint != route_endpoint:
         raise RuntimeError(
             f"Selected provider '{route.provider}' changed endpoint during client "
@@ -4112,7 +4204,12 @@ def _redact_llm_route_api_key(error: Exception, route: Optional[_LlmCallRoute]) 
     return error_text
 
 
-def handle_llm_call(args: dict, **kwargs) -> str:
+def _handle_llm_call(
+    args: dict,
+    *,
+    _route_ref: list[_LlmCallRoute],
+    **kwargs,
+) -> str:
     """Make one bare inference request on a preflighted Hermes provider route."""
     messages = args.get("messages", [])
     system_prompt = args.get("system_prompt")
@@ -4203,6 +4300,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             model_override,
             provider_override,
         )
+        _route_ref.append(route)
         resolved_provider = route.provider
         resolved_model = route.model
 
@@ -4402,6 +4500,19 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         "model": model,
         "usage": usage,
     })
+
+
+def handle_llm_call(args: dict, **kwargs) -> str:
+    """Make one bare inference request with route-aware error redaction."""
+    route_ref: list[_LlmCallRoute] = []
+    try:
+        return _handle_llm_call(args, _route_ref=route_ref, **kwargs)
+    except Exception as error:
+        route = route_ref[0] if route_ref else None
+        error_text = _redact_llm_route_api_key(error, route)
+        return _tool_error(
+            f"LLM response processing failed: {type(error).__name__}: {error_text}"
+        )
 
 
 # ---------------------------------------------------------------------------
