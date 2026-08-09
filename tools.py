@@ -547,15 +547,18 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
     "description": (
         "Make a bare LLM inference call without the full agent loop, tool "
         "schemas, or subagent overhead. Send messages and get text back. "
-        "Runs synchronously through the host's provider routing, fallback "
-        "chains, and credential pool — no API keys to manage.\n\n"
+        "Runs synchronously on one preflighted provider/model route and never "
+        "falls back to another provider. Call list_profile_models without a "
+        "profile first to see this calling profile's configured routes. With "
+        "no routing overrides, the configured default provider and model are "
+        "used exactly.\n\n"
         "Use this for: classification, translation, summarization, scoring, "
         "extraction, or any task where you just need the model's response "
         "without tool-calling or agentic context.\n\n"
         "The returned provider is populated only when the provider response "
         "explicitly identifies itself; requested_provider and "
-        "configured_provider preserve routing intent without mislabeling a "
-        "fallback provider as the server that actually handled the call. "
+        "configured_provider preserve routing intent without guessing which "
+        "server handled the call. "
         "Model overrides are resolved through Hermes's /model pipeline and "
         "must exist in the selected provider's advertised inventory before "
         "any request is sent.\n\n"
@@ -617,8 +620,10 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
                     "Optional provider override (e.g. 'openrouter', "
                     "'openai-codex', 'anthropic', 'ollama-cloud'). Use the "
                     "exact provider ID: Hermes's ambiguous 'openai' alias "
-                    "resolves to OpenRouter and is refused here. Uses the "
-                    "active provider by default."
+                    "resolves to OpenRouter and is refused here. An alternate "
+                    "provider must be returned by list_profile_models and "
+                    "requires an explicit model. Uses the active provider by "
+                    "default."
                 ),
             },
             "temperature": {
@@ -3450,7 +3455,7 @@ def _configured_local_model_inventory(
 def _resolve_llm_call_route(
     model_override: Optional[str],
     provider_override: Optional[str],
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[str, str]:
     """Resolve and validate an ``llm_call`` route before inference.
 
     ``call_llm`` expects a provider wire-model ID; it does not apply the

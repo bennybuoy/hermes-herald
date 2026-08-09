@@ -886,6 +886,11 @@ class TestLlmCallInputValidation:
         messages_schema = tools.LLM_CALL_SCHEMA["parameters"]["properties"]["messages"]
         assert messages_schema["minItems"] == 1
 
+    def test_schema_directs_discovery_and_promises_no_provider_fallback(self):
+        description = tools.LLM_CALL_SCHEMA["description"]
+        assert "list_profile_models" in description
+        assert "never falls back to another provider" in description
+
     @pytest.mark.parametrize("temperature", [-0.1, 2.1, True, "cold"])
     def test_temperature_range_is_validated(self, temperature):
         result = json.loads(tools.handle_llm_call({
