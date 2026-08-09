@@ -161,6 +161,7 @@ class TestLocalModelRouteDiscovery:
             {"provider": "ollama-cloud", "model": "glm-5.2"},
         ]
         assert result["route_count"] == 4
+        assert "provider-routing policy remain authoritative" in result["contract"]
         assert captured["explicit_only"] is True
         assert captured["include_unconfigured"] is False
 

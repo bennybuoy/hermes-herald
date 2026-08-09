@@ -3670,8 +3670,8 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
             "contract": (
                 "Prefer configured_default when it is present. Only when the task explicitly needs "
                 "an override, pass one exact available_routes provider/model pair "
-                "to llm_call. Unlisted providers are rejected and inference never "
-                "falls back."
+                "to llm_call. Unlisted pairs are rejected before the host call; "
+                "Hermes trust and provider-routing policy remain authoritative."
             ),
         })
 
