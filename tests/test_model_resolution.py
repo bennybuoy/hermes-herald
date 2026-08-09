@@ -98,7 +98,12 @@ class TestLocalModelRouteDiscovery:
             current_provider="ollama-cloud",
             current_model="glm-5.2",
             current_base_url="http://ollama-cloud.example/v1",
-            user_providers={},
+            user_providers={
+                "backup": {
+                    "base_url": "http://backup.example/v1",
+                    "models": ["backup-model"],
+                }
+            },
             custom_providers=[{
                 "name": "llamaherd",
                 "base_url": "http://llamaherd.example/v1",
@@ -123,6 +128,7 @@ class TestLocalModelRouteDiscovery:
             return {
                 "providers": [
                     {"slug": "ollama-cloud", "models": ["glm-5.2"]},
+                    {"slug": "backup", "models": ["backup-model"]},
                     {"slug": "custom:llamaherd", "models": ["glm-5.2"]},
                 ]
             }
@@ -137,10 +143,11 @@ class TestLocalModelRouteDiscovery:
             "model": "glm-5.2",
         }
         assert result["available_routes"] == [
+            {"provider": "backup", "model": "backup-model"},
             {"provider": "custom:llamaherd", "model": "glm-5.2"},
             {"provider": "ollama-cloud", "model": "glm-5.2"},
         ]
-        assert result["route_count"] == 2
+        assert result["route_count"] == 3
         assert captured["explicit_only"] is True
         assert captured["include_unconfigured"] is False
 
