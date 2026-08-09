@@ -170,6 +170,16 @@ def known_run_ids(origin_profile: str) -> set[str]:
     return {str(row["run_id"]) for row in rows}
 
 
+def run_id_for_edge(edge_id: str) -> Optional[str]:
+    """Return the run bound to one globally unique edge, if present."""
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT run_id FROM dispatches WHERE edge_id = ?",
+            (edge_id,),
+        ).fetchone()
+    return str(row["run_id"]) if row is not None else None
+
+
 def update_dispatch(
     *,
     run_id: str,

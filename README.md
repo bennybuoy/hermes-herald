@@ -260,7 +260,7 @@ Herald also provides:
 - durable call and model provenance in SQLite;
 - trace, parent-edge, and hop lineage for forwarded agent graphs;
 - optional `max_hops` to stop repeated A→B→A forwarding before another edge is created;
-- protected-command approval relay for advanced human-attended workflows.
+- protected-command notice relay with human-confirmed remote denial.
 
 <details>
 <summary><strong>Async monitoring and recovery details</strong></summary>
@@ -357,7 +357,7 @@ Use it for tasks where tools and iterative reasoning would be overhead: routing,
 | `collect_dispatches` | Query several run handles in one call |
 | `dispatch_status` | Read durable call history and credential-free configured/observed topology |
 | `cancel_dispatch` | Request cooperative target cancellation and suppress late local delivery |
-| `approve_dispatch` | Resolve the exact visible protected-command request through human confirmation |
+| `approve_dispatch` | Deny the exact visible protected-command notice through human confirmation |
 | `ping_profile` | Check target API reachability |
 | `list_profile_models` | Discover exact target `model_routes` aliases accepted by both dispatch modes |
 
@@ -435,14 +435,14 @@ A post-side-effect state-cache failure does not hide a remote handle: Herald ret
 
 For autonomous target profiles, prefer Hermes’s `smart` approval mode. Use manual Herald relay only when a human-attended origin is intentionally part of the workflow.
 
-When the target emits `approval.request`, Herald delivers the redacted request to the commissioning session. `approve_dispatch` requires:
+When the target emits `approval.request`, Herald delivers the redacted request to the commissioning session. `approve_dispatch` can deny that request and requires:
 
 - the exact target `{profile, run_id}`;
 - a fresh Herald `approval_id` bound to the originating session;
 - the visible FIFO head;
 - explicit human confirmation through Hermes’s owned approval surface.
 
-Cross-session, cross-profile, stale, replayed, or unseen requests fail before the target is contacted. Positive commands are resolved one at a time. `resolve_all=True` is deny-only. `choice="always"` requires a target-supplied permanent pattern scope.
+Cross-session, cross-profile, stale, replayed, or unseen requests fail before the target is contacted. **Herald v1 is deny-only:** `choice="once"`, `"session"`, and `"always"` are rejected before profile resolution or network contact. Current Hermes targets resolve approvals by FIFO position rather than an immutable target request ID, so positive remote approval cannot be proven to authorize the command that was shown. `resolve_all=True` is available only with `choice="deny"`.
 
 Target command descriptions remain untrusted display data. If the listener was lost before the command preview arrived, do not approve it—reconcile or cancel the run.
 
@@ -489,7 +489,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **160 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **166 tests** covering streaming persistent chat, model-route verification, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

@@ -699,6 +699,32 @@ class TestSSERecovery:
         poll_status.assert_called_once()
         deliver.assert_called_once_with(terminal, "run-release", "reviewer")
 
+    def test_reconnect_404_after_disconnect_falls_back_to_polling(self):
+        """A consumed core SSE queue disappears while its run remains active."""
+        terminal = _release_event("completed after events endpoint disappeared")
+        with patch.object(
+            callback,
+            "_read_sse_stream",
+            side_effect=[
+                ("disconnect", "wire dropped"),
+                ("not_found", "events endpoint 404"),
+            ],
+        ) as read_stream, patch.object(
+            callback, "_check_run_status", return_value=None
+        ) as check_status, patch.object(
+            callback, "_poll_run_status", return_value=terminal
+        ) as poll_status, patch.object(
+            callback, "_deliver_to_session"
+        ) as deliver, patch.object(
+            callback, "_cleanup_listener"
+        ), patch.object(callback.time, "sleep"):
+            callback._listen_sse(*_listen_args())
+
+        assert read_stream.call_count == 2
+        assert check_status.call_count == 2
+        poll_status.assert_called_once()
+        deliver.assert_called_once_with(terminal, "run-release", "reviewer")
+
 
 class TestActivityAwarePolling:
     def test_rfc3339_updated_at_resets_activity_without_crashing(self):

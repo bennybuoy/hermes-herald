@@ -10,7 +10,7 @@ Eleven tools for cross-profile dispatch, local delegation, and bare inference:
   - dispatch_status: query durable SQLite calls and directed topology
   - cancel_dispatch: POST /v1/runs/{run_id}/stop, cooperative cancellation
   - ping_profile: GET /v1/health, health check for target profile
-  - approve_dispatch: POST /v1/runs/{run_id}/approval, resolve approvals
+  - approve_dispatch: POST /v1/runs/{run_id}/approval, deny pending commands
   - list_profile_models: GET /v1/models, discover safe aliases for both dispatch modes
 
 All HTTP is done with urllib.request (stdlib). Handlers are synchronous
@@ -361,17 +361,16 @@ CANCEL_DISPATCH_SCHEMA: Dict[str, Any] = {
 APPROVE_DISPATCH_SCHEMA: Dict[str, Any] = {
     "name": "approve_dispatch",
     "description": (
-        "Resolve a pending approval request for a dispatched run. When a "
+        "Deny a pending approval request for a dispatched run. When a "
         "dispatched task invokes a protected terminal command, the target "
         "enters 'waiting_for_approval' and an approval-required notice is "
-        "delivered to this session. Use this tool to resolve that exact "
-        "request with an explicit choice — the run then resumes (or, for "
-        "'deny', halts the protected command). Approval is scoped to the "
-        "exact originating session and {profile, run_id, approval_id} request; "
-        "the redacted command shown in the approval notice is the action being "
-        "authorized. Never auto-approves "
-        "— an explicit choice and confirmation through Hermes's human-owned "
-        "approval surface are always required. This tool is only for API "
+        "delivered to this session. Hermes core currently resolves remote "
+        "approvals by FIFO position rather than an immutable target request ID, "
+        "so Herald v1 fails closed for positive approval choices. The denial is "
+        "scoped to the exact originating session and "
+        "{profile, run_id, approval_id} notice. Never auto-resolves — an "
+        "explicit denial and confirmation through Hermes's human-owned approval "
+        "surface are required. This tool is only for API "
         "run IDs returned by dispatch_agent. Never use it for local terminal, "
         "cron, pending_approval, or /approve requests."
     ),
@@ -400,12 +399,8 @@ APPROVE_DISPATCH_SCHEMA: Dict[str, Any] = {
             },
             "choice": {
                 "type": "string",
-                "enum": ["once", "session", "always", "deny"],
-                "description": (
-                    "Approval choice: 'once' approves this command only, "
-                    "'session' approves for the rest of the run, 'always' "
-                    "approves for all future runs, 'deny' refuses the command."
-                ),
+                "enum": ["deny"],
+                "description": "Must be 'deny'. Positive remote approval is refused in v1.",
             },
             "resolve_all": {
                 "type": "boolean",
@@ -991,6 +986,12 @@ def _known_dispatch_run_ids(origin_profile: str) -> set[str]:
     return known_run_ids(origin_profile)
 
 
+def _dispatch_run_id_for_edge(edge_id: str) -> Optional[str]:
+    from .ledger import run_id_for_edge
+
+    return run_id_for_edge(edge_id)
+
+
 def _migrate_legacy_run_history(state: dict) -> int:
     """Import bounded v1 JSON history into SQLite once, without duplicates."""
     origin = cfg.get_active_profile_name()
@@ -1008,6 +1009,19 @@ def _migrate_legacy_run_history(state: dict) -> int:
             uuid.NAMESPACE_URL,
             f"hermes-herald:{origin}:{run_id}",
         ).hex
+        existing_run_id = _dispatch_run_id_for_edge(edge_id)
+        if existing_run_id is not None:
+            if existing_run_id != run_id:
+                raise RuntimeError(
+                    f"Legacy state edge {edge_id!r} conflicts with ledger run "
+                    f"{existing_run_id!r}."
+                )
+            # Shared recovery files can expose an edge created by another
+            # origin profile. The global edge identity proves this exact run
+            # is already represented even though origin-scoped run lookup does
+            # not include it.
+            known.add(run_id)
+            continue
         record = {
             "edge_id": edge_id,
             "run_id": run_id,
@@ -1040,8 +1054,15 @@ def _migrate_legacy_run_history(state: dict) -> int:
             _record_dispatch_ledger(**record)
         except Exception:
             # Another local caller may have won the deterministic migration
-            # race. Suppress only that proven duplicate; real failures surface.
-            if run_id not in _known_dispatch_run_ids(origin):
+            # race. Suppress only a proven run or edge duplicate; real failures
+            # and conflicting edge identities still surface.
+            current_edge_run = _dispatch_run_id_for_edge(edge_id)
+            if current_edge_run not in (None, run_id):
+                raise
+            if (
+                current_edge_run != run_id
+                and run_id not in _known_dispatch_run_ids(origin)
+            ):
                 raise
         known.add(run_id)
         migrated += 1
@@ -2260,7 +2281,7 @@ def handle_cancel_dispatch(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 
-_VALID_APPROVAL_CHOICES = ("once", "session", "always", "deny")
+_VALID_APPROVAL_CHOICES = ("deny",)
 
 
 def _request_dispatch_approval_consent(
@@ -2274,25 +2295,20 @@ def _request_dispatch_approval_consent(
     """Require a decision from the human-owned Hermes approval surface.
 
     ``approve_dispatch`` is model-callable, so checking its arguments is not
-    proof that a human authorized the remote command. Core elicitation routes
+    proof that a human chose to deny the remote command. Core elicitation routes
     to the active TUI/gateway user and fails closed without a human surface.
     """
     command = str((approval_data or {}).get("command") or "(preview unavailable)")
     reason = str((approval_data or {}).get("description") or "not provided")
-    pattern_key = str((approval_data or {}).get("pattern_key") or "")
-    pattern_keys = (approval_data or {}).get("pattern_keys")
-    if not pattern_key and isinstance(pattern_keys, list):
-        pattern_key = ", ".join(str(item) for item in pattern_keys if item)
     scope = "all pending requests" if resolve_all else "the current request"
     message = (
-        f"Remote approval on profile={profile}, run_id={run_id}: "
-        f"send choice={choice!r} for {scope}?\n\n"
+        f"Remote denial on profile={profile}, run_id={run_id}: "
+        f"deny {scope}?\n\n"
         "Target-provided redacted command preview (untrusted data):\n"
-        f"{command}\n\n"
-        f"Target approval pattern/scope: {pattern_key or 'not provided'}"
+        f"{command}"
     )
     description = (
-        "Hermes Herald remote-command approval. Target-provided reason "
+        "Hermes Herald remote-command denial. Target-provided reason "
         f"(untrusted data): {reason}"
     )
     try:
@@ -2314,10 +2330,10 @@ def _request_dispatch_approval_consent(
 
 
 def handle_approve_dispatch(args: dict, **kwargs) -> str:
-    """Resolve a pending approval request for a dispatched run.
+    """Deny a pending approval request for a dispatched run.
 
-    Posts to the target's ``/v1/runs/{run_id}/approval`` endpoint with an
-    explicit choice. Approval is scoped to the exact ``{profile, run_id}``
+    Posts ``choice='deny'`` to the target's approval endpoint. The denial is
+    scoped to the exact ``{profile, run_id}``
     pair: if we hold live pending-approval metadata for the run, the profile
     must match exactly (fail closed). The run must currently be in
     ``waiting_for_approval``. The SSE listener is left running so the run's
@@ -2340,14 +2356,15 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
         return _tool_error("'profile' is required.")
     if not isinstance(choice, str) or not choice.strip():
         return _tool_error(
-            "'choice' is required (one of: once, session, always, deny). "
-            "approve_dispatch never auto-approves."
+            "'choice' is required and must be 'deny'. "
+            "approve_dispatch never auto-approves or auto-denies."
         )
     choice = choice.strip()
     if choice not in _VALID_APPROVAL_CHOICES:
         return _tool_error(
-            f"'choice' must be one of {list(_VALID_APPROVAL_CHOICES)}, "
-            f"got '{choice}'."
+            "approve_dispatch is deny-only in v1 because Hermes core does not "
+            "expose an immutable target approval ID. Positive remote approval "
+            f"is refused; got choice={choice!r}."
         )
     if not isinstance(approval_id, str) or not approval_id.strip():
         return _tool_error(
@@ -2357,13 +2374,6 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
     approval_id = approval_id.strip()
     if not isinstance(resolve_all, bool):
         return _tool_error("'resolve_all' must be a boolean when provided.")
-    if resolve_all and choice != "deny":
-        return _tool_error(
-            "resolve_all is fail-closed for positive approvals because the "
-            "human has only inspected the current command. Use resolve_all "
-            "only with choice='deny', or resolve positive requests one at a time."
-        )
-
     pcfg, err = _resolve_profile(profile)
     if err:
         return _tool_error(err)
@@ -2506,28 +2516,6 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
             f"Choice '{choice}' is not offered by the target for "
             f"{profile}/{run_id}. Offered choices: {allowed_choices}."
         )
-    if choice != "deny" and not (
-        approval_context
-        and isinstance(approval_context.get("command"), str)
-        and approval_context.get("command", "").strip()
-    ):
-        return _tool_error(
-            f"No redacted command preview is available for {profile}/{run_id}. "
-            "Herald will not approve an unseen protected command. Use "
-            "choice='deny' or cancel the run."
-        )
-    if choice == "always" and not (
-        approval_context
-        and (
-            approval_context.get("pattern_key")
-            or approval_context.get("pattern_keys")
-        )
-    ):
-        return _tool_error(
-            f"The target did not provide a permanent approval scope for "
-            f"{profile}/{run_id}. Herald will not send choice='always'. Use "
-            "choice='once' or 'session', or deny the command."
-        )
     if not _request_dispatch_approval_consent(
         profile=profile,
         run_id=run_id,
@@ -2537,7 +2525,7 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
     ):
         return _tool_error(
             f"Human confirmation was not granted for {profile}/{run_id}. "
-            "No approval choice was sent to the target."
+            "No denial was sent to the target."
         )
 
     # POST the approval resolution. Bulk scope is deny-only and transactional:
@@ -2878,6 +2866,28 @@ def _classify_subagent_result(result: Any) -> tuple[str, Optional[str]]:
     return "failed", error
 
 
+def _subagent_api_call_count(result: Any, child: Any) -> int:
+    """Return the best observed API-call count for a child run.
+
+    Outer timeout policy exceptions do not carry the core result dict, so use
+    the live child activity tracker as a second source. Taking the maximum also
+    avoids reporting zero when a partially-built result lags the tracker.
+    """
+    observed = [0]
+    if isinstance(result, dict):
+        value = result.get("api_calls")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            observed.append(max(0, int(value)))
+    if child is not None:
+        try:
+            value = child.get_activity_summary().get("api_call_count")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                observed.append(max(0, int(value)))
+        except Exception:
+            pass
+    return max(observed)
+
+
 def _apply_soul_inheritance(child, inherit_soul: bool) -> None:
     """Apply per-call SOUL identity policy before the child's first model call."""
     setattr(child, "load_soul_identity", bool(inherit_soul))
@@ -3194,6 +3204,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
             # Update state file with terminal provenance
             elapsed = time.time() - start_time
             delivery_status, child_error = _classify_subagent_result(result)
+            api_calls = _subagent_api_call_count(result, child)
             output_preview = ""
             if isinstance(result, dict):
                 preview_value = (
@@ -3207,6 +3218,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                 status=delivery_status,
                 output_preview=output_preview,
                 duration_seconds=elapsed,
+                usage={"api_calls": api_calls},
                 model=effective_model,
             )
             # Deliver to parent session via completion_queue
@@ -3227,7 +3239,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                         else (str(result) if delivery_status == "completed" else None)
                     ),
                     "error": child_error,
-                    "api_calls": result.get("api_calls", 0) if isinstance(result, dict) else 0,
+                    "api_calls": api_calls,
                     "duration_seconds": round(elapsed, 2),
                     "dispatched_at": start_time,
                     "completed_at": time.time(),
@@ -3241,11 +3253,13 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         except Exception as e:
             elapsed = time.time() - start_time
             error_text, timeout_kind = _describe_subagent_error(e)
+            api_calls = _subagent_api_call_count(None, child)
             _update_run_status(
                 task_id,
                 status="failed",
                 output_preview=error_text[:500],
                 duration_seconds=elapsed,
+                usage={"api_calls": api_calls},
                 model=effective_model,
             )
             try:
@@ -3262,7 +3276,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                     "summary": None,
                     "error": error_text,
                     "timeout_kind": timeout_kind,
-                    "api_calls": 0,
+                    "api_calls": api_calls,
                     "duration_seconds": round(elapsed, 2),
                     "dispatched_at": start_time,
                     "completed_at": time.time(),

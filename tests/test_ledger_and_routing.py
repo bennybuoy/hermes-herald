@@ -173,6 +173,28 @@ def test_legacy_migration_is_idempotent_and_marks_preview_provenance(
     assert rows[0]["model_resolution"] == "legacy_state_cache"
 
 
+def test_legacy_migration_skips_matching_edge_owned_by_another_origin(
+    ledger_file, monkeypatch
+):
+    _record(
+        edge_id="shared-edge",
+        run_id="shared-run",
+        origin_profile="ruby",
+    )
+    monkeypatch.setattr(config, "get_active_profile_name", lambda: "default")
+    state = {
+        "runs": [{
+            "edge_id": "shared-edge",
+            "run_id": "shared-run",
+            "profile": "target",
+            "status": "completed",
+        }]
+    }
+
+    assert tools._migrate_legacy_run_history(state) == 0
+    assert len(ledger.list_dispatches()) == 1
+
+
 def test_hop_budget_rejects_before_network_contact(monkeypatch):
     post = patch.object(tools, "_post_json")
     with post as post_json:

@@ -150,4 +150,5 @@ class TestSessionRecovery:
         n = callback.recover_session_ids()
         assert n >= 1, f"Expected at least 1 recovery, got {n}"
         sid = callback.get_profile_session_id("marie")
+
         assert sid == "sess-abc", f"Expected sess-abc, got {sid}"

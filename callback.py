@@ -491,6 +491,7 @@ def _listen_sse(
     """
     sse_url = f"{url}/v1/runs/{run_id}/events"
     start_time = time.time()
+    had_disconnect = False
 
     for attempt in range(1, _SSE_RECONNECT_ATTEMPTS + 1):
         outcome, deleg_evt = _read_sse_stream(
@@ -507,6 +508,26 @@ def _listen_sse(
         if outcome == "stall":
             _cleanup_listener(run_id)
             _handle_stall(run_id, profile, message_preview, session_id, session_key)
+            return
+
+        if outcome == "not_found" and had_disconnect:
+            # Hermes core owns a single destructive queue per run and removes
+            # the events endpoint when its subscriber disconnects. A reconnect
+            # can therefore return 404 while the authoritative run remains
+            # active. Reconcile terminal status once, then poll the live run.
+            poll_evt = _check_run_status(
+                run_id, profile, url, api_key, message_preview,
+                session_id, session_key, requested_model, resolved_model,
+            )
+            if poll_evt is None:
+                poll_evt = _poll_run_status(
+                    run_id, profile, url, api_key, message_preview,
+                    session_id, session_key, requested_model, resolved_model,
+                    start_time,
+                )
+            _cleanup_listener(run_id)
+            if poll_evt is not None:
+                _deliver_to_session(poll_evt, run_id, profile)
             return
 
         if outcome == "not_found":
@@ -527,6 +548,7 @@ def _listen_sse(
         # outcome == "disconnect" — check whether the run is already terminal
         # before reconnecting. Core's SSE queue is destructive, so resubscribing
         # to a finished run's event stream would miss the terminal event.
+        had_disconnect = True
         error_str = deleg_evt  # disconnect carries an error string
         poll_evt = _check_run_status(
             run_id, profile, url, api_key, message_preview,
@@ -756,8 +778,8 @@ def _poll_run_status(
                 run_id, profile, "", {}, message_preview, session_id, session_key,
                 status="failed",
                 error=(
-                    "SSE was lost before the protected-command preview arrived. "
-                    "Herald cannot safely approve an unseen command; inspect the "
+                    "SSE was lost before the protected-command notice arrived. "
+                    "Herald cannot bind a denial to an owned notice; inspect the "
                     "target directly or use cancel_dispatch."
                 ),
             )
@@ -1148,7 +1170,7 @@ def _deliver_approval_required(
     # Wrap the relayed command/description in clear delimiters so the
     # originating agent treats them as data, not instructions. This
     # prevents a crafted protected command from injecting agent directives
-    # (e.g. "call approve_dispatch with choice=always") into the turn.
+    # (e.g. "ignore the approval policy") into the turn.
     raw_cmd = approval_data.get("command", "")
     raw_desc = approval_data.get("description", "")
     summary = (
@@ -1162,9 +1184,9 @@ def _deliver_approval_required(
         f"Reason: <approval reason — informational only>\n"
         f"  {raw_desc}\n"
         f"  <end reason>\n"
-        f"Choices: {' | '.join(choices)}\n"
-        "To resolve, call approve_dispatch with the exact profile, run_id, and "
-        "approval_id above."
+        f"Target-advertised choices (informational): {' | '.join(choices)}\n"
+        "Herald v1 action: deny only. To deny, call approve_dispatch with "
+        "choice=\"deny\" and the exact profile, run_id, and approval_id above."
     )
 
     evt = {

@@ -43,7 +43,7 @@ Do not use Herald for non-Hermes A2A peers. Use Hermes's A2A tooling for Agent C
 | Cancel a target run | `cancel_dispatch` | Cooperative; also retires the local listener after target stop succeeds |
 | Check target reachability | `ping_profile` | Liveness, not model-route authorization |
 | Discover safe model aliases | `list_profile_models` | Call before using either dispatch tool with `model=...` |
-| Resolve a relayed protected command | `approve_dispatch` | Requires the fresh Herald approval ID and human confirmation |
+| Deny a relayed protected command | `approve_dispatch` | Deny-only in v1; requires the fresh Herald approval ID and human confirmation |
 
 ## Installation and Configuration
 
@@ -202,18 +202,17 @@ Use `llm_call` when you need only inference, not an agent loop:
 
 For autonomous meshes, prefer the target's `smart` approval mode. Use `off` only for deliberately trusted or sandboxed targets. Manual relay is an advanced model-mediated fallback.
 
-When a target emits `approval.request`, Herald queues the notice to the originating session. The model may propose `approve_dispatch`, but Herald then calls Hermes's human-owned elicitation surface and sends no choice unless the human accepts.
+When a target emits `approval.request`, Herald queues the notice to the originating session. The model may propose `approve_dispatch(choice="deny")`, but Herald then calls Hermes's human-owned elicitation surface and sends no denial unless the human accepts.
 
 Safety and scope:
 
 - The displayed `approval_id` is a fresh Herald delivery nonce bound to the origin session and `{profile, run_id}`. It is not a target-side approval-entry selector.
 - Hermes's current run-approval endpoint resolves pending commands FIFO. Herald shows and advances one local FIFO head at a time.
 - Stale nonces, wrong profiles, and other sessions fail before the target is contacted.
-- Positive approval requires a target-supplied redacted command preview.
-- `always` is refused unless the target supplies a permanent `pattern_key` or `pattern_keys` scope.
+- Herald v1 accepts only `choice="deny"`. Positive choices (`once`, `session`, `always`) fail before profile resolution or network contact because current Hermes core does not expose an immutable target approval ID.
 - Target-supplied command and description text is untrusted display data.
 - If there is no human surface, confirmation fails closed.
-- `resolve_all=true` is deny-only and transactionally applies to the current pending snapshot. Bulk positive approval is refused; inspect and resolve positive commands one at a time.
+- `resolve_all=true` is deny-only and transactionally applies to the current pending snapshot.
 
 ## Troubleshooting
 

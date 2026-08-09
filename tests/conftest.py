@@ -4,7 +4,6 @@ import sys
 import types
 import tempfile
 import importlib.util
-from unittest.mock import MagicMock
 
 # Add plugin dir and Hermes source to sys.path
 PLUGIN_DIR = os.environ.get(
@@ -32,26 +31,6 @@ for name in ("config", "ledger", "tools", "callback"):
     mod = importlib.util.module_from_spec(spec)
     sys.modules[f"hermes_herald.{name}"] = mod
     spec.loader.exec_module(mod)
-
-# Mock agent.auxiliary_client so tests can patch call_llm without
-# the real module (which requires httpx and other Hermes deps).
-_aux_client = types.ModuleType("agent.auxiliary_client")
-_aux_client.call_llm = MagicMock()
-_aux_client._read_main_provider = MagicMock(return_value="")
-
-def _extract_content_or_reasoning(response):
-    message = response.choices[0].message
-    content = getattr(message, "content", "") or ""
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    for field in ("reasoning", "reasoning_content"):
-        value = getattr(message, field, None)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return ""
-
-setattr(_aux_client, "extract_content_or_reasoning", _extract_content_or_reasoning)
-sys.modules["agent.auxiliary_client"] = _aux_client
 
 # Ensure config exists
 os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp())

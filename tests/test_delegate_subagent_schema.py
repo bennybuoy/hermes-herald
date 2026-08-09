@@ -41,6 +41,8 @@ def test_delegate_subagent_schema_matches_async_handler():
     assert "thread.start()" in source
     assert '"task_id": task_id' in source
     assert '"status": "dispatched"' in source
+    assert source.count("_subagent_api_call_count") == 2
+    assert '"api_calls": 0' not in source
 
 
 def test_stateless_session_is_rejected_before_background_work(monkeypatch):
@@ -245,6 +247,17 @@ def test_interrupt_threshold_is_cooperative_and_reports_interrupt_kind():
     error, kind = tools._describe_subagent_error(caught.value)
     assert kind == "interrupt"
     assert "cooperative interrupt threshold" in error
+
+
+def test_subagent_api_call_count_uses_result_and_live_child_activity():
+    child = SimpleNamespace(
+        get_activity_summary=lambda: {"api_call_count": 46}
+    )
+
+    assert tools._subagent_api_call_count({"api_calls": 2}, child) == 46
+    assert tools._subagent_api_call_count(None, child) == 46
+    assert tools._subagent_api_call_count({"api_calls": 2}, None) == 2
+    assert tools._subagent_api_call_count(None, None) == 0
 
 
 def test_soul_inheritance_is_opt_in_and_invalidates_cached_prompt():

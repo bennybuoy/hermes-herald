@@ -1,7 +1,7 @@
 """Tests for the approval relay + resolution feature (GitHub issue #7).
 
 Covers:
-  - approve_dispatch handler (once / deny / error cases / scope)
+  - approve_dispatch handler (deny-only / error cases / scope)
   - pending approval metadata persistence + clearing
   - stall timer suppression while awaiting approval
   - cancel clears pending approval metadata
@@ -115,7 +115,31 @@ def _approval_id(run_id: str) -> str:
 
 
 class TestApproveDispatch:
-    def test_choice_once_resolves_and_returns_count(self):
+    @pytest.mark.parametrize("choice", ["once", "session", "always"])
+    def test_positive_choices_fail_closed_before_target_contact(self, choice):
+        run_id = f"run-positive-{choice}"
+        _set_pending(run_id, "marie")
+
+        with patch.object(tools, "_resolve_profile") as resolve, \
+             patch.object(tools, "_get_json") as get_status, \
+             patch.object(tools, "_request_dispatch_approval_consent") as consent, \
+             patch.object(tools, "_post_json") as post:
+            result = json.loads(tools.handle_approve_dispatch({
+                "run_id": run_id,
+                "profile": "marie",
+                "choice": choice,
+                "approval_id": _approval_id(run_id),
+            }))
+
+        assert result["status"] == "error"
+        assert "deny-only" in result["error"]
+        resolve.assert_not_called()
+        get_status.assert_not_called()
+        consent.assert_not_called()
+        post.assert_not_called()
+        assert callback.get_pending_approval(run_id) is not None
+
+    def test_deny_resolves_and_returns_count(self):
         run_id = "run-approve-1"
         _set_pending(run_id, "marie")
 
@@ -124,18 +148,18 @@ class TestApproveDispatch:
              patch.object(tools, "_post_json", return_value={"resolved": 1, "status": "running"}) as pj:
 
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
 
         assert result["resolved"] == 1
         assert result["status"] == "running"
-        assert result["choice"] == "once"
+        assert result["choice"] == "deny"
         assert result["resolve_all"] is False
         # Posted to the approval endpoint with the right body
         posted_url = pj.call_args.args[0]
         assert posted_url.endswith(f"/v1/runs/{run_id}/approval")
-        assert pj.call_args.args[2] == {"choice": "once", "all": False}
+        assert pj.call_args.args[2] == {"choice": "deny", "all": False}
         # Status was fetched first
         assert gj.call_count == 1
         # Pending metadata cleared after resolution
@@ -188,7 +212,7 @@ class TestApproveDispatch:
             }))
 
         assert result["status"] == "error"
-        assert "positive approvals" in result["error"]
+        assert "Positive remote approval" in result["error"]
         resolve.assert_not_called()
         get_status.assert_not_called()
         post.assert_not_called()
@@ -202,7 +226,7 @@ class TestApproveDispatch:
              patch.object(tools, "_request_dispatch_approval_consent", return_value=False), \
              patch.object(tools, "_post_json") as pj:
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "always",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
 
@@ -219,7 +243,7 @@ class TestApproveDispatch:
              patch.object(tools, "_post_json") as pj:
 
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": f"approval-{run_id}",
             }))
 
@@ -237,7 +261,7 @@ class TestApproveDispatch:
              patch.object(tools, "_post_json") as pj:
 
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "ada", "choice": "once",
+                "run_id": run_id, "profile": "ada", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
 
@@ -256,7 +280,7 @@ class TestApproveDispatch:
              patch.object(tools, "_post_json") as pj:
 
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": f"approval-{run_id}",
             }))
 
@@ -276,7 +300,7 @@ class TestApproveDispatch:
              patch.object(tools, "_post_json", side_effect=boom):
 
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
 
@@ -306,7 +330,7 @@ class TestApproveDispatch:
     def test_unresolved_profile_fails(self):
         with patch.object(tools, "_resolve_profile", return_value=({}, "Profile 'x' not found")):
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": "r", "profile": "x", "choice": "once",
+                "run_id": "r", "profile": "x", "choice": "deny",
             }))
         assert result["status"] == "error"
 
@@ -346,7 +370,7 @@ class TestPendingMetadataPersistence:
              patch.object(tools, "_get_json", return_value={"status": "waiting_for_approval"}), \
              patch.object(tools, "_post_json", return_value={"resolved": 1, "status": "running"}):
             tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             })
 
@@ -373,7 +397,7 @@ class TestApprovalOwnership:
              patch.object(tools, "_get_json") as gj, \
              patch.object(tools, "_post_json") as pj:
             wrong_owner = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
         assert wrong_owner["status"] == "error"
@@ -394,7 +418,7 @@ class TestApprovalOwnership:
              patch.object(tools, "_get_json") as gj, \
              patch.object(tools, "_post_json") as pj:
             wrong_nonce = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": "stale-approval-id",
             }))
         assert wrong_nonce["status"] == "error"
@@ -402,7 +426,7 @@ class TestApprovalOwnership:
         gj.assert_not_called()
         pj.assert_not_called()
 
-    def test_approving_visible_request_resolves_fifo_head_and_promotes_next(self):
+    def test_denying_visible_request_resolves_fifo_head_and_promotes_next(self):
         run_id = "run-fifo-bound"
         first = _set_pending(run_id, "marie")
         second = dict(first)
@@ -428,7 +452,7 @@ class TestApprovalOwnership:
             result = json.loads(tools.handle_approve_dispatch({
                 "run_id": run_id,
                 "profile": "marie",
-                "choice": "once",
+                "choice": "deny",
                 "approval_id": first["delivery_id"],
             }))
 
@@ -450,7 +474,7 @@ class TestApprovalOwnership:
             second_result = json.loads(tools.handle_approve_dispatch({
                 "run_id": run_id,
                 "profile": "marie",
-                "choice": "once",
+                "choice": "deny",
                 "approval_id": second["delivery_id"],
             }))
         assert second_result["status"] == "running"
@@ -613,7 +637,7 @@ class TestRecovery:
              patch.object(tools, "_get_json") as gj, \
              patch.object(tools, "_post_json") as pj:
             result = json.loads(tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "ada", "choice": "once",
+                "run_id": run_id, "profile": "ada", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             }))
         assert result["status"] == "error"
@@ -685,7 +709,7 @@ class TestNoCredentialLeak:
              patch.object(tools, "_get_json", return_value={"status": "waiting_for_approval"}), \
              patch.object(tools, "_post_json", return_value={"resolved": 1, "status": "running"}):
             out = tools.handle_approve_dispatch({
-                "run_id": run_id, "profile": "marie", "choice": "once",
+                "run_id": run_id, "profile": "marie", "choice": "deny",
                 "approval_id": _approval_id(run_id),
             })
         assert _API_KEY not in out

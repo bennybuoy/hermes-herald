@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out Hermes Herald
+        uses: actions/checkout@v4
+
+      - name: Check out compatible Hermes Agent source
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: f1120ada4d487416c3c76fefd73346c70f641835
+          path: hermes-agent
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: hermes-agent/pyproject.toml
+
+      - name: Install Hermes Agent and test runner
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./hermes-agent pytest
+
+      - name: Run Hermes Herald tests
+        working-directory: tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          HERMES_HERALD_PLUGIN_DIR: ${{ github.workspace }}
+          HERMES_SOURCE_DIR: ${{ github.workspace }}/hermes-agent
+          HERMES_RUNTIME_PYTHON: ${{ env.pythonLocation }}/bin/python
+        run: python -m pytest -p no:cacheprovider -q
