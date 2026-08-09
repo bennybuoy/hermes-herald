@@ -191,6 +191,7 @@ def test_plugin_strict_creation_bypasses_call_llm_and_requests_usage(monkeypatch
     from hermes_herald import tools  # type: ignore[import-not-found]
 
     captured = {}
+    client_requests = []
 
     def create(**kwargs):
         captured.update(kwargs)
@@ -207,11 +208,11 @@ def test_plugin_strict_creation_bypasses_call_llm_and_requests_usage(monkeypatch
             AssertionError("strict creation must not enter call_llm")
         ),
     )
-    monkeypatch.setattr(
-        aux,
-        "_get_cached_client",
-        lambda provider, model=None, **kwargs: (client, model),
-    )
+    def get_client(provider, model=None, **kwargs):
+        client_requests.append((provider, kwargs))
+        return client, model
+
+    monkeypatch.setattr(aux, "_get_cached_client", get_client)
     monkeypatch.setattr(
         aux,
         "_build_call_kwargs",
@@ -238,8 +239,47 @@ def test_plugin_strict_creation_bypasses_call_llm_and_requests_usage(monkeypatch
     )
 
     assert list(stream) == []
+    assert client_requests[0][0] == "custom"
+    assert client_requests[0][1]["base_url"] == "https://strict.example/v1"
     assert captured["stream"] is True
     assert captured["stream_options"] == {"include_usage": True}
+
+
+def test_plugin_strict_creation_rejects_endpoint_mutation(monkeypatch):
+    """Client resolution may not replace the preflighted endpoint."""
+    from types import SimpleNamespace
+    from agent import auxiliary_client as aux
+    from hermes_herald import tools  # type: ignore[import-not-found]
+
+    escaped_client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: iter(()))
+        ),
+    )
+    monkeypatch.setattr(
+        aux,
+        "_get_cached_client",
+        lambda provider, model=None, **kwargs: (escaped_client, model),
+    )
+    monkeypatch.setattr(aux, "_build_call_kwargs", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="changed endpoint"):
+        tools._create_strict_llm_stream(
+            aux,
+            tools._LlmCallRoute(
+                provider="custom:auto",
+                model="strict-model",
+                base_url="https://selected.invalid/v1",
+                api_key="test-token",
+                api_mode="chat_completions",
+            ),
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=None,
+            max_tokens=None,
+            extra_body=None,
+            timeout=120.0,
+        )
 
 
 def test_real_auxiliary_import_and_reasoning_extraction(tmp_path):

@@ -3866,14 +3866,23 @@ def _create_strict_llm_stream(
             "Installed Hermes core lacks the strict client construction helpers "
             "required by Herald; upgrade Hermes. No inference request was sent."
         )
-    client, final_model = get_client(
-        route.provider,
+    # Named custom-provider slugs are picker identities, not safe inputs to
+    # auxiliary_client's provider router: ``custom:auto`` normalizes to
+    # ``auto`` and ``custom:openrouter`` to the built-in OpenRouter branch.
+    # Resolve every preflighted custom route through the literal custom branch
+    # with its already-selected endpoint and credentials.
+    client_provider = (
+        "custom" if route.provider.lower().startswith("custom:") else route.provider
+    )
+    client_result = cast(Any, get_client(
+        client_provider,
         route.model,
         base_url=route.base_url,
         api_key=route.api_key,
         api_mode=route.api_mode,
         task=None,
-    )
+    ))
+    client, final_model = client_result
     if client is None:
         raise RuntimeError(
             f"Selected provider '{route.provider}' could not construct a client; "
@@ -3885,9 +3894,37 @@ def _create_strict_llm_stream(
             f"Selected provider changed model '{route.model}' to '{final_model}'; "
             "no inference request was sent and no alternate provider was tried."
         )
-    client_base_url = str(getattr(client, "base_url", route.base_url) or route.base_url)
+    def _base_url_identity(value: Any) -> tuple[str, str, str]:
+        parsed = urlsplit(str(value or "").strip())
+        return (
+            parsed.scheme.lower(),
+            parsed.netloc.lower(),
+            parsed.path.rstrip("/"),
+        )
+
+    client_base_url = ""
+    for candidate in (
+        client,
+        getattr(client, "_client", None),
+        getattr(client, "client", None),
+    ):
+        value = str(getattr(candidate, "base_url", "") or "").strip()
+        if value:
+            client_base_url = value
+            break
+    if not client_base_url:
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' returned a client whose endpoint "
+            "cannot be verified; no inference request was sent."
+        )
+    if _base_url_identity(client_base_url) != _base_url_identity(route.base_url):
+        raise RuntimeError(
+            f"Selected provider '{route.provider}' changed endpoint during client "
+            "construction; no inference request was sent and no alternate provider "
+            "was tried."
+        )
     kwargs = cast(Dict[str, Any], build_kwargs(
-        route.provider,
+        client_provider,
         route.model,
         messages,
         temperature=temperature,
@@ -3903,12 +3940,7 @@ def _create_strict_llm_stream(
 
 
 def handle_llm_call(args: dict, **kwargs) -> str:
-    """Make a bare LLM inference call through the host's provider routing.
-
-    Routes through agent.auxiliary_client.call_llm — the same function
-    used by ctx.llm, context compression, vision, and web extraction.
-    No agent loop, no tool schemas, no subagent overhead.
-    """
+    """Make one bare inference request on a preflighted Hermes provider route."""
     messages = args.get("messages", [])
     system_prompt = args.get("system_prompt")
     model_override = args.get("model")
@@ -3990,6 +4022,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             )
         extra_body = {"response_format": {"type": "json_object"}}
 
+    route: Optional[_LlmCallRoute] = None
     try:
         from agent import auxiliary_client as auxiliary
 
@@ -4030,11 +4063,14 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             )
     except ImportError as e:
         return _tool_error(
-            f"Cannot import call_llm from agent.auxiliary_client: {e}. "
+            f"Cannot import Hermes auxiliary provider support: {e}. "
             "This tool requires running inside a Hermes agent session."
         )
     except Exception as e:
-        return _tool_error(f"LLM call failed: {type(e).__name__}: {e}")
+        error_text = str(e)
+        if route is not None and len(route.api_key) >= 4:
+            error_text = error_text.replace(route.api_key, "[REDACTED]")
+        return _tool_error(f"LLM call failed: {type(e).__name__}: {error_text}")
 
     # Extract text from the response
     text = ""
