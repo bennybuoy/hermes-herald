@@ -3882,6 +3882,7 @@ def _create_strict_llm_stream(
     timeout: float,
 ) -> Any:
     """Create one request on the resolved route without entering fallback logic."""
+    deadline = time.monotonic() + timeout
     get_client = cast(Any, getattr(auxiliary, "_get_cached_client", None))
     build_kwargs = cast(Any, getattr(auxiliary, "_build_call_kwargs", None))
     if not callable(get_client) or not callable(build_kwargs):
@@ -3920,7 +3921,11 @@ def _create_strict_llm_stream(
                 "Installed Hermes core lacks the Anthropic wrapper required for this "
                 "strict custom route; upgrade Hermes. No inference request was sent."
             )
-        real_client = build_anthropic_client(route.api_key, route.base_url)
+        real_client = build_anthropic_client(
+            route.api_key,
+            route.base_url,
+            timeout=timeout,
+        )
         if real_client is None:
             raise RuntimeError(
                 f"Selected provider '{route.provider}' could not construct an "
@@ -3996,7 +4001,28 @@ def _create_strict_llm_stream(
     ))
     kwargs["stream"] = True
     kwargs["stream_options"] = {"include_usage": True}
-    return client.chat.completions.create(**kwargs)
+    owns_client = client_provider == "custom" and (
+        route.api_mode.lower() == "anthropic_messages"
+    )
+    try:
+        return client.chat.completions.create(**kwargs)
+    finally:
+        if owns_client:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                def _close_owned_client() -> None:
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+
+                close_thread = threading.Thread(
+                    target=_close_owned_client,
+                    daemon=True,
+                    name="herald-strict-anthropic-close",
+                )
+                close_thread.start()
+                close_thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 def handle_llm_call(args: dict, **kwargs) -> str:

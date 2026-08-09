@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -293,8 +294,8 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
     captured = {}
     real_client = object()
 
-    def build_anthropic_client(api_key, base_url):
-        built.update(api_key=api_key, base_url=base_url)
+    def build_anthropic_client(api_key, base_url, timeout=None):
+        built.update(api_key=api_key, base_url=base_url, timeout=timeout)
         return real_client
 
     def wrapped_client(real, model, api_key, base_url, is_oauth=False):
@@ -305,8 +306,13 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
             wrapper_base_url=base_url,
             is_oauth=is_oauth,
         )
+        def close():
+            built["closed"] = True
+            time.sleep(0.2)
+
         return SimpleNamespace(
             base_url=base_url,
+            close=close,
             chat=SimpleNamespace(
                 completions=SimpleNamespace(
                     create=lambda **kwargs: captured.update(kwargs) or iter(())
@@ -333,6 +339,7 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
     )
 
     endpoint = "https://anthropic-custom.selected.example/anthropic"
+    started = time.monotonic()
     stream = tools._create_strict_llm_stream(
         aux,
         tools._LlmCallRoute(
@@ -346,14 +353,17 @@ def test_plugin_strict_creation_preserves_custom_anthropic_endpoint(monkeypatch)
         temperature=None,
         max_tokens=16,
         extra_body=None,
-        timeout=120.0,
+        timeout=0.01,
     )
 
     assert list(stream) == []
+    assert time.monotonic() - started < 0.1
     assert built["base_url"] == endpoint
     assert built["wrapper_base_url"] == endpoint
     assert built["api_key"] == "test-token"
     assert built["wrapper_api_key"] == "test-token"
+    assert built["timeout"] == 0.01
+    assert built["closed"] is True
     assert captured["stream"] is True
 
 
