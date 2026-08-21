@@ -155,6 +155,12 @@ hermes_herald:
 
 `capabilities` is deliberately fail-closed. Use `[dispatch]`, `[chat]`, or `[dispatch, chat]`.
 
+Each route's `api_key` is the **target profile's own inbound API token** — the
+same value you stored in the target's `gateway.platforms.api_server.extra.key`
+in step 2. A dispatch failing with `401 Unauthorized` almost always means this
+route carries a stale or wrong copy of that key, not that the target is down:
+re-copy it from the target's config before debugging further.
+
 ### 4. Restart and verify
 
 Start a fresh origin session and look for:
