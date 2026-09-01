@@ -532,6 +532,182 @@ class TestApprovalRelay:
         assert run_id not in callback._approval_notice_ids_by_run
         assert not callback._approval_notice_events
 
+    def test_fifo_mismatch_after_interleaved_advance_returns_none(self):
+        """Advance between get_pending_approval and _advance_pending_approval.
+
+        Race: SSE reads head A, approve_dispatch promotes A→B and publishes B,
+        then SSE advances with A's id. Mismatch must return None so B is not
+        treated as a newly promoted item (and delivered again). The remaining
+        head must stay pending in memory and the state file.
+        """
+        completion_queue = queue.Queue()
+        mod = types.ModuleType("tools.process_registry")
+        mod.process_registry = types.SimpleNamespace(completion_queue=completion_queue)
+        sys.modules["tools.process_registry"] = mod
+
+        run_id = "run-fifo-interleave"
+        tools._persist_run(run_id, "marie", "preview", model="glm-5.2")
+        first = {
+            "run_id": run_id,
+            "profile": "marie",
+            "command": "COMMAND_A",
+            "description": "first",
+            "choices": ["deny"],
+            "delivery_id": "dispatch-approval-interleave-a",
+            "origin_session_id": "sess",
+            "origin_session_key": "skey",
+        }
+        second = dict(first)
+        second.update({
+            "command": "COMMAND_B",
+            "delivery_id": "dispatch-approval-interleave-b",
+        })
+        assert callback._set_pending_approval(run_id, first) is True
+        assert callback._set_pending_approval(run_id, second) is False
+        callback._deliver_approval_required(first, "sess", "skey")
+        tools._update_pending_approval(
+            run_id, first, callback.get_pending_approval_queue(run_id),
+        )
+
+        # Direct interleaving: snapshot A, concurrent actor advances A→B,
+        # stale _advance with A's id must not return B.
+        stale = callback.get_pending_approval(run_id)
+        assert stale["delivery_id"] == first["delivery_id"]
+        assert callback._advance_pending_approval(
+            run_id, first["delivery_id"],
+        )["delivery_id"] == second["delivery_id"]
+        assert callback._advance_pending_approval(
+            run_id, stale["delivery_id"],
+        ) is None
+        assert callback.get_pending_approval(run_id)["delivery_id"] == (
+            second["delivery_id"]
+        )
+
+        # Restore A-then-B so the SSE listener path can replay the same race.
+        callback._clear_pending_approval_mem(run_id)
+        callback._set_pending_approval(run_id, first)
+        callback._set_pending_approval(run_id, second)
+        callback._deliver_approval_required(first, "sess", "skey")
+        tools._update_pending_approval(
+            run_id, first, callback.get_pending_approval_queue(run_id),
+        )
+
+        real_get = callback.get_pending_approval
+
+        def racing_get(rid):
+            snapshot = real_get(rid)
+            if snapshot and snapshot.get("delivery_id") == first["delivery_id"]:
+                # Concurrent approve_dispatch: retire A and publish B
+                # between the SSE read of the head and the subsequent
+                # _advance_pending_approval call.
+                promoted = callback._advance_pending_approval(
+                    rid, first["delivery_id"], local_response=True,
+                )
+                tools._update_pending_approval(
+                    rid, promoted, callback.get_pending_approval_queue(rid),
+                )
+                callback._deliver_approval_required(
+                    promoted,
+                    str(promoted.get("origin_session_id") or ""),
+                    str(promoted.get("origin_session_key") or ""),
+                )
+            return snapshot
+
+        stream = [
+            _sse({"event": "approval.responded", "run_id": run_id, "resolved": 1}),
+        ]
+        with patch.object(callback, "urlopen", return_value=_FakeResponse(stream)), \
+             patch.object(callback, "get_pending_approval", side_effect=racing_get):
+            outcome, _payload = callback._read_sse_stream(
+                run_id, "marie", "http://x", "key", "preview",
+                "sess", "skey", "", "", time.time(),
+            )
+
+        assert outcome == "disconnect"
+        notices = []
+        while not completion_queue.empty():
+            notices.append(completion_queue.get_nowait())
+        live_b = [
+            evt for evt in notices
+            if evt.get("approval", {}).get("delivery_id") == second["delivery_id"]
+            and not evt.get("retired")
+        ]
+        assert len(live_b) == 1
+        pending = callback.get_pending_approval(run_id)
+        assert pending["delivery_id"] == second["delivery_id"]
+        state = tools._load_state()
+        run = next(r for r in state["runs"] if r["run_id"] == run_id)
+        assert run["pending_approval"]["delivery_id"] == second["delivery_id"]
+
+    def test_deliver_approval_required_dedupes_published_delivery_id(self):
+        """The same delivery_id must not be published twice."""
+        completion_queue = queue.Queue()
+        mod = types.ModuleType("tools.process_registry")
+        mod.process_registry = types.SimpleNamespace(completion_queue=completion_queue)
+        sys.modules["tools.process_registry"] = mod
+
+        run_id = "run-fifo-dedupe"
+        approval = {
+            "run_id": run_id,
+            "profile": "marie",
+            "command": "COMMAND_A",
+            "description": "first",
+            "choices": ["deny"],
+            "delivery_id": "dispatch-approval-dedupe-a",
+            "origin_session_id": "sess",
+            "origin_session_key": "skey",
+        }
+        callback._set_pending_approval(run_id, approval)
+        callback._deliver_approval_required(approval, "sess", "skey")
+        callback._deliver_approval_required(approval, "sess", "skey")
+        assert completion_queue.qsize() == 1
+        notice = completion_queue.get_nowait()
+        assert notice["approval"]["delivery_id"] == approval["delivery_id"]
+
+    def test_approval_delivery_id_uses_csprng_nonce(self):
+        """delivery_id suffix comes from secrets.token_urlsafe, not time.time_ns."""
+        delivered = _setup_fake_registry()
+        run_id = "run-csprng-nonce"
+        tools._persist_run(run_id, "marie", "preview", model="glm-5.2")
+        stream = [_sse({
+            "event": "approval.request", "run_id": run_id,
+            "command": "c", "description": "d",
+            "choices": ["deny"],
+        })]
+        from urllib.error import URLError
+        gone_resp = URLError("connection refused")
+
+        with patch.object(
+            callback.secrets, "token_urlsafe", return_value="CSPRNG_NONCE_16B",
+        ) as token, \
+             patch.object(
+                 callback, "urlopen", side_effect=[_FakeResponse(stream), gone_resp],
+             ), \
+             patch.object(callback.time, "sleep"), \
+             patch.object(callback, "_SSE_RECONNECT_ATTEMPTS", 1):
+            callback._listen_sse(
+                run_id, "marie", "http://x", "key", "preview", "sess", "skey",
+            )
+
+        token.assert_called_with(16)
+        approval_evts = [e for e in delivered if e.get("status") == "approval_required"]
+        assert len(approval_evts) == 1
+        assert approval_evts[0]["delegation_id"] == (
+            f"dispatch-approval-{run_id[:12]}-CSPRNG_NONCE_16B"
+        )
+
+        # Fallback site in _deliver_approval_required also uses the CSPRNG.
+        token.reset_mock()
+        with patch.object(
+            callback.secrets, "token_urlsafe", return_value="FALLBACK_NONCE",
+        ) as fallback:
+            callback._deliver_approval_required(
+                {"run_id": "run-fallback-nonce", "profile": "marie", "command": "x"},
+                "sess",
+                "skey",
+            )
+        fallback.assert_called_with(16)
+
     def test_listener_continues_after_approval_events(self):
         """The SSE listener does NOT exit on approval events.
 
