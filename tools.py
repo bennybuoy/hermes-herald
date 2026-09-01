@@ -87,7 +87,9 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "The task message to send to the target profile. "
                     "Be specific and self-contained — the target profile "
-                    "has no context from this conversation."
+                    "has no context from this conversation. "
+                    "Avoid placing secrets or credentials in the task text — "
+                    "the dispatch ledger stores the full message as supplied."
                 ),
             },
             "instructions": {
@@ -95,7 +97,9 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Optional system prompt override for the target session. "
                     "Use to set role/behavior (e.g. 'You are a pedagogical "
-                    "reviewer...')."
+                    "reviewer...'). "
+                    "Avoid placing secrets or credentials in the task text — "
+                    "the dispatch ledger stores the full message as supplied."
                 ),
             },
             "delivery": {
@@ -287,14 +291,18 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "The message to send to the target profile. "
-                    "Be specific and self-contained."
+                    "Be specific and self-contained. "
+                    "Avoid placing secrets or credentials in the task text — "
+                    "the dispatch ledger stores the full message as supplied."
                 ),
             },
             "instructions": {
                 "type": "string",
                 "description": (
                     "Optional system prompt override for this turn. "
-                    "Resend it on subsequent calls when it is still required."
+                    "Resend it on subsequent calls when it is still required. "
+                    "Avoid placing secrets or credentials in the task text — "
+                    "the dispatch ledger stores the full message as supplied."
                 ),
             },
             "new_session": {
