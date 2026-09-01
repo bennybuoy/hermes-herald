@@ -1264,11 +1264,12 @@ def start_listener(
     session_key = route["session_key"]
 
     with _delivery_gate_lock:
-        _delivery_routes[run_id] = route
         with _listeners_lock:
             if run_id in _listeners:
                 return
 
+        _delivery_routes[run_id] = route
+        with _listeners_lock:
             thread = threading.Thread(
                 target=_listen_sse,
                 args=(
