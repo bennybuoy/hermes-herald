@@ -950,12 +950,30 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _trim_state_runs(runs: list, limit: int) -> list:
-    """Bound the live-recovery cache, preferring non-terminal runs.
+def _is_evictable_state_run(run) -> bool:
+    """True when a recovery-cache entry may be dropped before live runs.
 
-    Oldest terminal entries are dropped first so in-flight dispatches stay
-    recoverable. Only if live runs still exceed ``limit`` are the oldest
-    non-terminal entries dropped. Original relative order is preserved.
+    Terminal statuses are finished. Detached ``delivery='none'`` records
+    that are still ``dispatched`` are also evictable: no listener will
+    ever update them, so they must not crowd out fresh chat records that
+    ``recover_session_ids()`` needs after restart. A later ``check_dispatch``
+    poll can promote a detached run to ``running`` / ``queued``, which
+    keeps it live.
+    """
+    if not isinstance(run, dict):
+        return False
+    if run.get("status") in _TERMINAL_STATE_STATUSES:
+        return True
+    return run.get("delivery") == "none" and run.get("status") == "dispatched"
+
+
+def _trim_state_runs(runs: list, limit: int) -> list:
+    """Bound the live-recovery cache, preferring actively monitored runs.
+
+    Oldest terminal entries and unmonitored ``delivery='none'`` dispatches
+    are dropped first so in-flight callback runs stay recoverable. Only if
+    live runs still exceed ``limit`` are the oldest remaining entries
+    dropped. Original relative order is preserved.
     """
     overflow = len(runs) - limit
     if overflow <= 0:
@@ -964,7 +982,7 @@ def _trim_state_runs(runs: list, limit: int) -> list:
     for i, run in enumerate(runs):
         if overflow <= 0:
             break
-        if run.get("status") in _TERMINAL_STATE_STATUSES:
+        if _is_evictable_state_run(run):
             drop.add(i)
             overflow -= 1
     if overflow > 0:
@@ -994,14 +1012,15 @@ def _save_state(data: dict) -> None:
     """Atomically write the run-state JSON file."""
     path = cfg.get_state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Trim old entries, preferring in-flight runs over completed ones.
+    # Trim old entries, preferring monitored in-flight runs over completed
+    # and unmonitored detached (delivery='none') dispatches.
     runs = data.get("runs", [])
     if len(runs) > _MAX_STATE_ENTRIES:
         original = len(runs)
         data["runs"] = _trim_state_runs(runs, _MAX_STATE_ENTRIES)
         logger.warning(
             "State cache truncated: dropped %d of %d entries (limit %d); "
-            "preferring non-terminal runs",
+            "preferring actively monitored runs",
             original - len(data["runs"]),
             original,
             _MAX_STATE_ENTRIES,

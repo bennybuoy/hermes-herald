@@ -162,6 +162,63 @@ class TestStatePersistence:
         kept = tools._trim_state_runs(runs, 2)
         assert [run["run_id"] for run in kept] == ["live-mid", "live-new"]
 
+    def test_trim_state_runs_evicts_stale_detached_not_fresh_chat(self):
+        """Unmonitored delivery=none dispatches must not evict a fresh chat record."""
+        stale = [
+            {
+                "run_id": f"detached-{i}",
+                "status": "dispatched",
+                "delivery": "none",
+            }
+            for i in range(200)
+        ]
+        chat = {
+            "run_id": "chat-fresh",
+            "profile": "marie",
+            "session_id": "sess-fresh",
+            "type": "chat",
+            "status": "completed",
+        }
+        kept = tools._trim_state_runs(stale + [chat], 200)
+        ids = [run["run_id"] for run in kept]
+        assert len(kept) == 200
+        assert "chat-fresh" in ids
+        assert ids[0] == "detached-1"
+        assert ids[-1] == "chat-fresh"
+        assert "detached-0" not in ids
+
+    def test_trim_state_runs_still_prefers_monitored_live_over_chat(self):
+        """Callback-monitored dispatches still beat a completed chat record."""
+        live = [
+            {
+                "run_id": f"live-{i}",
+                "status": "dispatched",
+                "delivery": "callback",
+            }
+            for i in range(200)
+        ]
+        chat = {
+            "run_id": "chat-fresh",
+            "type": "chat",
+            "status": "completed",
+        }
+        kept = tools._trim_state_runs(live + [chat], 200)
+        ids = [run["run_id"] for run in kept]
+        assert len(kept) == 200
+        assert "chat-fresh" not in ids
+        assert ids[0] == "live-0"
+        assert ids[-1] == "live-199"
+
+    def test_trim_state_runs_keeps_polled_detached_running(self):
+        """A delivery=none run polled to running stays live over evictable entries."""
+        runs = [
+            {"run_id": "old-chat", "type": "chat", "status": "completed"},
+            {"run_id": "polled", "status": "running", "delivery": "none"},
+            {"run_id": "stale", "status": "dispatched", "delivery": "none"},
+        ]
+        kept = tools._trim_state_runs(runs, 1)
+        assert [run["run_id"] for run in kept] == ["polled"]
+
 
 class TestCancelFlags:
     """Cancel flag suppression in callback._deliver_to_session."""
@@ -235,3 +292,35 @@ class TestSessionRecovery:
         sid = callback.get_profile_session_id("marie")
 
         assert sid == "sess-abc", f"Expected sess-abc, got {sid}"
+
+    def test_stale_detached_runs_do_not_block_session_recovery(self):
+        """200 unmonitored dispatches must not evict the latest chat session."""
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        stale = [
+            {
+                "run_id": f"detached-{i}",
+                "profile": "other",
+                "status": "dispatched",
+                "delivery": "none",
+            }
+            for i in range(200)
+        ]
+        chat = {
+            "run_id": "chat-marie-fresh",
+            "profile": "marie",
+            "session_id": "sess-fresh",
+            "type": "chat",
+            "status": "completed",
+        }
+        with tools._state_lock:
+            tools._save_state({"runs": stale + [chat]})
+
+        n = callback.recover_session_ids()
+        assert n >= 1, f"Expected at least 1 recovery, got {n}"
+        assert callback.get_profile_session_id("marie") == "sess-fresh"
+        ids = [run["run_id"] for run in tools._load_state()["runs"]]
+        assert "chat-marie-fresh" in ids
+        assert len(ids) == 200
