@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import threading
 import time
 from datetime import datetime
@@ -228,12 +229,19 @@ def _advance_pending_approval(
     *,
     local_response: bool = False,
 ) -> Optional[dict]:
-    """Retire the exact FIFO head and promote the next target request."""
+    """Retire the exact FIFO head and promote the next target request.
+
+    Returns a copy of the newly promoted request, or None if the queue is
+    empty or ``delivery_id`` is not the current head. A mismatch is not a
+    snapshot of whatever is at head — callers treat any truthy return as a
+    newly promoted item to publish, so returning the current head would
+    re-deliver an already-published notice.
+    """
     retired_id = ""
     with _pending_approvals_lock:
         current = _pending_approvals.get(run_id)
         if not current or current.get("delivery_id") != delivery_id:
-            return dict(current) if current else None
+            return None
         queue = _pending_approval_queues.get(run_id, [])
         if queue and queue[0].get("delivery_id") == delivery_id:
             queue.pop(0)
@@ -873,7 +881,8 @@ def _read_sse_stream(
                         # and keep listening. The run is still active.
                         if event_type == "approval.request":
                             delivery_id = (
-                                f"dispatch-approval-{run_id[:12]}-{time.time_ns()}"
+                                f"dispatch-approval-{run_id[:12]}-"
+                                f"{secrets.token_urlsafe(16)}"
                             )
                             with _delivery_gate_lock:
                                 route = dict(_delivery_routes.get(run_id) or {})
@@ -951,7 +960,10 @@ def _read_sse_stream(
                                         promoted,
                                         get_pending_approval_queue(run_id),
                                     )
-                                else:
+                                elif get_pending_approval(run_id) is None:
+                                    # Empty FIFO. A mismatch leaves the
+                                    # remaining head in place — another
+                                    # actor already advanced and published.
                                     _clear_pending_approval(run_id)
                             except Exception:
                                 pass
@@ -1192,7 +1204,7 @@ def _deliver_approval_required(
     evt = {
         "type": "async_delegation",
         "delegation_id": approval_data.get("delivery_id") or (
-            f"dispatch-approval-{run_id[:12]}-{time.time_ns()}"
+            f"dispatch-approval-{run_id[:12]}-{secrets.token_urlsafe(16)}"
         ),
         "goal": f"[dispatched to {profile}] approval required",
         "context": None,
@@ -1235,6 +1247,10 @@ def _deliver_approval_required(
             # and publishing its notice. Suppress a request already stale.
             pending = _pending_approvals.get(run_id)
             if not pending or pending.get("delivery_id") != delivery_id:
+                return
+            # Concurrent promoter (approve_dispatch) may already have
+            # published this exact delivery_id. Do not enqueue a second copy.
+            if delivery_id in _approval_notice_events:
                 return
             _approval_notice_events[delivery_id] = evt
             _approval_notice_ids_by_run.setdefault(run_id, set()).add(delivery_id)
