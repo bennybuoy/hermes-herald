@@ -9,9 +9,23 @@ import pytest
 from hermes_herald import tools
 
 
+_PROXY_ENV_VARS = (
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+)
+
+
 @pytest.fixture(autouse=True)
-def _reset_plaintext_http_cache():
+def _reset_plaintext_http_cache(monkeypatch):
     tools._http_plaintext_checked.clear()
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
     yield
     tools._http_plaintext_checked.clear()
 
@@ -249,3 +263,77 @@ def test_host_is_loopback_uses_resolved_addresses(monkeypatch):
         tools.socket, "getaddrinfo", lambda *a, **k: _addrinfo_ipv4("192.168.1.4")
     )
     assert tools._host_is_loopback("localhost") is False
+
+
+def test_loopback_http_warns_when_off_loopback_http_proxy_is_set(monkeypatch, caplog):
+    """urlopen() would send the bearer token to a non-loopback proxy."""
+    _stub_profile(monkeypatch, "http://127.0.0.1:8652")
+    caplog.set_level(logging.WARNING, logger="hermes_herald.tools")
+    monkeypatch.setenv("http_proxy", "http://10.0.0.1:8080")
+
+    resolved, err = tools._resolve_profile("tutor")
+
+    assert err is None
+    messages = _warning_messages(caplog)
+    assert len(messages) == 1
+    assert "tutor" in messages[0]
+    assert "http://127.0.0.1:8652" in messages[0]
+    assert "proxy" in messages[0].lower()
+    assert "bearer tokens" in messages[0].lower()
+
+
+def test_localhost_http_warns_when_http_proxy_set_and_not_in_no_proxy(
+    monkeypatch, caplog
+):
+    _stub_profile(monkeypatch, "http://localhost:8652")
+    caplog.set_level(logging.WARNING, logger="hermes_herald.tools")
+    monkeypatch.setattr(
+        tools.socket, "getaddrinfo", lambda *a, **k: _addrinfo_ipv4("127.0.0.1")
+    )
+    # Literal proxy IP so the getaddrinfo stub cannot reclassify the proxy
+    # as loopback.
+    monkeypatch.setenv("HTTP_PROXY", "http://10.0.0.1:3128")
+
+    resolved, err = tools._resolve_profile("tutor")
+
+    assert err is None
+    assert resolved["url"] == "http://localhost:8652"
+    messages = _warning_messages(caplog)
+    assert len(messages) == 1
+    assert "proxy" in messages[0].lower()
+
+
+def test_loopback_http_does_not_warn_when_no_proxy_exempts_host(monkeypatch, caplog):
+    _stub_profile(monkeypatch, "http://127.0.0.1:8652")
+    caplog.set_level(logging.WARNING, logger="hermes_herald.tools")
+    monkeypatch.setenv("http_proxy", "http://10.0.0.1:8080")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+
+    resolved, err = tools._resolve_profile("tutor")
+
+    assert err is None
+    assert _warning_messages(caplog) == []
+
+
+def test_loopback_http_does_not_warn_when_proxy_itself_is_loopback(
+    monkeypatch, caplog
+):
+    _stub_profile(monkeypatch, "http://127.0.0.1:8652")
+    caplog.set_level(logging.WARNING, logger="hermes_herald.tools")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:8080")
+
+    resolved, err = tools._resolve_profile("tutor")
+
+    assert err is None
+    assert _warning_messages(caplog) == []
+
+
+def test_https_proxy_does_not_affect_http_loopback_warning(monkeypatch, caplog):
+    _stub_profile(monkeypatch, "http://127.0.0.1:8652")
+    caplog.set_level(logging.WARNING, logger="hermes_herald.tools")
+    monkeypatch.setenv("https_proxy", "http://10.0.0.1:8080")
+
+    resolved, err = tools._resolve_profile("tutor")
+
+    assert err is None
+    assert _warning_messages(caplog) == []

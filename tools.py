@@ -32,7 +32,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    HTTPRedirectHandler,
+    Request,
+    build_opener,
+    getproxies,
+    proxy_bypass,
+)
 from urllib.error import HTTPError, URLError
 
 from . import config as cfg
@@ -1379,12 +1385,52 @@ def _host_is_loopback(hostname: str) -> bool:
     return all(_ip_is_loopback(addr) for addr in addresses)
 
 
+def _proxy_url_hostname(proxy_url: str) -> str:
+    """Return the hostname of a proxy URL as urllib would parse it.
+
+    Proxy values may be a full URL (``http://127.0.0.1:8080``) or a
+    bare ``host:port``. Empty or unparseable values yield ``""``.
+    """
+    proxy_url = (proxy_url or "").strip()
+    if not proxy_url:
+        return ""
+    if "://" not in proxy_url:
+        proxy_url = "//" + proxy_url
+    return urlsplit(proxy_url).hostname or ""
+
+
+def _http_would_use_off_loopback_proxy(url: str) -> bool:
+    """True if urlopen() would send *url* through a non-loopback HTTP proxy.
+
+    ``urlopen()`` uses ``build_opener()``, whose default ``ProxyHandler``
+    consults ``getproxies()`` (``HTTP_PROXY``/``http_proxy``, and
+    ``HTTPS_PROXY``/``https_proxy`` for https URLs) and ``proxy_bypass()``
+    (``NO_PROXY``/``no_proxy``). A loopback target is therefore not safe
+    when a non-loopback proxy would still see the bearer token.
+    """
+    scheme = (urlsplit(url).scheme or "http").lower()
+    proxy_url = (getproxies().get(scheme) or "").strip()
+    if not proxy_url:
+        return False
+    try:
+        host = Request(url).host or ""
+        if host and proxy_bypass(host):
+            return False
+    except (OSError, ValueError, TypeError):
+        pass
+    return not _host_is_loopback(_proxy_url_hostname(proxy_url))
+
+
 def _warn_if_non_loopback_http(profile: str, url: str, hostname: str) -> None:
     """Log once when a profile URL is plaintext HTTP to a non-loopback host.
 
     Does not reject the URL: Tailscale/LAN plaintext HTTP is a documented
     deployment. Bearer tokens are still sent; the warning is so operators
     notice a misconfigured remote target.
+
+    A loopback target still warns when urllib would proxy the request to a
+    non-loopback HTTP proxy (``HTTP_PROXY`` set and host not in ``NO_PROXY``).
+    A loopback proxy is treated as safe.
     """
     key = (profile, url)
     with _http_plaintext_lock:
@@ -1392,6 +1438,16 @@ def _warn_if_non_loopback_http(profile: str, url: str, hostname: str) -> None:
             return
         _http_plaintext_checked.add(key)
     if _host_is_loopback(hostname):
+        if not _http_would_use_off_loopback_proxy(url):
+            return
+        logger.warning(
+            "hermes-herald: profile '%s' URL %s is plaintext HTTP to a "
+            "loopback host, but an HTTP proxy is configured that is not "
+            "loopback and the host is not listed in NO_PROXY; bearer tokens "
+            "will be sent unencrypted to the proxy.",
+            profile,
+            url,
+        )
         return
     logger.warning(
         "hermes-herald: profile '%s' URL %s is plaintext HTTP and does not "
