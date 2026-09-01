@@ -27,6 +27,7 @@ import time
 import tempfile
 import threading
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
@@ -935,10 +936,45 @@ def _get_json(url: str, api_key: str, timeout: float = 10.0) -> dict:
 # ---------------------------------------------------------------------------
 
 _MAX_STATE_ENTRIES = 200
+_TERMINAL_STATE_STATUSES = frozenset({
+    "completed", "failed", "cancelled", "timeout", "error",
+})
 
 # Serializes all state file reads/writes — SSE callback threads and
 # tool handler threads can race on read-modify-write cycles without this.
 _state_lock = threading.Lock()
+
+
+def _utc_now_iso() -> str:
+    """UTC timestamp matching the ledger format (``...+00:00``)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _trim_state_runs(runs: list, limit: int) -> list:
+    """Bound the live-recovery cache, preferring non-terminal runs.
+
+    Oldest terminal entries are dropped first so in-flight dispatches stay
+    recoverable. Only if live runs still exceed ``limit`` are the oldest
+    non-terminal entries dropped. Original relative order is preserved.
+    """
+    overflow = len(runs) - limit
+    if overflow <= 0:
+        return runs
+    drop: set[int] = set()
+    for i, run in enumerate(runs):
+        if overflow <= 0:
+            break
+        if run.get("status") in _TERMINAL_STATE_STATUSES:
+            drop.add(i)
+            overflow -= 1
+    if overflow > 0:
+        for i in range(len(runs)):
+            if overflow <= 0:
+                break
+            if i not in drop:
+                drop.add(i)
+                overflow -= 1
+    return [run for i, run in enumerate(runs) if i not in drop]
 
 
 def _load_state() -> dict:
@@ -958,10 +994,18 @@ def _save_state(data: dict) -> None:
     """Atomically write the run-state JSON file."""
     path = cfg.get_state_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Trim old entries
+    # Trim old entries, preferring in-flight runs over completed ones.
     runs = data.get("runs", [])
     if len(runs) > _MAX_STATE_ENTRIES:
-        data["runs"] = runs[-_MAX_STATE_ENTRIES:]
+        original = len(runs)
+        data["runs"] = _trim_state_runs(runs, _MAX_STATE_ENTRIES)
+        logger.warning(
+            "State cache truncated: dropped %d of %d entries (limit %d); "
+            "preferring non-terminal runs",
+            original - len(data["runs"]),
+            original,
+            _MAX_STATE_ENTRIES,
+        )
     # Atomic write: temp file + replace (cross-platform, overwrites existing)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
@@ -1146,6 +1190,7 @@ def _persist_run(
     delivery: str = "callback",
     hop_count: int = 1,
     max_hops: Optional[int] = None,
+    session_id: str = "",
 ) -> None:
     """Add a run entry to the state file with explicit model provenance.
 
@@ -1153,15 +1198,19 @@ def _persist_run(
     New dispatches separately record the requested route alias and the model
     resolved by authenticated target route discovery. Neither field is
     inferred from run status/completion echoes.
+
+    ``session_id`` must be the origin routing identifier already captured by
+    the caller (``capture_session_routing``). It is never read from
+    ``os.environ``, which is stale in TUI/desktop sessions.
     """
     with _state_lock:
         state = _load_state()
         state.setdefault("runs", []).append({
             "run_id": run_id,
             "profile": profile,
-            "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dispatched_at": _utc_now_iso(),
             "message_preview": message_preview[:120],
-            "session_id": os.environ.get("HERMES_SESSION_ID", ""),
+            "session_id": session_id,
             "model": model or resolved_model or "",
             "requested_model": requested_model or "",
             "resolved_model": resolved_model or "",
@@ -1205,7 +1254,7 @@ def _update_run_status(
                 if run.get("run_id") == run_id:
                     run["status"] = status
                     if status in {"completed", "failed", "cancelled"}:
-                        run["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                        run["completed_at"] = _utc_now_iso()
                     else:
                         run["completed_at"] = ""
                     if output_preview:
@@ -1650,6 +1699,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             delivery=delivery,
             hop_count=hop_count,
             max_hops=max_hops,
+            session_id=origin_session_id,
         )
     except Exception as exc:
         recovery_warning = f"Profile-local recovery state could not be updated: {exc}"
@@ -1719,7 +1769,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
         "run_id": run_id,
         "profile": profile,
         "status": "dispatched",
-        "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "dispatched_at": _utc_now_iso(),
         "message_preview": message[:120],
         "delivery": delivery,
         "edge_id": edge_id,
@@ -2129,7 +2179,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             state.setdefault("runs", []).append({
                 "run_id": chat_record_id,
                 "profile": profile,
-                "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "dispatched_at": _utc_now_iso(),
                 "message_preview": message[:120],
                 "session_id": result_session_id,
                 "model": result.get("model") or model_provenance["resolved_model"],
@@ -2137,7 +2187,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 "resolved_model": model_provenance["resolved_model"],
                 "model_resolution": model_provenance["resolution_source"],
                 "status": "completed",
-                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "completed_at": _utc_now_iso(),
                 "duration_seconds": None,
                 "output_preview": reply[:500] if reply else "",
                 "usage": usage,
@@ -3186,7 +3236,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         state.setdefault("runs", []).append({
             "run_id": task_id,
             "profile": "in-process",
-            "dispatched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dispatched_at": _utc_now_iso(),
             "message_preview": goal[:120],
             "session_id": session_id,
             "model": effective_model,

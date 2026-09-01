@@ -1,10 +1,12 @@
 """Regression tests for Hermes Herald state persistence."""
 import json
+import logging
 import os
 import sys
 import types
 import tempfile
 import threading
+from datetime import datetime
 import pytest
 
 from hermes_herald import tools
@@ -78,6 +80,87 @@ class TestStatePersistence:
         with unittest.mock.patch.object(os, "replace") as mock_replace:
             tools._save_state({"runs": []})
             mock_replace.assert_called_once()
+
+    def test_persist_run_uses_utc_timestamp(self):
+        """dispatched_at is a UTC ISO-8601 timestamp matching the ledger."""
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        tools._persist_run("test-utc", "marie", "Hello", model="glm-5.2")
+        run = tools._load_state()["runs"][0]
+        stamp = run["dispatched_at"]
+        assert stamp.endswith("+00:00"), stamp
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset().total_seconds() == 0
+
+    def test_update_run_status_uses_utc_timestamp(self):
+        """completed_at is a UTC ISO-8601 timestamp matching the ledger."""
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        tools._persist_run("test-utc-done", "marie", "Hello", model="glm-5.2")
+        tools._update_run_status("test-utc-done", "completed", output_preview="ok")
+        run = tools._load_state()["runs"][0]
+        stamp = run["completed_at"]
+        assert stamp.endswith("+00:00"), stamp
+        parsed = datetime.fromisoformat(stamp)
+        assert parsed.utcoffset().total_seconds() == 0
+
+    def test_persist_run_uses_passed_session_id_not_environ(self, monkeypatch):
+        """_persist_run stores the caller-supplied session_id, never os.environ."""
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+        tools._persist_run(
+            "test-sid", "marie", "Hello", model="glm-5.2",
+            session_id="live-captured-session",
+        )
+        run = tools._load_state()["runs"][0]
+        assert run["session_id"] == "live-captured-session"
+
+    def test_persist_run_does_not_read_environ_session_id(self, monkeypatch):
+        """Omitting session_id records empty rather than falling back to env."""
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+        tools._persist_run("test-sid-empty", "marie", "Hello", model="glm-5.2")
+        run = tools._load_state()["runs"][0]
+        assert run["session_id"] == ""
+
+    def test_save_state_warns_and_prefers_non_terminal(self, caplog, monkeypatch):
+        """Truncation logs a warning and keeps in-flight runs over completed ones."""
+        monkeypatch.setattr(tools, "_MAX_STATE_ENTRIES", 2)
+        state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")
+        if os.path.exists(state_path):
+            os.unlink(state_path)
+
+        with caplog.at_level(logging.WARNING, logger="hermes_herald.tools"):
+            tools._save_state({"runs": [
+                {"run_id": "old-done", "status": "completed"},
+                {"run_id": "mid-done", "status": "failed"},
+                {"run_id": "live", "status": "dispatched"},
+            ]})
+
+        assert any("truncated" in rec.message.lower() for rec in caplog.records)
+        ids = [run["run_id"] for run in tools._load_state()["runs"]]
+        assert ids == ["mid-done", "live"]
+
+    def test_trim_state_runs_drops_oldest_live_only_when_needed(self):
+        """Non-terminal overflow still bounds the cache to the newest live runs."""
+        runs = [
+            {"run_id": "live-old", "status": "dispatched"},
+            {"run_id": "live-mid", "status": "running"},
+            {"run_id": "live-new", "status": "waiting_for_approval"},
+        ]
+        kept = tools._trim_state_runs(runs, 2)
+        assert [run["run_id"] for run in kept] == ["live-mid", "live-new"]
 
 
 class TestCancelFlags:
