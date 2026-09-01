@@ -19,10 +19,12 @@ except delegate_subagent which runs in a background thread.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import math
 import os
+import socket
 import time
 import tempfile
 import threading
@@ -1324,6 +1326,82 @@ def _tool_error(msg: str) -> str:
     return json.dumps({"status": "error", "error": msg})
 
 
+# Profile/URL pairs already evaluated for the plaintext-HTTP warning.
+# Process-lifetime so a chatty dispatch loop does not repeat the log.
+_http_plaintext_checked: set[tuple[str, str]] = set()
+_http_plaintext_lock = threading.Lock()
+
+
+def _ip_is_loopback(ip_str: str) -> bool:
+    """Return True if *ip_str* is a loopback address.
+
+    Loopback includes ``127.0.0.0/8`` and ``::1``. IPv4-mapped IPv6
+    loopback (``::ffff:127.0.0.1``) is treated as loopback. Zone-ids
+    (``fe80::1%lo``) are stripped before parsing.
+    """
+    if "%" in ip_str:
+        ip_str = ip_str.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_loopback)
+
+
+def _host_is_loopback(hostname: str) -> bool:
+    """Return True iff every resolved address for *hostname* is loopback.
+
+    Literal IPs are classified directly. Hostnames (including
+    ``localhost``) are resolved with ``getaddrinfo`` so the check follows
+    the address the HTTP client would use, not the hostname string.
+    ``localhost`` may resolve to ``127.0.0.1`` or ``::1``; both are
+    loopback. DNS failure or any non-loopback address is not loopback.
+    """
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        pass
+    else:
+        return _ip_is_loopback(hostname)
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except OSError:
+        return False
+    addresses = [info[4][0] for info in infos if info[4]]
+    if not addresses:
+        return False
+    return all(_ip_is_loopback(addr) for addr in addresses)
+
+
+def _warn_if_non_loopback_http(profile: str, url: str, hostname: str) -> None:
+    """Log once when a profile URL is plaintext HTTP to a non-loopback host.
+
+    Does not reject the URL: Tailscale/LAN plaintext HTTP is a documented
+    deployment. Bearer tokens are still sent; the warning is so operators
+    notice a misconfigured remote target.
+    """
+    key = (profile, url)
+    with _http_plaintext_lock:
+        if key in _http_plaintext_checked:
+            return
+        _http_plaintext_checked.add(key)
+    if _host_is_loopback(hostname):
+        return
+    logger.warning(
+        "hermes-herald: profile '%s' URL %s is plaintext HTTP and does not "
+        "resolve exclusively to a loopback address; bearer tokens will be "
+        "sent unencrypted. Use loopback, a trusted private network, or HTTPS.",
+        profile,
+        url,
+    )
+
+
 def _resolve_profile(
     profile: str,
     operation: Optional[str] = None,
@@ -1376,6 +1454,8 @@ def _resolve_profile(
         )
     resolved = dict(pcfg)
     resolved["url"] = url.rstrip("/")
+    if parsed.scheme == "http" and parsed.hostname:
+        _warn_if_non_loopback_http(profile, resolved["url"], parsed.hostname)
     return resolved, None
 
 
