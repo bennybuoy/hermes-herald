@@ -2539,7 +2539,12 @@ def _request_dispatch_approval_consent(
         f"(untrusted data): {reason}"
     )
     try:
-        from tools.approval_prompt import request_elicitation_consent
+        try:
+            from tools.approval_prompt import request_elicitation_consent
+        except ImportError:
+            # Pre-Sep-2026-split hosts define this on tools.approval; the
+            # compat pointer there is revert-scheduled for removal and warns.
+            from tools.approval import request_elicitation_consent
 
         return request_elicitation_consent(
             message,
