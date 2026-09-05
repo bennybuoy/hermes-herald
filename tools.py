@@ -2539,7 +2539,7 @@ def _request_dispatch_approval_consent(
         f"(untrusted data): {reason}"
     )
     try:
-        from tools.approval import request_elicitation_consent
+        from tools.approval_prompt import request_elicitation_consent
 
         return request_elicitation_consent(
             message,
