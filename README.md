@@ -392,7 +392,7 @@ The child runs asynchronously in a daemon thread and returns a `task_id` immedia
 
 Because the child is in-process, it is not durable across parent-process exit. Use `dispatch_agent` when process isolation or durable target execution matters.
 
-`delegate_subagent` requires the live parent-agent context exposed by classic interactive CLI and desktop/TUI sessions. Gateway/API plugin-dispatch paths fail closed rather than guessing another session.
+`delegate_subagent` requires the live parent-agent context exposed by classic interactive CLI and desktop/TUI sessions. On the API server the parent is resolved only from the gateway adapter's active-run registry by the exact session_id-to-run_id mapping — a miss fails closed — and when the session cannot receive detached delivery (for example `/v1/runs`), the child runs in-turn and the tool result carries the final summary synchronously instead of queuing it.
 
 > If Hermes core’s global `delegation.child_timeout_seconds` is enabled, it can preempt Herald’s per-call policy. Set it to `0` or leave it unset when using Herald timeout controls.
 

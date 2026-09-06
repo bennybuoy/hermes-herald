@@ -3603,6 +3603,35 @@ def _resolve_parent_agent(parent_agent=None, session_id: str = ""):
 
     try:
         from gateway.session_context import get_session_env
+
+        is_api_server = (
+            str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip()
+            == "api_server"
+        )
+    except Exception:
+        is_api_server = False
+
+    if is_api_server:
+        # API-server runs have no UI session registry; the gateway adapter
+        # holds the live run agents keyed by exact run_id. Exact key only —
+        # no scan, and any miss fails closed (None).
+        try:
+            run_id = str(session_id or "").strip()
+            if not run_id:
+                return None
+            from gateway.config import Platform
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+            adapter = (
+                runner.adapters.get(Platform.API_SERVER) if runner else None
+            )
+            return getattr(adapter, "_active_run_agents", {}).get(run_id)
+        except Exception:
+            return None
+
+    try:
+        from gateway.session_context import get_session_env
         from tui_gateway import server as tui_server
 
         ui_session_id = str(
@@ -3653,6 +3682,196 @@ def _capture_subagent_routing(parent_agent) -> dict:
     }
 
 
+def _run_delegate_subagent_in_turn(
+    *,
+    args: dict,
+    kwargs: dict,
+    parent_agent,
+    reasoning_effort,
+) -> str:
+    """Run the delegate_subagent child on the calling thread and return its JSON.
+
+    Sessions without async delivery (for example ``/v1/runs`` binds
+    ``async_delivery=False``) can never receive a queued completion, so the
+    child runs synchronously on THIS thread — no background thread and no
+    completion_queue put — and the HTTP turn waits for the final
+    ``{task_id, status, summary|error}`` JSON instead of returning detached.
+    """
+    goal = args.get("goal", "")
+    model_name = args.get("model", "")
+    inherit_soul = args.get("inherit_soul", False) is True
+    inherit_context = args.get("inherit_context", False) is True
+    inherit_toolsets = args.get("inherit_toolsets", True) is not False
+
+    if not goal.strip():
+        return _tool_error("'goal' is required.")
+    if not parent_agent:
+        return _tool_error(
+            "delegate_subagent requires a parent agent context "
+            "(not available in this mode)."
+        )
+
+    context = _compose_subagent_context(
+        parent_agent, args.get("context"), inherit_context,
+    )
+    try:
+        toolsets = _resolve_subagent_toolsets(
+            args.get("toolsets"), inherit_toolsets,
+        )
+    except ValueError as e:
+        return _tool_error(str(e))
+
+    try:
+        creds = _resolve_model_creds(model_name, parent_agent)
+    except ValueError as e:
+        return _tool_error(f"Could not resolve model '{model_name}': {e}")
+    except Exception as e:
+        return _tool_error(f"Model resolution failed: {type(e).__name__}: {e}")
+
+    try:
+        from tools.delegate_tool import (
+            _build_child_agent,
+            _run_single_child,
+            _get_child_timeout,
+            _load_config as _load_delegation_config,
+            DEFAULT_MAX_ITERATIONS,
+        )
+    except ImportError as e:
+        return _tool_error(f"Cannot import core delegation internals: {e}")
+
+    cfg = _load_delegation_config()
+    max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    try:
+        stall_timeout_seconds, interrupt_after_seconds = _parse_subagent_timeout_policy(
+            args,
+            core_timeout_seconds=_get_child_timeout(),
+        )
+    except ValueError as e:
+        return _tool_error(str(e))
+
+    try:
+        child = _build_child_agent(
+            task_index=0,
+            goal=goal,
+            context=context,
+            toolsets=toolsets,
+            model=creds["model"],
+            max_iterations=max_iter,
+            task_count=1,
+            parent_agent=parent_agent,
+            override_provider=creds["provider"],
+            override_base_url=creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=creds["api_mode"],
+            role="leaf",
+        )
+        _apply_soul_inheritance(child, inherit_soul)
+        _apply_reasoning_effort(child, reasoning_effort)
+        if toolsets is not None:
+            _enforce_subagent_toolset_policy(child, toolsets)
+    except Exception as e:
+        return _tool_error(f"Failed to build subagent: {type(e).__name__}: {e}")
+
+    task_id = f"subagent-{uuid.uuid4().hex[:12]}"
+    effective_model = creds["model"] or getattr(parent_agent, "model", "?")
+    if reasoning_effort is not None:
+        effort_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
+        effective_model = f"{effective_model} (reasoning: {effort_label})"
+    start_time = time.time()
+
+    routing = _capture_subagent_routing(parent_agent)
+    session_id = routing["session_id"]
+
+    with _state_lock:
+        state = _load_state()
+        state.setdefault("runs", []).append({
+            "run_id": task_id,
+            "profile": "in-process",
+            "dispatched_at": _utc_now_iso(),
+            "message_preview": goal[:120],
+            "session_id": session_id,
+            "model": effective_model,
+            "status": "running",
+            "completed_at": "",
+            "duration_seconds": None,
+            "output_preview": "",
+            "usage": {},
+            "type": "subagent",
+            "stall_timeout_seconds": stall_timeout_seconds,
+            "interrupt_after_seconds": interrupt_after_seconds,
+        })
+        _save_state(state)
+
+    try:
+        result = _run_child_with_timeout_policy(
+            child=child,
+            run_child=lambda: _run_single_child(
+                task_index=0,
+                goal=goal,
+                child=child,
+                parent_agent=parent_agent,
+            ),
+            stall_timeout_seconds=stall_timeout_seconds,
+            interrupt_after_seconds=interrupt_after_seconds,
+        )
+    except Exception as e:
+        elapsed = time.time() - start_time
+        error_text, _timeout_kind = _describe_subagent_error(e)
+        api_calls = _subagent_api_call_count(None, child)
+        _update_run_status(
+            task_id,
+            status="failed",
+            output_preview=error_text[:500],
+            duration_seconds=elapsed,
+            usage={"api_calls": api_calls},
+            model=effective_model,
+        )
+        return json.dumps({
+            "task_id": task_id,
+            "status": "failed",
+            "error": error_text,
+            "model": effective_model,
+            "api_calls": api_calls,
+            "duration_seconds": round(elapsed, 2),
+        })
+
+    elapsed = time.time() - start_time
+    delivery_status, child_error = _classify_subagent_result(result)
+    api_calls = _subagent_api_call_count(result, child)
+    summary = None
+    if isinstance(result, dict):
+        summary = result.get("summary", result.get("output", ""))
+        summary = str(summary) if summary is not None else None
+    elif delivery_status == "completed":
+        summary = str(result)
+    _update_run_status(
+        task_id,
+        status=delivery_status,
+        output_preview=(
+            str(child_error if delivery_status == "failed" else (summary or ""))[:500]
+        ),
+        duration_seconds=elapsed,
+        usage={"api_calls": api_calls},
+        model=effective_model,
+    )
+    payload: Dict[str, Any] = {
+        "task_id": task_id,
+        "status": delivery_status,
+        "model": effective_model,
+        "api_calls": api_calls,
+        "duration_seconds": round(elapsed, 2),
+    }
+    if delivery_status == "completed":
+        payload["summary"] = summary
+    else:
+        payload["error"] = child_error
+    return json.dumps(payload)
+
+
 def handle_delegate_subagent(args: dict, **kwargs) -> str:
     """Spawn an in-process subagent with per-call model and timeout policy.
 
@@ -3679,18 +3898,19 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         kwargs.get("parent_agent"), kwargs.get("session_id", "")
     )
 
+    if not _async_delivery_supported():
+        return _run_delegate_subagent_in_turn(
+            args=args,
+            kwargs=kwargs,
+            parent_agent=parent_agent,
+            reasoning_effort=reasoning_effort,
+        )
     if not goal.strip():
         return _tool_error("'goal' is required.")
     if not parent_agent:
         return _tool_error(
             "delegate_subagent requires a parent agent context "
             "(not available in this mode)."
-        )
-    if not _async_delivery_supported():
-        return _tool_error(
-            "delegate_subagent is asynchronous, but this session cannot receive "
-            "detached results. No child was started. Use llm_call when a "
-            "synchronous result is required."
         )
 
     context = _compose_subagent_context(

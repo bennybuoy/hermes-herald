@@ -45,14 +45,81 @@ def test_delegate_subagent_schema_matches_async_handler():
     assert '"api_calls": 0' not in source
 
 
-def test_stateless_session_is_rejected_before_background_work(monkeypatch):
+def test_in_turn_child_runs_on_caller_thread_when_async_delivery_off(monkeypatch):
+    import tools.delegate_tool as delegate_tool
+    import tools.process_registry as process_registry
+
     monkeypatch.setattr(tools, "_async_delivery_supported", lambda: False)
+
+    class FakeQueue:
+        def __init__(self):
+            self.events = []
+
+        def put(self, evt):
+            self.events.append(evt)
+
+    queue = FakeQueue()
+    monkeypatch.setattr(
+        process_registry.process_registry, "completion_queue", queue
+    )
+
+    parent = SimpleNamespace(model="parent-model", _session_messages=[])
+    child = SimpleNamespace(tool_progress_callback=None)
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_agent", lambda **kwargs: child
+    )
+
+    def fake_run_single_child(**kwargs):
+        assert kwargs.get("child") is child
+        return {"status": "completed", "summary": "child summary text"}
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run_single_child)
+
+    monkeypatch.setattr(tools, "_load_state", lambda: {"runs": []})
+    monkeypatch.setattr(tools, "_save_state", lambda state: None)
+    updates = []
+    monkeypatch.setattr(
+        tools,
+        "_update_run_status",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        tools,
+        "_capture_subagent_routing",
+        lambda parent_agent=None: {
+            "session_id": "context-session",
+            "session_key": "context-key",
+            "origin_ui_session_id": "ui-session-9",
+        },
+    )
+
     result = tools.json.loads(tools.handle_delegate_subagent(
-        {"goal": "audit this"},
-        parent_agent=SimpleNamespace(),
+        {"goal": "audit this"}, parent_agent=parent,
     ))
+
+    assert result["status"] == "completed"
+    assert result["summary"] == "child summary text"
+    assert result["task_id"].startswith("subagent-")
+    # No detached delivery: nothing may be queued behind the HTTP turn.
+    assert queue.events == []
+    assert updates and updates[0][1].get("status") == "completed"
+
+
+def test_in_turn_child_fails_closed_without_parent(monkeypatch):
+    import gateway.session_context as session_context
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(tools, "_async_delivery_supported", lambda: False)
+    monkeypatch.setattr(
+        session_context, "get_session_env", lambda key, default="": default
+    )
+    monkeypatch.setattr(
+        plugins, "get_plugin_manager", lambda: SimpleNamespace(_cli_ref=None)
+    )
+
+    result = tools.json.loads(tools.handle_delegate_subagent({"goal": "x"}))
     assert result["status"] == "error"
-    assert "cannot receive detached results" in result["error"]
+    assert "parent agent context" in result["error"]
 
 
 def test_delivery_capability_probe_fails_closed_on_core_error(monkeypatch):
@@ -90,6 +157,96 @@ def test_parent_agent_resolves_from_exact_tui_session(monkeypatch):
     )
 
     assert tools._resolve_parent_agent(None) is expected
+
+
+def test_parent_agent_resolves_from_exact_api_run_id(monkeypatch):
+    import gateway.session_context as session_context
+    import hermes_cli.plugins as plugins
+    import gateway.config as gateway_config
+    import gateway.run as gateway_run
+    import tui_gateway.server as tui_server
+
+    expected = SimpleNamespace(session_id="durable-session")
+    unrelated = SimpleNamespace(session_id="unrelated")
+
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": (
+            "api_server" if key == "HERMES_SESSION_PLATFORM" else default
+        ),
+    )
+    monkeypatch.setattr(
+        plugins, "get_plugin_manager", lambda: SimpleNamespace(_cli_ref=None)
+    )
+    monkeypatch.setattr(
+        tui_server,
+        "_sessions",
+        {"tui-session-1": {"agent": SimpleNamespace(session_id="other")}},
+    )
+
+    class FakeAdapter:
+        _active_run_agents = {
+            "run-abc": expected,
+            "run-other": unrelated,
+        }
+
+    class FakeRunner:
+        adapters = {gateway_config.Platform.API_SERVER: FakeAdapter()}
+
+    monkeypatch.setattr(
+        gateway_run, "_gateway_runner_ref", lambda: FakeRunner()
+    )
+
+    # Exact run_id in the adapter registry wins; the TUI path is skipped.
+    assert tools._resolve_parent_agent(None, "run-abc") is expected
+    # Unknown keys fail closed without scanning other runs.
+    assert tools._resolve_parent_agent(None, "run-missing") is None
+    assert tools._resolve_parent_agent(None, "run-other") is unrelated
+    # An empty session_id resolves to no parent.
+    assert tools._resolve_parent_agent(None, "") is None
+    assert tools._resolve_parent_agent(None, "   ") is None
+
+
+def test_parent_agent_api_lookup_fails_closed_without_runner_or_adapter(monkeypatch):
+    import gateway.session_context as session_context
+    import hermes_cli.plugins as plugins
+    import gateway.config as gateway_config
+    import gateway.run as gateway_run
+    import tui_gateway.server as tui_server
+
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": (
+            "api_server" if key == "HERMES_SESSION_PLATFORM" else default
+        ),
+    )
+    monkeypatch.setattr(
+        plugins, "get_plugin_manager", lambda: SimpleNamespace(_cli_ref=None)
+    )
+    monkeypatch.setattr(tui_server, "_sessions", {})
+
+    class EmptyAdapter:
+        _active_run_agents = {"run-abc": SimpleNamespace()}
+
+    live_runner = SimpleNamespace(
+        adapters={gateway_config.Platform.API_SERVER: EmptyAdapter()}
+    )
+
+    # No runner (weakref dead) → no parent.
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: None)
+    assert tools._resolve_parent_agent(None, "run-abc") is None
+
+    # Runner without the API-server adapter → no parent.
+    monkeypatch.setattr(
+        gateway_run, "_gateway_runner_ref", lambda: SimpleNamespace(adapters={})
+    )
+    assert tools._resolve_parent_agent(None, "run-abc") is None
+
+    # Adapter present but the exact key is missing → no parent, no scan.
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: live_runner)
+    assert tools._resolve_parent_agent(None, "not-registered") is None
 
 
 def test_parent_agent_resolution_is_exact_and_fails_closed(monkeypatch):

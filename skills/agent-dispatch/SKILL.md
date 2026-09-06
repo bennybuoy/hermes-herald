@@ -187,7 +187,7 @@ delegate_subagent(
 
 Key contracts:
 
-- It works in the classic interactive CLI and desktop/TUI, where Herald resolves the exact commissioning UI session. Gateway and API dispatch paths do not expose the required parent-agent context and fail closed.
+- It works in the classic interactive CLI and desktop/TUI, where Herald resolves the exact commissioning UI session. On the API server, resolution uses only the exact session_id-to-run_id entry in the gateway adapter's active-run registry and a miss fails closed; with no detached delivery capability (e.g. `/v1/runs`), the child runs in-turn and the tool result returns the final summary synchronously.
 - It returns a `task_id` immediately and auto-delivers the final summary or error.
 - It runs in a daemon background thread and dies with the parent process.
 - Bare and full model names pass through Hermes's model-switch pipeline.
