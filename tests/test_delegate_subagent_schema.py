@@ -273,6 +273,49 @@ def test_soul_inheritance_is_opt_in_and_invalidates_cached_prompt():
     assert child._cached_system_prompt is None
 
 
+def test_reasoning_effort_parses_levels_none_and_rejects_unknown():
+    assert tools._parse_subagent_reasoning_effort(None) is None
+    assert tools._parse_subagent_reasoning_effort("  LOW ") == {
+        "enabled": True, "effort": "low",
+    }
+    assert tools._parse_subagent_reasoning_effort("none") == {"enabled": False}
+    for level in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+        assert tools._parse_subagent_reasoning_effort(level) == {
+            "enabled": True, "effort": level,
+        }
+    with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+        tools._parse_subagent_reasoning_effort("maximum")
+    with pytest.raises(ValueError, match="reasoning_effort must be one of"):
+        tools._parse_subagent_reasoning_effort(True)
+    # YAML-false-style argument disables thinking rather than coercing away.
+    assert tools._parse_subagent_reasoning_effort(False) == {"enabled": False}
+
+
+def test_reasoning_effort_applies_after_build_and_noop_when_omitted():
+    child = SimpleNamespace(reasoning_config={"enabled": True, "effort": "high"})
+    tools._apply_reasoning_effort(child, None)
+    assert child.reasoning_config == {"enabled": True, "effort": "high"}
+
+    tools._apply_reasoning_effort(child, {"enabled": True, "effort": "minimal"})
+    assert child.reasoning_config == {"enabled": True, "effort": "minimal"}
+
+    tools._apply_reasoning_effort(child, {"enabled": False})
+    assert child.reasoning_config == {"enabled": False}
+    # The override writes a private copy, so later caller-side mutation of the
+    # parsed dict cannot leak into the child.
+    assert tools._parse_subagent_reasoning_effort("low") is not child.reasoning_config
+
+
+def test_subagent_schema_exposes_reasoning_effort_contract():
+    properties = tools.DELEGATE_SUBAGENT_SCHEMA["parameters"]["properties"]
+    assert properties["reasoning_effort"]["enum"] == [
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "none",
+    ]
+    assert "delegation.reasoning_effort" in properties["reasoning_effort"]["description"]
+    description = tools.DELEGATE_SUBAGENT_SCHEMA["description"]
+    assert "reasoning_effort" in description
+
+
 def test_parent_context_inheritance_is_opt_in_bounded_and_excludes_tools():
     parent = SimpleNamespace(_session_messages=[
         {"role": "system", "content": "hidden system"},

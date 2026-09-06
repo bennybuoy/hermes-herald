@@ -325,10 +325,24 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional exact model_routes alias advertised by the "
+                    "Optional model_routes alias advertised by the "
                     "target's authenticated /v1/models endpoint. Herald "
                     "verifies the alias before sending. Omit to use the "
                     "target profile's default runtime."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional per-call reasoning effort for this subagent. "
+                    "Omit to inherit the normal resolution order (core "
+                    "delegation.reasoning_effort config when set, otherwise "
+                    "the parent agent's level). 'none' disables thinking for "
+                    "this child; the other values set the thinking budget. "
+                    "Applies only when the target provider supports reasoning "
+                    "control; unsupported values fail noisily at request time."
                 ),
             },
             "stall_timeout_seconds": {
@@ -454,7 +468,10 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
         "the parent's, the subagent gets fresh credentials for that provider. "
         "If it's the same provider/aggregator, credentials are inherited. "
         "Set inherit_soul=true to load the active parent profile's full "
-        "SOUL.md as the child's identity; it is off by default.\n\n"
+        "SOUL.md as the child's identity; it is off by default. "
+        "reasoning_effort optionally sets this child's thinking budget "
+        "(minimal..ultra, or 'none' to disable) per call, without touching "
+        "the delegation config that core delegate_task reads.\n\n"
         "Runs asynchronously in a daemon background thread and returns a "
         "task_id immediately. Activity resets a stall timer (10 minutes by "
         "default), so productive children can run indefinitely. An optional "
@@ -520,6 +537,19 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
                     "list is intersected with the parent's capabilities; an "
                     "empty list creates a model-only child. If omitted, "
                     "inherit_toolsets controls the behaviour."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional per-call reasoning effort for this subagent. "
+                    "Omit to inherit the normal resolution order (core "
+                    "delegation.reasoning_effort config when set, otherwise "
+                    "the parent agent's level). 'none' disables thinking for "
+                    "this child; the other values set the thinking budget. "
+                    "Unsupported combinations fail noisily at request time."
                 ),
             },
             "inherit_toolsets": {
@@ -3128,6 +3158,67 @@ def _apply_soul_inheritance(child, inherit_soul: bool) -> None:
     setattr(child, "_cached_system_prompt", None)
 
 
+_VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _parse_subagent_reasoning_effort(raw):
+    """Parse the per-call reasoning_effort argument.
+
+    Returns None when omitted (inherit normal resolution). Returns the core
+    ``reasoning_config`` dict shape otherwise: {"enabled": False} for "none"
+    or {"enabled": True, "effort": level}. Mirrors core's
+    ``hermes_constants.parse_reasoning_effort`` contract, including the rule
+    that a disabled level must disable thinking rather than coerce away.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        # Schema constrains to strings; a boolean means the caller ignored the
+        # enum. False disables thinking, True is meaningless -> explicit error.
+        if raw is False:
+            return {"enabled": False}
+        raise ValueError(
+            "reasoning_effort must be one of: "
+            + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+        )
+    if not isinstance(raw, str):
+        raise ValueError(
+            "reasoning_effort must be one of: "
+            + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+        )
+    effort = raw.strip().lower()
+    if effort == "none":
+        return {"enabled": False}
+    if effort in _VALID_REASONING_EFFORTS:
+        return {"enabled": True, "effort": effort}
+    raise ValueError(
+        "reasoning_effort must be one of: "
+        + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+    )
+
+
+def _apply_reasoning_effort(child, reasoning_effort) -> None:
+    """Apply the per-call reasoning override before the child's first model call.
+
+    Mirrors the _apply_soul_inheritance seam: assignment after build, before
+    the first request. The reasoning_config kwarg was already consumed into
+    AIAgent state by _build_child_agent; per-request assembly reads the live
+    attribute (agent/reasoning_params.py has no construction-time snapshot),
+    so the override takes effect for every child request.
+    """
+    if reasoning_effort is None:
+        return
+    setattr(child, "reasoning_config", dict(reasoning_effort))
+    # Defensive: nothing currently caches reasoning state at build, but keep
+    # the same invalidation posture as SOUL inheritance in case core adds one.
+    for attr in ("_reasoning_config_cached", "_cached_reasoning_config"):
+        if hasattr(child, attr):
+            try:
+                delattr(child, attr)
+            except Exception:
+                pass
+
+
 _INHERITED_CONTEXT_MESSAGE_LIMIT = 20
 _INHERITED_CONTEXT_CHAR_LIMIT = 12_000
 _NO_TOOLSETS_SENTINEL = "__herald_model_only__"
@@ -3303,6 +3394,10 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
     inherit_soul = args.get("inherit_soul", False) is True
     inherit_context = args.get("inherit_context", False) is True
     inherit_toolsets = args.get("inherit_toolsets", True) is not False
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
     parent_agent = _resolve_parent_agent(
         kwargs.get("parent_agent"), kwargs.get("session_id", "")
     )
@@ -3383,6 +3478,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         # SOUL.md is loaded from the active profile, while project context,
         # USER.md, memory, and parent conversation history remain excluded.
         _apply_soul_inheritance(child, inherit_soul)
+        _apply_reasoning_effort(child, reasoning_effort)
         if toolsets is not None:
             _enforce_subagent_toolset_policy(child, toolsets)
     except Exception as e:
@@ -3390,6 +3486,13 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
 
     task_id = f"subagent-{uuid.uuid4().hex[:12]}"
     effective_model = creds["model"] or getattr(parent_agent, "model", "?")
+    if reasoning_effort is not None:
+        effort_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
+        effective_model = f"{effective_model} (reasoning: {effort_label})"
     start_time = time.time()
 
     # Capture task-local routing identifiers BEFORE spawning the thread.

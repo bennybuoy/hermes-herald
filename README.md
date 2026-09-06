@@ -376,6 +376,20 @@ Because the child is in-process, it is not durable across parent-process exit. U
 
 > If Hermes core’s global `delegation.child_timeout_seconds` is enabled, it can preempt Herald’s per-call policy. Set it to `0` or leave it unset when using Herald timeout controls.
 
+### Per-call reasoning effort
+
+`delegate_subagent` accepts `reasoning_effort` to set the child's thinking budget for this one call, without touching core's `delegation.reasoning_effort` config:
+
+```python
+delegate_subagent(
+    goal="Deep-dive the auth flow for security issues",
+    model="gpt-5",
+    reasoning_effort="high",   # minimal..ultra; 'none' disables thinking
+)
+```
+
+Omitted, the child keeps the normal resolution order (core `delegation.reasoning_effort` when configured, otherwise the parent's level). The override applies after the child is built via the same post-build seam as SOUL inheritance and takes effect on every child request; unsupported model/provider combinations fail noisily at request time rather than silently substituting a different level.
+
 ---
 
 ## Pillar 3 — A lightweight inference lane
