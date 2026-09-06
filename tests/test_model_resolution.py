@@ -187,6 +187,7 @@ class TestLocalModelRouteDiscovery:
                         "id": "review-fast",
                         "root": "glm-5.2",
                         "parent": "glm-5.2",
+                        "provider": "nous",
                     },
                 ]
             }
@@ -212,9 +213,11 @@ class TestLocalModelRouteDiscovery:
             "alias": "review-fast",
             "pass_as": "review-fast",
             "resolved_model": "glm-5.2",
+            "provider": "nous",
+            "provider_pinned": True,
         }]
         assert result["dispatchable_model_count"] == 1
-        assert "copy one exact string from pass_as_model" in result["contract"]
+        assert "pass provider=" in result["contract"]
         assert "remote-secret" not in raw
 
         queried = json.loads(tools.handle_list_profile_models({

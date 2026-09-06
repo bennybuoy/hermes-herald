@@ -305,6 +305,48 @@ def test_dispatch_agent_omitted_reasoning_sends_no_model_options(monkeypatch):
     assert "model_options" not in captured["body"]
 
 
+def test_dispatch_agent_sends_provider_on_body(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        tools, "_resolve_profile",
+        lambda profile, operation="dispatch": (
+            {"url": "http://127.0.0.1:9", "api_key": "k"}, None,
+        ),
+    )
+    monkeypatch.setattr(tools, "_preflight_dispatch_ledger", lambda: None)
+    monkeypatch.setattr(
+        tools, "_verify_run_model_route",
+        lambda profile, pcfg, model, provider="": ({
+            "requested_model": model,
+            "resolved_model": "gpt-5.6-sol",
+            "resolution_source": "target_model_routes",
+            "provider": provider or "nous",
+            "provider_pinned": False,
+        }, None),
+    )
+    monkeypatch.setattr(tools, "_async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", lambda key, default="": default)
+
+    def fake_post_json(url, api_key, body, timeout=30.0):
+        captured["body"] = body
+        return {"run_id": "run_p"}
+
+    monkeypatch.setattr(tools, "_post_json", fake_post_json)
+    monkeypatch.setattr(tools, "_record_dispatch_ledger", lambda **kw: None)
+    monkeypatch.setattr(tools, "_persist_run", lambda *a, **kw: None)
+
+    result = json.loads(tools.handle_dispatch_agent({
+        "profile": "remote",
+        "message": "task",
+        "model": "gpt-5.6-sol",
+        "provider": "nous",
+    }))
+    assert result.get("run_id") == "run_p", result
+    assert captured["body"]["model"] == "gpt-5.6-sol"
+    assert captured["body"]["provider"] == "nous"
+
+
 def test_llm_direct_extra_body_cannot_override_model_or_temperature(monkeypatch):
     _enable_llm_direct(monkeypatch, endpoints={
         "test": {

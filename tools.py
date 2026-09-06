@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import time
 import tempfile
@@ -171,6 +172,17 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                     "slugs, do not add a provider prefix, and do not pass "
                     "advertised_primary.model. Omit this field to use the "
                     "target's default runtime."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional target provider slug copied from "
+                    "list_profile_models(profile=<this profile>) "
+                    "dispatchable_models[].provider. Required to pin a "
+                    "subscription when the same model exists on more than one "
+                    "provider and the alias is unpinned. If the alias already "
+                    "pins a provider, this must match it."
                 ),
             },
             "reasoning_effort": {
@@ -345,6 +357,15 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
                     "first when overriding the target default. Do not invent "
                     "slugs or add a provider prefix. Omit to use the target "
                     "profile's default runtime."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional target provider slug copied from "
+                    "list_profile_models(profile=<this profile>) "
+                    "dispatchable_models[].provider. Pin this when the same "
+                    "model exists on more than one provider."
                 ),
             },
             "reasoning_effort": {
@@ -1757,10 +1778,39 @@ def _resolve_profile(
     return resolved, None
 
 
+def _parse_optional_provider(raw) -> tuple[str, Optional[str]]:
+    """Return (provider, error). Empty/omitted is allowed."""
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return "", "'provider' must be a string when provided."
+    provider = raw.strip()
+    if not provider:
+        return "", None
+    if len(provider) > 80 or not re.match(r"^[A-Za-z0-9_.:-]+$", provider):
+        return "", (
+            "'provider' must be a short provider slug "
+            "(letters, digits, '_', '.', ':', '-')."
+        )
+    return provider, None
+
+
+def _entry_route_provider(entry: dict) -> str:
+    """Credential-free provider pin from a /v1/models row, if advertised."""
+    for key in ("provider", "owned_by"):
+        raw = entry.get(key)
+        if isinstance(raw, str):
+            value = raw.strip()
+            if value and value.lower() not in {"hermes", "hermes-agent"}:
+                return value
+    return ""
+
+
 def _verify_run_model_route(
     profile: str,
     pcfg: dict,
     requested_model: str,
+    requested_provider: str = "",
 ) -> tuple[dict, Optional[str]]:
     """Verify an explicit /v1/runs model as a target model_routes alias.
 
@@ -1825,10 +1875,23 @@ def _verify_run_model_route(
     if matched is not None:
         resolved_model = matched.get("root")
         if isinstance(resolved_model, str) and resolved_model.strip():
+            pinned_provider = _entry_route_provider(matched)
+            if (
+                requested_provider
+                and pinned_provider
+                and requested_provider != pinned_provider
+            ):
+                return {}, (
+                    f"Model route '{requested_model}' on {profile} is pinned to "
+                    f"provider '{pinned_provider}'. Remove provider= or pass "
+                    f"provider='{pinned_provider}'. No task was started."
+                )
             return {
                 "requested_model": requested_model,
                 "resolved_model": resolved_model.strip(),
                 "resolution_source": "target_model_routes",
+                "provider": requested_provider or pinned_provider,
+                "provider_pinned": bool(pinned_provider),
             }, None
         return {}, (
             f"Cannot verify model route '{requested_model}' for {profile}: "
@@ -1882,6 +1945,9 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     message = args.get("message", "")
     instructions = args.get("instructions")
     model_override = args.get("model")
+    requested_provider, provider_error = _parse_optional_provider(args.get("provider"))
+    if provider_error:
+        return _tool_error(provider_error)
     delivery = args.get("delivery", "callback")
     trace_id = args.get("trace_id", "")
     parent_edge_id = args.get("parent_edge_id", "")
@@ -1970,13 +2036,19 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     route_resolution: Dict[str, str] = {}
     if requested_model:
         route_resolution, route_error = _verify_run_model_route(
-            profile, pcfg, requested_model,
+            profile, pcfg, requested_model, requested_provider,
         )
         if route_error:
             return _tool_error(route_error)
         # Send the exact verified alias. Sending the resolved root would miss
         # Hermes' exact alias lookup and silently select the target default.
         body["model"] = requested_model
+        transmit_provider = requested_provider or route_resolution.get("provider") or ""
+        if transmit_provider:
+            body["provider"] = transmit_provider
+    elif requested_provider:
+        # Pin provider for the target default model when no alias is sent.
+        body["provider"] = requested_provider
     reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
     if reasoning_model_options is not None:
         body["model_options"] = reasoning_model_options
@@ -2366,6 +2438,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     instructions = args.get("instructions")
     new_session = args.get("new_session", False)
     model_override = args.get("model")
+    requested_provider, provider_error = _parse_optional_provider(args.get("provider"))
+    if provider_error:
+        return _tool_error(provider_error)
     call_timeout = args.get("stall_timeout_seconds")
     try:
         reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
@@ -2397,7 +2472,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     }
     if requested_model:
         model_provenance, model_error = _verify_run_model_route(
-            profile, pcfg, requested_model,
+            profile, pcfg, requested_model, requested_provider,
         )
         if model_error:
             return _tool_error(model_error)
@@ -2463,6 +2538,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    transmit_provider = requested_provider or model_provenance.get("provider") or ""
+    if transmit_provider:
+        chat_body["provider"] = transmit_provider
     reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
     if reasoning_model_options is not None:
         chat_body["model_options"] = reasoning_model_options
@@ -4480,6 +4558,8 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 "alias": entry["id"].strip(),
                 "pass_as": entry["id"].strip(),
                 "resolved_model": entry["root"].strip(),
+                "provider": _entry_route_provider(entry),
+                "provider_pinned": bool(_entry_route_provider(entry)),
             }
             for entry in entries
             if isinstance(entry, dict)
@@ -4499,6 +4579,7 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         if not needle
         or needle in item["alias"].lower()
         or needle in item["resolved_model"].lower()
+        or needle in (item.get("provider") or "").lower()
     ]
     payload = {
         "profile": profile,
@@ -4511,11 +4592,14 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         "dispatchable_models": dispatchable,
         "dispatchable_model_count": len(dispatchable),
         "contract": (
-            "For dispatch_agent and dispatch_chat, copy one exact string from "
-            "pass_as_model into model=. Those are the target's model_routes "
-            "aliases. Do not add a provider prefix, do not pass "
-            "resolved_model, and do not pass advertised_primary.model as an "
-            "override. Omit model= to use the target default."
+            "For dispatch_agent and dispatch_chat, copy pass_as into model= "
+            "and, when provider is non-empty, copy provider into provider=. "
+            "If provider is empty the alias is unpinned: pass provider= "
+            "explicitly or the target may pick among configured providers "
+            "(including ones without a subscription). Do not add a provider "
+            "prefix to model=, do not pass resolved_model, and do not pass "
+            "advertised_primary.model as an override. Omit model= to use the "
+            "target default."
         ),
     }
     if query:
