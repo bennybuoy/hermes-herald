@@ -11,6 +11,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -230,12 +231,7 @@ def get_endpoint_config(endpoint: str) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(entry, dict):
         raise ValueError(f"hermes_herald.llm_direct.endpoints.{endpoint} must be a mapping.")
-    base_url = str(entry.get("base_url") or "").strip()
-    if not base_url.startswith(("http://", "https://")):
-        raise ValueError(
-            f"hermes_herald.llm_direct.endpoints.{endpoint}.base_url must be an "
-            f"explicit http(s) URL (got {base_url!r})."
-        )
+    base_url = _normalize_direct_base_url(entry.get("base_url"), endpoint)
     allowed = entry.get("allowed_models")
     if allowed is not None and (
         not isinstance(allowed, list) or not all(isinstance(m, str) for m in allowed)
@@ -244,18 +240,67 @@ def get_endpoint_config(endpoint: str) -> Optional[Dict[str, Any]]:
             f"hermes_herald.llm_direct.endpoints.{endpoint}.allowed_models must be a list of strings."
         )
     resolved = dict(entry)
-    raw_key = entry.get("api_key", "")
-    if isinstance(raw_key, str):
-        resolved["api_key"] = _resolve_env_var(raw_key)
+    resolved["base_url"] = base_url
+    resolved["api_key"] = _resolve_direct_api_key(entry.get("api_key"), endpoint)
+    return resolved
+
+
+def _normalize_direct_base_url(raw, endpoint: str) -> str:
+    """Return a credential-free absolute http(s) URL with a hostname."""
+    text = str(raw or "").strip()
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.base_url must be an "
+            f"explicit http(s) URL with a hostname (got {text!r})."
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.base_url must not "
+            "embed credentials."
+        )
+    host = parsed.hostname
+    hostpart = f"[{host}]" if ":" in host else host
+    if parsed.port:
+        hostpart = f"{hostpart}:{parsed.port}"
+    return f"{parsed.scheme}://{hostpart}{parsed.path}".rstrip("/")
+
+
+def _resolve_direct_api_key(raw, endpoint: str) -> str:
+    """Require a ${ENV_VAR} reference that resolves to a nonempty secret."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key must be a "
+            "${ENV_VAR} reference."
+        )
+    text = raw.strip()
+    match = _ENV_VAR_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key must be a "
+            "${ENV_VAR} reference, not a literal secret."
+        )
+    resolved = os.environ.get(match.group(1), "")
+    if not resolved:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key environment "
+            f"variable {match.group(1)} is unset or empty."
+        )
     return resolved
 
 
 def llm_direct_enabled() -> bool:
     """Return True when hermes_herald.llm_direct.enabled is true (opt-in gate)."""
-    return (_load_config().get("llm_direct") or {}).get("enabled") is True
+    section = _load_config().get("llm_direct")
+    if not isinstance(section, dict):
+        return False
+    return section.get("enabled") is True
 
 
 def get_default_direct_endpoint() -> str:
     """Return the configured default llm_direct endpoint name, or ''."""
-    raw = (_load_config().get("llm_direct") or {}).get("default_endpoint")
+    section = _load_config().get("llm_direct")
+    if not isinstance(section, dict):
+        return ""
+    raw = section.get("default_endpoint")
     return raw.strip() if isinstance(raw, str) else ""

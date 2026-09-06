@@ -1,10 +1,11 @@
 """Tool schemas and handlers for the Hermes Herald plugin.
 
-Eleven tools for cross-profile dispatch, local delegation, and bare inference:
+Twelve tools for cross-profile dispatch, local delegation, and bare inference:
   - dispatch_agent: POST /v1/runs (async, SSE callback or detached graph edge)
   - dispatch_chat: streaming POST /v1/chat/completions, sync session-persistent
   - delegate_subagent: in-process subagent with per-call model and timeout policy
   - llm_call: bare inference through Hermes provider routing
+  - llm_direct: opt-in direct OpenAI-compatible call to a configured endpoint
   - check_dispatch: GET /v1/runs/{run_id}, returns status
   - collect_dispatches: batch GET /v1/runs/{run_id} for multiple runs
   - dispatch_status: query durable SQLite calls and directed topology
@@ -178,10 +179,10 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Optional reasoning effort for this run, sent as "
                     "model_options.reasoning to the target. Omit to use the "
-                    "target's configured reasoning. 'none' disables thinking "
-                    "for this run; other values set the thinking budget. "
-                    "Targets ignore unknown levels silently; unsupported "
-                    "model/level combinations fail at request time."
+                    "target's configured reasoning. 'none' requests thinking "
+                    "off; other values request a thinking budget. The target "
+                    "host may ignore, clamp, or drop the request according to "
+                    "its own reasoning policy."
                 ),
             },
         },
@@ -349,13 +350,12 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
                 "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
                          "ultra", "none"],
                 "description": (
-                    "Optional per-call reasoning effort for this subagent. "
-                    "Omit to inherit the normal resolution order (core "
-                    "delegation.reasoning_effort config when set, otherwise "
-                    "the parent agent's level). 'none' disables thinking for "
-                    "this child; the other values set the thinking budget. "
-                    "Applies only when the target provider supports reasoning "
-                    "control; unsupported values fail noisily at request time."
+                    "Optional reasoning effort for this turn, sent as "
+                    "model_options.reasoning to the target. Omit to use the "
+                    "target's configured reasoning. 'none' requests thinking "
+                    "off; other values request a thinking budget. The target "
+                    "host may ignore, clamp, or drop the request according to "
+                    "its own reasoning policy."
                 ),
             },
             "stall_timeout_seconds": {
@@ -560,9 +560,10 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
                     "Optional per-call reasoning effort for this subagent. "
                     "Omit to inherit the normal resolution order (core "
                     "delegation.reasoning_effort config when set, otherwise "
-                    "the parent agent's level). 'none' disables thinking for "
-                    "this child; the other values set the thinking budget. "
-                    "Unsupported combinations fail noisily at request time."
+                    "the parent agent's level). 'none' requests thinking off; "
+                    "other values request a thinking budget. Herald assigns "
+                    "child.reasoning_config after build; the host may still "
+                    "clamp, drop, or substitute per its own reasoning policy."
                 ),
             },
             "inherit_toolsets": {
@@ -845,8 +846,11 @@ LLM_DIRECT_SCHEMA: Dict[str, Any] = {
                 "type": "object",
                 "description": (
                     "Vendor-specific request fields merged into the JSON body "
-                    "verbatim (e.g. top_k, repetition_penalty, logit_bias, "
-                    "prediction). Keys starting with '_' are rejected."
+                    "(e.g. top_k, repetition_penalty). Keys starting with '_' "
+                    "are rejected. Reserved OpenAI fields (model, messages, "
+                    "temperature, top_p, max_tokens, seed, stop, "
+                    "reasoning_effort, reasoning) must be set via the matching "
+                    "tool parameters, not extra_body."
                 ),
             },
             "timeout_seconds": {
@@ -1282,6 +1286,7 @@ def _migrate_legacy_run_history(state: dict) -> int:
             "requested_model": str(run.get("requested_model") or ""),
             "resolved_model": str(run.get("resolved_model") or run.get("model") or ""),
             "model_resolution": "legacy_state_cache",
+            "reasoning": str(run.get("reasoning") or ""),
             "status": str(run.get("status") or "unknown"),
             "output_preview": str(run.get("output_preview") or ""),
             "duration_seconds": run.get("duration_seconds"),
@@ -3355,7 +3360,10 @@ def _apply_reasoning_effort(child, reasoning_effort) -> None:
     the first request. The reasoning_config kwarg was already consumed into
     AIAgent state by _build_child_agent; per-request assembly reads the live
     attribute (agent/reasoning_params.py has no construction-time snapshot),
-    so the override takes effect for every child request.
+    so the override is visible to per-request assembly. Downstream host
+    policy (mandatory reasoning, length recovery, provider clamps) can still
+    drop or substitute the requested budget; Herald does not promise a
+    strict every-request guarantee against the host.
     """
     if reasoning_effort is None:
         return
@@ -4068,16 +4076,11 @@ def handle_llm_call(args: dict, **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ping_profile — health check tool
+# llm_direct — opt-in full-control endpoint tool
 # ---------------------------------------------------------------------------
 
 def handle_llm_direct(args: dict, **kwargs) -> str:
     """One direct OpenAI-compatible call to a configured endpoint, full control."""
-    import urllib.request as _urlreq
-    import urllib.error as _urlerr
-
-    from . import config as cfg
-
     if not cfg.llm_direct_enabled():
         return _tool_error(
             "llm_direct is disabled. Set hermes_herald.llm_direct.enabled: true "
@@ -4116,6 +4119,12 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
 
     base_url = str(endpoint["base_url"]).rstrip("/")
     api_key = str(endpoint.get("api_key") or "")
+    if not api_key:
+        return _tool_error(
+            f"Endpoint '{endpoint_name}' has no resolved api_key. "
+            "Set a nonempty ${ENV_VAR} reference in config."
+        )
+    secrets = (api_key,)
 
     model = (args.get("model") or endpoint.get("default_model") or "")
     if not isinstance(model, str) or not model.strip():
@@ -4123,12 +4132,9 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
             f"No model given and endpoint '{endpoint_name}' has no default_model."
         )
     model = model.strip()
-    allowed = endpoint.get("allowed_models")
-    if isinstance(allowed, list) and model not in allowed:
-        return _tool_error(
-            f"Model '{model}' is not in endpoint '{endpoint_name}' allowed_models. "
-            f"Allowed: {', '.join(allowed)}."
-        )
+    allow_error = _llm_direct_allowlist_error(endpoint_name, endpoint, model)
+    if allow_error:
+        return allow_error
 
     body: Dict[str, Any] = {"model": model, "messages": [dict(m) for m in messages]}
 
@@ -4170,6 +4176,8 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
             reasoning_config = _parse_subagent_reasoning_effort(reasoning_raw)
         except ValueError as e:
             return _tool_error(str(e))
+        if not isinstance(reasoning_config, dict):
+            return _tool_error("reasoning_effort could not be parsed.")
         if reasoning_config.get("enabled") is False:
             body["reasoning_effort"] = "none"
             body["reasoning"] = {"enabled": False}
@@ -4187,9 +4195,24 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
             return _tool_error(
                 f"'extra_body' keys starting with '_' are rejected: {', '.join(bad_keys)}"
             )
-        # Caller extra_body wins over the reasoning translation only for keys
-        # it actually sets; 'reasoning' from the caller replaces ours verbatim.
+        reserved = [
+            k for k in extra_body
+            if isinstance(k, str) and k in _LLM_DIRECT_RESERVED_BODY_KEYS
+        ]
+        if reserved:
+            return _tool_error(
+                "'extra_body' cannot override reserved fields: "
+                + ", ".join(sorted(reserved))
+                + ". Set those via the matching tool parameters."
+            )
         body.update(extra_body)
+
+    final_model = body.get("model")
+    if not isinstance(final_model, str) or not final_model.strip():
+        return _tool_error("Final request is missing a model.")
+    allow_error = _llm_direct_allowlist_error(endpoint_name, endpoint, final_model.strip())
+    if allow_error:
+        return allow_error
 
     timeout_seconds = args.get("timeout_seconds")
     if timeout_seconds is None:
@@ -4201,26 +4224,37 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
 
     url = f"{base_url}/chat/completions"
     data = json.dumps(body).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    req = _urlreq.Request(url, data=data, headers=headers, method="POST")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = Request(url, data=data, headers=headers, method="POST")
 
     start = time.monotonic()
     try:
-        with _urlreq.urlopen(req, timeout=timeout_seconds) as resp:
+        with urlopen(req, timeout=timeout_seconds) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-    except _urlerr.HTTPError as e:
+    except HTTPError as e:
         err_body = ""
         try:
             err_body = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             pass
-        return _tool_error(f"HTTP {e.code} from {url}: {err_body or e.reason}")
-    except _urlerr.URLError as e:
-        return _tool_error(f"Cannot reach {url}: {e.reason}")
+        return _tool_error(_redact_secrets(
+            f"HTTP {e.code} from endpoint '{endpoint_name}'"
+            + (f": {err_body}" if err_body else f": {e.reason}"),
+            secrets,
+        ))
+    except URLError as e:
+        return _tool_error(_redact_secrets(
+            f"Cannot reach endpoint '{endpoint_name}': {e.reason}",
+            secrets,
+        ))
     except Exception as e:
-        return _tool_error(f"llm_direct failed: {type(e).__name__}: {e}")
+        return _tool_error(_redact_secrets(
+            f"llm_direct failed: {type(e).__name__}",
+            secrets,
+        ))
     elapsed = round(time.monotonic() - start, 2)
 
     choices = payload.get("choices") if isinstance(payload, dict) else None
@@ -4234,27 +4268,50 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
     if not text.strip():
         err = payload.get("error") if isinstance(payload, dict) else None
         detail = err.get("message") if isinstance(err, dict) else ""
-        return _tool_error(
-            f"Empty completion from {url}."
-            + (f" Provider error: {detail}" if detail else "")
-        )
+        return _tool_error(_redact_secrets(
+            f"Empty completion from endpoint '{endpoint_name}'."
+            + (f" Provider error: {detail}" if detail else ""),
+            secrets,
+        ))
 
     raw_usage = payload.get("usage") if isinstance(payload, dict) else None
     usage = raw_usage if isinstance(raw_usage, dict) else {}
+    reported_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
 
     return json.dumps({
-        "text": text,
+        "text": _redact_secrets(text, secrets),
         "endpoint": endpoint_name,
-        "model": str(payload.get("model") or model),
+        "model": _redact_secrets(reported_model, secrets),
         "finish_reason": finish_reason,
         "usage": usage,
         "duration_seconds": elapsed,
     })
 
 
-# ---------------------------------------------------------------------------
-# ping_profile — health check tool
-# ---------------------------------------------------------------------------
+_LLM_DIRECT_RESERVED_BODY_KEYS = frozenset({
+    "model", "messages", "temperature", "top_p", "max_tokens", "seed", "stop",
+    "reasoning_effort", "reasoning",
+})
+
+
+def _redact_secrets(text: str, secrets) -> str:
+    """Strip resolved credentials from any string that might reach the caller."""
+    out = str(text or "")
+    for secret in secrets:
+        if secret:
+            out = out.replace(str(secret), "[redacted]")
+    return out
+
+
+def _llm_direct_allowlist_error(endpoint_name, endpoint, model: str):
+    allowed = endpoint.get("allowed_models")
+    if isinstance(allowed, list) and model not in allowed:
+        return _tool_error(
+            f"Model '{model}' is not in endpoint '{endpoint_name}' allowed_models. "
+            f"Allowed: {', '.join(allowed)}."
+        )
+    return None
+
 
 def handle_ping_profile(args: dict, **kwargs) -> str:
     """Check if a target Hermes profile's API server is reachable."""

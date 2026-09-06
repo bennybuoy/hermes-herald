@@ -251,6 +251,7 @@ def _row_to_dict(row: sqlite3.Row, include_messages: bool) -> dict:
         "requested_model": row["requested_model"],
         "resolved_model": row["resolved_model"],
         "model_resolution": row["model_resolution"],
+        "reasoning": str(row["reasoning"] or ""),
         "status": row["status"],
         "dispatched_at": row["dispatched_at"],
         "updated_at": row["updated_at"],

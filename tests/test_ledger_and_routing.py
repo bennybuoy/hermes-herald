@@ -349,3 +349,76 @@ def test_new_chat_sessions_use_unique_human_readable_titles(monkeypatch):
     assert titles[0].startswith("Dispatch to target · ")
     assert titles[1].startswith("Dispatch to target · ")
     assert titles[0] != titles[1]
+
+
+def test_list_dispatches_includes_reasoning(ledger_file):
+    _record(reasoning="high")
+    row = ledger.list_dispatches()[0]
+    assert row["reasoning"] == "high"
+
+
+def test_reasoning_column_migrates_from_older_schema(ledger_file):
+    import sqlite3
+    connection = sqlite3.connect(str(ledger_file))
+    connection.execute(
+        """
+        CREATE TABLE dispatches (
+            edge_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            origin_profile TEXT NOT NULL,
+            target_profile TEXT NOT NULL,
+            dispatch_type TEXT NOT NULL,
+            delivery TEXT NOT NULL,
+            message TEXT NOT NULL,
+            message_preview TEXT NOT NULL,
+            instructions TEXT NOT NULL DEFAULT '',
+            trace_id TEXT NOT NULL DEFAULT '',
+            parent_edge_id TEXT NOT NULL DEFAULT '',
+            hop_count INTEGER NOT NULL DEFAULT 1,
+            max_hops INTEGER,
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            requested_model TEXT NOT NULL DEFAULT '',
+            resolved_model TEXT NOT NULL DEFAULT '',
+            model_resolution TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            dispatched_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT '',
+            output_preview TEXT NOT NULL DEFAULT '',
+            duration_seconds REAL,
+            usage_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO dispatches (
+            edge_id, run_id, origin_profile, target_profile, dispatch_type,
+            delivery, message, message_preview, status, dispatched_at, updated_at
+        ) VALUES ('old-edge', 'old-run', 'origin', 'target', 'run', 'callback',
+                  'hello', 'hello', 'completed', 't0', 't0')
+        """
+    )
+    connection.commit()
+    connection.close()
+    ledger.preflight()
+    ledger.preflight()
+    row = ledger.list_dispatches()[0]
+    assert row["run_id"] == "old-run"
+    assert row["reasoning"] == ""
+
+
+def test_legacy_migration_copies_reasoning(ledger_file, monkeypatch):
+    monkeypatch.setattr(config, "get_active_profile_name", lambda: "origin")
+    state = {
+        "runs": [{
+            "run_id": "legacy-reason",
+            "profile": "target",
+            "message_preview": "preview",
+            "status": "completed",
+            "reasoning": "none",
+        }]
+    }
+    assert tools._migrate_legacy_run_history(state) == 1
+    row = ledger.list_dispatches()[0]
+    assert row["reasoning"] == "none"

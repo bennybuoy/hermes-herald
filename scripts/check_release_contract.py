@@ -21,11 +21,20 @@ def main() -> None:
     assert "- hermes-herald" in readme
 
     advertised = manifest["provides_tools"]
-    assert len(advertised) == 11
+    assert isinstance(advertised, list) and advertised
+    assert len(advertised) == len(set(advertised))
+    assert "llm_direct" in advertised
     for tool_name in advertised:
-        assert f'(\"{tool_name}\",' in init_source
+        assert f'("{tool_name}",' in init_source
+    count_line = f"hermes-herald: registered {len(advertised)} tools"
+    assert count_line in readme, f"README missing {count_line!r}"
+    heading = f"## The {len(advertised)} tools"
+    assert heading in readme, f"README missing {heading!r}"
 
-    print("release contract: OK (hermes-herald, 11 tools, opt-in documented)")
+    print(
+        f"release contract: OK (hermes-herald, {len(advertised)} tools, "
+        "opt-in documented)"
+    )
 
 
 if __name__ == "__main__":

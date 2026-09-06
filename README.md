@@ -166,7 +166,7 @@ re-copy it from the target's config before debugging further.
 Start a fresh origin session and look for:
 
 ```text
-hermes-herald: registered 11 tools
+hermes-herald: registered 12 tools
 ```
 
 Then verify reachability and authenticated model discovery:
@@ -388,7 +388,7 @@ delegate_subagent(
 )
 ```
 
-Omitted, the child keeps the normal resolution order (core `delegation.reasoning_effort` when configured, otherwise the parent's level). The override applies after the child is built via the same post-build seam as SOUL inheritance and takes effect on every child request; unsupported model/provider combinations fail noisily at request time rather than silently substituting a different level.
+Omitted, the child keeps the normal resolution order (core `delegation.reasoning_effort` when configured, otherwise the parent's level). Herald assigns `child.reasoning_config` after build via the same post-build seam as SOUL inheritance. Downstream host policy can still clamp, drop, or substitute the requested budget (mandatory-reasoning rejection, length recovery, provider limits); do not treat the parameter as a strict every-request guarantee against the host.
 
 ---
 
@@ -440,9 +440,38 @@ the host call; policy or provider failures are returned noisily without a
 Herald-side retry. Results expose the requested pair alongside the provider and
 model reported by the host facade.
 
+`llm_direct` is a separate, **opt-in** research lane. It does not use host
+routing. Endpoints are named in config (`hermes_herald.llm_direct.enabled: true`,
+explicit `http(s)` `base_url`, `api_key: ${ENV_VAR}` only). The tool never
+accepts a URL or credential as an argument. `extra_body` is for vendor-specific
+fields only — reserved OpenAI fields must go through the matching parameters.
+Redirects are refused so a bearer token cannot follow a 3xx to another origin.
+
+```yaml
+hermes_herald:
+  llm_direct:
+    enabled: true
+    default_endpoint: lab
+    endpoints:
+      lab:
+        base_url: https://llm.example.com/v1
+        api_key: ${LAB_API_KEY}
+        default_model: lab-model
+        allowed_models: [lab-model]
+```
+
+```python
+llm_direct(
+    messages=[{"role": "user", "content": "Reply with the single word OK"}],
+    temperature=0,
+    seed=7,
+    extra_body={"top_k": 40},
+)
+```
+
 ---
 
-## The 11 tools
+## The 12 tools
 
 | Tool | Purpose |
 |---|---|
@@ -450,6 +479,7 @@ model reported by the host facade.
 | `dispatch_agent` | Async cross-profile run with callback or detached delivery |
 | `delegate_subagent` | In-process child with per-call model and inheritance controls |
 | `llm_call` | Bare model inference without an agent loop |
+| `llm_direct` | Opt-in direct OpenAI-compatible call to a pre-configured endpoint (full parameter control; credentials stay in config) |
 | `check_dispatch` | Query one target run using its exact `{profile, run_id}` |
 | `collect_dispatches` | Query several run handles in one call |
 | `dispatch_status` | Read durable call history and credential-free configured/observed topology |

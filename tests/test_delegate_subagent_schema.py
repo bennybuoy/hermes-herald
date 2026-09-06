@@ -301,9 +301,10 @@ def test_reasoning_effort_applies_after_build_and_noop_when_omitted():
 
     tools._apply_reasoning_effort(child, {"enabled": False})
     assert child.reasoning_config == {"enabled": False}
-    # The override writes a private copy, so later caller-side mutation of the
-    # parsed dict cannot leak into the child.
-    assert tools._parse_subagent_reasoning_effort("low") is not child.reasoning_config
+    parsed = {"enabled": True, "effort": "low"}
+    tools._apply_reasoning_effort(child, parsed)
+    parsed["effort"] = "ultra"
+    assert child.reasoning_config == {"enabled": True, "effort": "low"}
 
 
 def test_subagent_schema_exposes_reasoning_effort_contract():
