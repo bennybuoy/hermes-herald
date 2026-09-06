@@ -171,6 +171,19 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                     "hermes_herald profile config."
                 ),
             },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional reasoning effort for this run, sent as "
+                    "model_options.reasoning to the target. Omit to use the "
+                    "target's configured reasoning. 'none' disables thinking "
+                    "for this run; other values set the thinking budget. "
+                    "Targets ignore unknown levels silently; unsupported "
+                    "model/level combinations fail at request time."
+                ),
+            },
         },
         "required": ["profile", "message"],
     },
@@ -746,6 +759,108 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
 }
 
 
+LLM_DIRECT_SCHEMA: Dict[str, Any] = {
+    "name": "llm_direct",
+    "description": (
+        "Call a pre-configured OpenAI-compatible endpoint directly with FULL "
+        "parameter control — model, temperature, top_p, max_tokens, seed, stop "
+        "sequences, reasoning effort, and an extra_body passthrough for "
+        "vendor-specific fields. For LLM research and benchmarking where the "
+        "host-managed llm_call route is too constrained. Endpoints are named "
+        "in hermes_herald.llm_direct config (opt-in); credentials never ride "
+        "the tool call. Returns text, usage, and the provider-reported model."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "endpoint": {
+                "type": "string",
+                "description": (
+                    "Endpoint name from hermes_herald.llm_direct.endpoints "
+                    "config. Omit to use llm_direct.default_endpoint."
+                ),
+            },
+            "messages": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["system", "user", "assistant"],
+                        },
+                        "content": {"type": "string"},
+                    },
+                    "required": ["role", "content"],
+                },
+                "description": "Chat messages: [{role, content}].",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model id sent verbatim to the endpoint (no route "
+                    "aliasing). Omit to use the endpoint's default_model."
+                ),
+            },
+            "temperature": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Sampling temperature (0-2). Omit for endpoint default.",
+            },
+            "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Nucleus sampling mass (0-1). Omit for endpoint default.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum generated tokens. Omit for endpoint default.",
+            },
+            "seed": {
+                "type": "integer",
+                "description": "Deterministic sampling seed where supported.",
+            },
+            "stop": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 4,
+                "description": "Up to 4 stop sequences.",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Reasoning effort: sent as reasoning_effort (OpenAI-style) "
+                    "plus extra_body.reasoning for provider profiles that "
+                    "read it. 'none' maps to reasoning_effort 'none'. Omit "
+                    "for endpoint default."
+                ),
+            },
+            "extra_body": {
+                "type": "object",
+                "description": (
+                    "Vendor-specific request fields merged into the JSON body "
+                    "verbatim (e.g. top_k, repetition_penalty, logit_bias, "
+                    "prediction). Keys starting with '_' are rejected."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 600,
+                "description": "HTTP timeout (default 120, max 600).",
+            },
+        },
+        "required": ["messages"],
+    },
+}
+
+
 ALL_SCHEMAS = [
     DISPATCH_AGENT_SCHEMA,
     CHECK_DISPATCH_SCHEMA,
@@ -755,6 +870,7 @@ ALL_SCHEMAS = [
     CANCEL_DISPATCH_SCHEMA,
     DELEGATE_SUBAGENT_SCHEMA,
     LLM_CALL_SCHEMA,
+    LLM_DIRECT_SCHEMA,
     PING_PROFILE_SCHEMA,
     APPROVE_DISPATCH_SCHEMA,
     LIST_PROFILE_MODELS_SCHEMA,
@@ -1249,6 +1365,7 @@ def _persist_run(
     requested_model: str = "",
     resolved_model: str = "",
     model_resolution: str = "",
+    reasoning: str = "",
     edge_id: str = "",
     trace_id: str = "",
     parent_edge_id: str = "",
@@ -1280,6 +1397,7 @@ def _persist_run(
             "requested_model": requested_model or "",
             "resolved_model": resolved_model or "",
             "model_resolution": model_resolution or "",
+            "reasoning": reasoning or "",
             "edge_id": edge_id,
             "trace_id": trace_id,
             "parent_edge_id": parent_edge_id,
@@ -1751,6 +1869,10 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     parent_edge_id = args.get("parent_edge_id", "")
     parent_hop = args.get("parent_hop", 0)
     max_hops = args.get("max_hops")
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
 
     if not profile:
         return _tool_error("'profile' is required.")
@@ -1837,6 +1959,9 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
         # Send the exact verified alias. Sending the resolved root would miss
         # Hermes' exact alias lookup and silently select the target default.
         body["model"] = requested_model
+    reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
+    if reasoning_model_options is not None:
+        body["model_options"] = reasoning_model_options
 
     try:
         result = _post_json(
@@ -1870,6 +1995,13 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     # the origin before starting a background listener because ContextVars do
     # not necessarily survive arbitrary callback threads.
     resolved_model = route_resolution.get("resolved_model", "")
+    reasoning_label = ""
+    if reasoning_effort is not None:
+        reasoning_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
     from .callback import capture_session_routing
 
     routing = capture_session_routing(kwargs.get("parent_agent"))
@@ -1886,6 +2018,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             requested_model=requested_model,
             resolved_model=resolved_model,
             model_resolution=route_resolution.get("resolution_source", ""),
+            reasoning=reasoning_label,
             edge_id=edge_id,
             trace_id=trace_id,
             parent_edge_id=parent_edge_id,
@@ -1915,6 +2048,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             requested_model=requested_model,
             resolved_model=resolved_model,
             model_resolution=route_resolution.get("resolution_source", ""),
+            reasoning=reasoning_label,
         )
     except Exception as exc:
         logger.error("Remote run %s started but ledger insert failed: %s", run_id, exc)
@@ -2215,6 +2349,10 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     new_session = args.get("new_session", False)
     model_override = args.get("model")
     call_timeout = args.get("stall_timeout_seconds")
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
 
     if not profile:
         return _tool_error("'profile' is required.")
@@ -2307,6 +2445,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
+    if reasoning_model_options is not None:
+        chat_body["model_options"] = reasoning_model_options
 
     parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
     parent_progress = getattr(parent_agent, "tool_progress_callback", None)
@@ -2362,6 +2503,14 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
 
     usage = result.get("usage", {})
 
+    reasoning_label = ""
+    if reasoning_effort is not None:
+        reasoning_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
+
     # Record bounded recovery state plus the durable full-text call ledger.
     chat_record_id = f"chat-{uuid.uuid4().hex}"
     edge_id = uuid.uuid4().hex
@@ -2379,6 +2528,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 "requested_model": model_provenance["requested_model"],
                 "resolved_model": model_provenance["resolved_model"],
                 "model_resolution": model_provenance["resolution_source"],
+                "reasoning": reasoning_label,
                 "status": "completed",
                 "completed_at": _utc_now_iso(),
                 "duration_seconds": None,
@@ -2414,6 +2564,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             requested_model=model_provenance["requested_model"],
             resolved_model=model_provenance["resolved_model"],
             model_resolution=model_provenance["resolution_source"],
+            reasoning=reasoning_label,
         )
     except Exception as exc:
         logger.error("Chat completed but ledger insert failed: %s", exc)
@@ -3220,6 +3371,30 @@ def _apply_reasoning_effort(child, reasoning_effort) -> None:
 
 
 _INHERITED_CONTEXT_MESSAGE_LIMIT = 20
+
+
+def _remote_reasoning_model_options(reasoning_effort) -> Optional[Dict[str, Any]]:
+    """Translate a parsed reasoning_config into the target API's model_options shape.
+
+    Both remote dispatch surfaces (/v1/runs and /v1/chat/completions) accept
+    ``model_options.reasoning.{enabled, effort}`` (api_server._request_reasoning_config);
+    the structured form takes precedence over the legacy reasoning_effort key.
+    Unknown levels are ignored by the target (never raised), so no level
+    validation happens here beyond what the parser already did.
+    Returns None when no override was requested.
+    """
+    if reasoning_effort is None:
+        return None
+    if reasoning_effort.get("enabled") is False:
+        return {"reasoning": {"enabled": False}}
+    return {
+        "reasoning": {
+            "enabled": True,
+            "effort": str(reasoning_effort.get("effort") or "medium"),
+        }
+    }
+
+
 _INHERITED_CONTEXT_CHAR_LIMIT = 12_000
 _NO_TOOLSETS_SENTINEL = "__herald_model_only__"
 
@@ -3889,6 +4064,191 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         "requested_model": model_override or "",
         "model": str(getattr(result, "model", "") or ""),
         "usage": usage,
+    })
+
+
+# ---------------------------------------------------------------------------
+# ping_profile — health check tool
+# ---------------------------------------------------------------------------
+
+def handle_llm_direct(args: dict, **kwargs) -> str:
+    """One direct OpenAI-compatible call to a configured endpoint, full control."""
+    import urllib.request as _urlreq
+    import urllib.error as _urlerr
+
+    from . import config as cfg
+
+    if not cfg.llm_direct_enabled():
+        return _tool_error(
+            "llm_direct is disabled. Set hermes_herald.llm_direct.enabled: true "
+            "in config.yaml to opt in."
+        )
+
+    messages = args.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return _tool_error("'messages' is required (list of {role, content} objects).")
+    for index, message in enumerate(messages):
+        if (
+            not isinstance(message, dict)
+            or message.get("role") not in {"system", "user", "assistant"}
+            or not isinstance(message.get("content"), str)
+        ):
+            return _tool_error(
+                f"messages[{index}] must be an object with role "
+                "(system/user/assistant) and string content."
+            )
+
+    endpoint_name = (args.get("endpoint") or cfg.get_default_direct_endpoint() or "").strip()
+    if not endpoint_name:
+        return _tool_error(
+            "No endpoint given and hermes_herald.llm_direct.default_endpoint "
+            "is not set. Name one endpoint from llm_direct.endpoints."
+        )
+    try:
+        endpoint = cfg.get_endpoint_config(endpoint_name)
+    except ValueError as e:
+        return _tool_error(str(e))
+    if endpoint is None:
+        return _tool_error(
+            f"Endpoint '{endpoint_name}' is not configured under "
+            "hermes_herald.llm_direct.endpoints."
+        )
+
+    base_url = str(endpoint["base_url"]).rstrip("/")
+    api_key = str(endpoint.get("api_key") or "")
+
+    model = (args.get("model") or endpoint.get("default_model") or "")
+    if not isinstance(model, str) or not model.strip():
+        return _tool_error(
+            f"No model given and endpoint '{endpoint_name}' has no default_model."
+        )
+    model = model.strip()
+    allowed = endpoint.get("allowed_models")
+    if isinstance(allowed, list) and model not in allowed:
+        return _tool_error(
+            f"Model '{model}' is not in endpoint '{endpoint_name}' allowed_models. "
+            f"Allowed: {', '.join(allowed)}."
+        )
+
+    body: Dict[str, Any] = {"model": model, "messages": [dict(m) for m in messages]}
+
+    temperature = args.get("temperature")
+    if temperature is not None:
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not 0.0 <= float(temperature) <= 2.0:
+            return _tool_error("'temperature' must be a number from 0.0 to 2.0.")
+        body["temperature"] = float(temperature)
+    top_p = args.get("top_p")
+    if top_p is not None:
+        if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) \
+                or not 0.0 <= float(top_p) <= 1.0:
+            return _tool_error("'top_p' must be a number from 0.0 to 1.0.")
+        body["top_p"] = float(top_p)
+    max_tokens = args.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+            return _tool_error("'max_tokens' must be a positive integer.")
+        body["max_tokens"] = max_tokens
+    seed = args.get("seed")
+    if seed is not None:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            return _tool_error("'seed' must be an integer.")
+        body["seed"] = seed
+    stop = args.get("stop")
+    if stop is not None:
+        if (
+            not isinstance(stop, list)
+            or len(stop) > 4
+            or not all(isinstance(s, str) and s for s in stop)
+        ):
+            return _tool_error("'stop' must be a list of up to 4 non-empty strings.")
+        body["stop"] = stop
+
+    reasoning_raw = args.get("reasoning_effort")
+    if reasoning_raw is not None:
+        try:
+            reasoning_config = _parse_subagent_reasoning_effort(reasoning_raw)
+        except ValueError as e:
+            return _tool_error(str(e))
+        if reasoning_config.get("enabled") is False:
+            body["reasoning_effort"] = "none"
+            body["reasoning"] = {"enabled": False}
+        else:
+            effort = str(reasoning_config.get("effort") or "medium")
+            body["reasoning_effort"] = effort
+            body["reasoning"] = {"enabled": True, "effort": effort}
+
+    extra_body = args.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            return _tool_error("'extra_body' must be an object.")
+        bad_keys = [k for k in extra_body if isinstance(k, str) and k.startswith("_")]
+        if bad_keys:
+            return _tool_error(
+                f"'extra_body' keys starting with '_' are rejected: {', '.join(bad_keys)}"
+            )
+        # Caller extra_body wins over the reasoning translation only for keys
+        # it actually sets; 'reasoning' from the caller replaces ours verbatim.
+        body.update(extra_body)
+
+    timeout_seconds = args.get("timeout_seconds")
+    if timeout_seconds is None:
+        timeout_seconds = 120.0
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) \
+            or not 1.0 <= float(timeout_seconds) <= 600.0:
+        return _tool_error("'timeout_seconds' must be a number from 1 to 600.")
+    timeout_seconds = float(timeout_seconds)
+
+    url = f"{base_url}/chat/completions"
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = _urlreq.Request(url, data=data, headers=headers, method="POST")
+
+    start = time.monotonic()
+    try:
+        with _urlreq.urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except _urlerr.HTTPError as e:
+        err_body = ""
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        return _tool_error(f"HTTP {e.code} from {url}: {err_body or e.reason}")
+    except _urlerr.URLError as e:
+        return _tool_error(f"Cannot reach {url}: {e.reason}")
+    except Exception as e:
+        return _tool_error(f"llm_direct failed: {type(e).__name__}: {e}")
+    elapsed = round(time.monotonic() - start, 2)
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    text = ""
+    finish_reason = ""
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message_obj = choices[0].get("message")
+        if isinstance(message_obj, dict) and isinstance(message_obj.get("content"), str):
+            text = message_obj["content"]
+        finish_reason = str(choices[0].get("finish_reason") or "")
+    if not text.strip():
+        err = payload.get("error") if isinstance(payload, dict) else None
+        detail = err.get("message") if isinstance(err, dict) else ""
+        return _tool_error(
+            f"Empty completion from {url}."
+            + (f" Provider error: {detail}" if detail else "")
+        )
+
+    raw_usage = payload.get("usage") if isinstance(payload, dict) else None
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
+
+    return json.dumps({
+        "text": text,
+        "endpoint": endpoint_name,
+        "model": str(payload.get("model") or model),
+        "finish_reason": finish_reason,
+        "usage": usage,
+        "duration_seconds": elapsed,
     })
 
 

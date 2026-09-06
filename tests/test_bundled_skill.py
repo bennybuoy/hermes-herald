@@ -33,7 +33,7 @@ def test_plugin_registers_all_tools_and_bundled_skill():
 
     plugin.register(ctx)
 
-    assert ctx.register_tool.call_count == 11
+    assert ctx.register_tool.call_count == 12
     ctx.register_skill.assert_called_once_with("agent-dispatch", SKILL_PATH)
 
 
