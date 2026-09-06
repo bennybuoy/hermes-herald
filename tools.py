@@ -80,7 +80,9 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
         "dispatch_status and check_dispatch to recover and poll known runs. "
         "Multiple dispatches can be issued in one turn for parallel execution. "
         "For synchronous multi-turn conversations with session persistence, "
-        "use dispatch_chat instead."
+        "use dispatch_chat instead. Before passing model=, call "
+        "list_profile_models(profile=<target>) and copy one string from "
+        "pass_as_model; guessed or provider-prefixed slugs fail closed."
     ),
     "parameters": {
         "type": "object",
@@ -163,13 +165,12 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional target model_routes alias for this run. The "
-                    "plugin verifies the exact alias through the target's "
-                    "authenticated /v1/models endpoint before starting the "
-                    "task. Arbitrary model names and unverifiable aliases "
-                    "fail closed; omit this field to use the target profile's "
-                    "default runtime. Overrides a model alias set in the "
-                    "hermes_herald profile config."
+                    "Exact alias copied from list_profile_models("
+                    "profile=<this profile>).pass_as_model. Call that tool "
+                    "first when overriding the target default. Do not invent "
+                    "slugs, do not add a provider prefix, and do not pass "
+                    "advertised_primary.model. Omit this field to use the "
+                    "target's default runtime."
                 ),
             },
             "reasoning_effort": {
@@ -339,10 +340,11 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional model_routes alias advertised by the "
-                    "target's authenticated /v1/models endpoint. Herald "
-                    "verifies the alias before sending. Omit to use the "
-                    "target profile's default runtime."
+                    "Exact alias copied from list_profile_models("
+                    "profile=<this profile>).pass_as_model. Call that tool "
+                    "first when overriding the target default. Do not invent "
+                    "slugs or add a provider prefix. Omit to use the target "
+                    "profile's default runtime."
                 ),
             },
             "reasoning_effort": {
@@ -738,12 +740,14 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
     "name": "list_profile_models",
     "description": (
         "Discover exact fail-closed model routes before inference or dispatch. "
-        "Omit profile to list only provider/model routes explicitly configured "
-        "for this calling profile. Prefer configured_default; choose another "
-        "exact pair only when the task explicitly needs an override. Supply "
-        "profile to query a target's authenticated model_routes aliases for "
-        "dispatch_agent. Ambient credentials and unconfigured fallback providers "
-        "are excluded from local results."
+        "Omit profile to list this calling profile's llm_call provider/model "
+        "pairs. Supply profile to list the target's dispatch aliases — the "
+        "only strings allowed in dispatch_agent/dispatch_chat model=. Copy "
+        "one value from pass_as_model; advertised_primary.model is the default "
+        "when you omit model, not a valid override. Optional query filters "
+        "aliases by substring when the same model exists under several names. "
+        "Ambient credentials and unconfigured fallback providers are excluded "
+        "from local results."
     ),
     "parameters": {
         "type": "object",
@@ -753,6 +757,15 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Optional target name from hermes_herald.profiles. Omit for "
                     "the calling profile's exact local llm_call routes."
+                ),
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional substring filter on alias or resolved_model "
+                    "(case-insensitive). Use when several aliases exist for "
+                    "similar models. Matches are listed separately; pass_as_model "
+                    "always contains the full exact-alias list."
                 ),
             },
         },
@@ -1840,10 +1853,10 @@ def _verify_run_model_route(
         reason = "it is not an exact configured model_routes alias"
     return {}, (
         f"Model override '{requested_model}' is not supported for {profile}: "
-        f"{reason}. Available route aliases: {available_text}. Configure an "
-        f"exact platforms.api_server.extra.model_routes alias on the target, "
-        f"pass one of the available aliases, or omit model to use the target "
-        f"default. No task was started."
+        f"{reason}. pass_as_model: {available_text}. Call "
+        f"list_profile_models(profile={profile!r}) and copy one exact alias "
+        f"from pass_as_model into model=. Do not add a provider prefix. "
+        f"Omit model to use the target default. No task was started."
     )
 
 
@@ -4377,6 +4390,9 @@ def handle_ping_profile(args: dict, **kwargs) -> str:
 def handle_list_profile_models(args: dict, **kwargs) -> str:
     """Return exact local llm_call routes or remote dispatch aliases."""
     profile = args.get("profile", "").strip()
+    query = args.get("query", "")
+    query = query.strip() if isinstance(query, str) else ""
+    needle = query.lower()
     if not profile:
         try:
             from agent import auxiliary_client as auxiliary
@@ -4399,7 +4415,13 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
             ),
             key=lambda route: (route["provider"], route["model"]),
         )
-        return json.dumps({
+        matches = [
+            route for route in routes
+            if not needle
+            or needle in route["provider"].lower()
+            or needle in route["model"].lower()
+        ]
+        payload = {
             "scope": "local",
             "configured_default": inventory["configured_default"],
             "available_routes": routes,
@@ -4408,9 +4430,16 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 "Prefer configured_default when it is present. Only when the task explicitly needs "
                 "an override, pass one exact available_routes provider/model pair "
                 "to llm_call. Unlisted pairs are rejected before the host call; "
-                "Hermes trust and provider-routing policy remain authoritative."
+                "Hermes trust and provider-routing policy remain authoritative. "
+                "When the same model appears on several providers, copy the "
+                "exact pair — do not pass a bare model name."
             ),
-        })
+        }
+        if query:
+            payload["query"] = query
+            payload["matches"] = matches
+            payload["match_count"] = len(matches)
+        return json.dumps(payload)
 
     pcfg, err = _resolve_profile(profile)
     if err:
@@ -4449,6 +4478,7 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         (
             {
                 "alias": entry["id"].strip(),
+                "pass_as": entry["id"].strip(),
                 "resolved_model": entry["root"].strip(),
             }
             for entry in entries
@@ -4463,13 +4493,34 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         key=lambda item: item["alias"],
     )
     default_model = primary["id"].strip() if primary else ""
-    return json.dumps({
+    pass_as_model = [item["pass_as"] for item in dispatchable]
+    matches = [
+        item for item in dispatchable
+        if not needle
+        or needle in item["alias"].lower()
+        or needle in item["resolved_model"].lower()
+    ]
+    payload = {
         "profile": profile,
         "advertised_primary": {
             "model": default_model,
             "dispatchable_as_override": False,
             "is_runtime_evidence": False,
         },
+        "pass_as_model": pass_as_model,
         "dispatchable_models": dispatchable,
         "dispatchable_model_count": len(dispatchable),
-    })
+        "contract": (
+            "For dispatch_agent and dispatch_chat, copy one exact string from "
+            "pass_as_model into model=. Those are the target's model_routes "
+            "aliases. Do not add a provider prefix, do not pass "
+            "resolved_model, and do not pass advertised_primary.model as an "
+            "override. Omit model= to use the target default."
+        ),
+    }
+    if query:
+        payload["query"] = query
+        payload["matches"] = matches
+        payload["match_count"] = len(matches)
+        payload["match_pass_as"] = [item["pass_as"] for item in matches]
+    return json.dumps(payload)
