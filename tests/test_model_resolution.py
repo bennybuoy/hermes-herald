@@ -161,7 +161,7 @@ class TestLocalModelRouteDiscovery:
             {"provider": "ollama-cloud", "model": "glm-5.2"},
         ]
         assert result["route_count"] == 4
-        assert "provider-routing policy remain authoritative" in result["contract"]
+        assert "do not pass a bare model name" in result["contract"]
         assert captured["explicit_only"] is True
         assert captured["include_unconfigured"] is False
 
@@ -187,6 +187,7 @@ class TestLocalModelRouteDiscovery:
                         "id": "review-fast",
                         "root": "glm-5.2",
                         "parent": "glm-5.2",
+                        "provider": "nous",
                     },
                 ]
             }
@@ -201,17 +202,34 @@ class TestLocalModelRouteDiscovery:
             "api_key": "remote-secret",
             "timeout": 10.0,
         }
-        assert result == {
-            "profile": "reviewer",
-            "advertised_primary": {
-                "model": "glm-5.2",
-                "dispatchable_as_override": False,
-                "is_runtime_evidence": False,
-            },
-            "dispatchable_models": [{
-                "alias": "review-fast",
-                "resolved_model": "glm-5.2",
-            }],
-            "dispatchable_model_count": 1,
+        assert result["profile"] == "reviewer"
+        assert result["advertised_primary"] == {
+            "model": "glm-5.2",
+            "dispatchable_as_override": False,
+            "is_runtime_evidence": False,
         }
+        assert result["pass_as_model"] == ["review-fast"]
+        assert result["dispatchable_models"] == [{
+            "alias": "review-fast",
+            "pass_as": "review-fast",
+            "resolved_model": "glm-5.2",
+            "provider": "nous",
+            "provider_pinned": True,
+        }]
+        assert result["dispatchable_model_count"] == 1
+        assert "pass provider=" in result["contract"]
         assert "remote-secret" not in raw
+
+        queried = json.loads(tools.handle_list_profile_models({
+            "profile": "reviewer", "query": "review",
+        }))
+        assert queried["query"] == "review"
+        assert queried["match_pass_as"] == ["review-fast"]
+        assert queried["pass_as_model"] == ["review-fast"]
+
+        missed = json.loads(tools.handle_list_profile_models({
+            "profile": "reviewer", "query": "astra",
+        }))
+        assert missed["match_count"] == 0
+        assert missed["match_pass_as"] == []
+        assert missed["pass_as_model"] == ["review-fast"]

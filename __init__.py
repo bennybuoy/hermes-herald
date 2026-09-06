@@ -7,6 +7,8 @@ Three dispatch modes:
 
 Inference:
   - llm_call: bare LLM call through Hermes provider routing
+  - llm_direct: full-control direct call to a configured OpenAI-compatible
+    endpoint (opt-in; research/benchmarking)
 
 Plus management tools:
   - check_dispatch: GET /v1/runs/{run_id}, polls a single run
@@ -25,6 +27,15 @@ Config (config.yaml):
         api_key: ${REVIEWER_API_KEY}
         model: reviewer-fast  # optional exact model_routes alias for both dispatch tools
     state_file: /custom/private/path/hermes-herald-runs.json  # optional
+    llm_direct:                # optional; disabled until enabled: true
+      enabled: true
+      default_endpoint: nous
+      endpoints:
+        nous:
+          base_url: https://api.nousresearch.com/v1
+          api_key: ${NOUS_API_KEY}
+          default_model: fable-1
+          allowed_models: [fable-1]   # optional
 """
 
 from __future__ import annotations
@@ -42,6 +53,7 @@ from .tools import (
     handle_cancel_dispatch,
     handle_delegate_subagent,
     handle_llm_call,
+    handle_llm_direct,
     handle_ping_profile,
     handle_approve_dispatch,
     handle_list_profile_models,
@@ -58,9 +70,10 @@ _TOOLS = (
     ("cancel_dispatch", ALL_SCHEMAS[5], handle_cancel_dispatch, "🛑"),
     ("delegate_subagent", ALL_SCHEMAS[6], handle_delegate_subagent, "🔀"),
     ("llm_call", ALL_SCHEMAS[7], handle_llm_call, "🧠"),
-    ("ping_profile", ALL_SCHEMAS[8], handle_ping_profile, "📶"),
-    ("approve_dispatch", ALL_SCHEMAS[9], handle_approve_dispatch, "✅"),
-    ("list_profile_models", ALL_SCHEMAS[10], handle_list_profile_models, "🧭"),
+    ("llm_direct", ALL_SCHEMAS[8], handle_llm_direct, "🔬"),
+    ("ping_profile", ALL_SCHEMAS[9], handle_ping_profile, "📶"),
+    ("approve_dispatch", ALL_SCHEMAS[10], handle_approve_dispatch, "✅"),
+    ("list_profile_models", ALL_SCHEMAS[11], handle_list_profile_models, "🧭"),
 )
 
 
@@ -80,7 +93,7 @@ def register(ctx) -> None:
     logger.info(
         "hermes-herald: registered %d tools (dispatch_agent, check_dispatch, "
         "collect_dispatches, dispatch_status, dispatch_chat, cancel_dispatch, "
-        "delegate_subagent, llm_call, ping_profile, approve_dispatch, "
+        "delegate_subagent, llm_call, llm_direct, ping_profile, approve_dispatch, "
         "list_profile_models)",
         len(_TOOLS),
     )

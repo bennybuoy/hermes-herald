@@ -1,10 +1,11 @@
 """Tool schemas and handlers for the Hermes Herald plugin.
 
-Eleven tools for cross-profile dispatch, local delegation, and bare inference:
+Twelve tools for cross-profile dispatch, local delegation, and bare inference:
   - dispatch_agent: POST /v1/runs (async, SSE callback or detached graph edge)
   - dispatch_chat: streaming POST /v1/chat/completions, sync session-persistent
   - delegate_subagent: in-process subagent with per-call model and timeout policy
   - llm_call: bare inference through Hermes provider routing
+  - llm_direct: opt-in direct OpenAI-compatible call to a configured endpoint
   - check_dispatch: GET /v1/runs/{run_id}, returns status
   - collect_dispatches: batch GET /v1/runs/{run_id} for multiple runs
   - dispatch_status: query durable SQLite calls and directed topology
@@ -24,6 +25,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import time
 import tempfile
@@ -79,7 +81,9 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
         "dispatch_status and check_dispatch to recover and poll known runs. "
         "Multiple dispatches can be issued in one turn for parallel execution. "
         "For synchronous multi-turn conversations with session persistence, "
-        "use dispatch_chat instead."
+        "use dispatch_chat instead. Before passing model=, call "
+        "list_profile_models(profile=<target>) and copy one string from "
+        "pass_as_model; guessed or provider-prefixed slugs fail closed."
     ),
     "parameters": {
         "type": "object",
@@ -162,13 +166,36 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional target model_routes alias for this run. The "
-                    "plugin verifies the exact alias through the target's "
-                    "authenticated /v1/models endpoint before starting the "
-                    "task. Arbitrary model names and unverifiable aliases "
-                    "fail closed; omit this field to use the target profile's "
-                    "default runtime. Overrides a model alias set in the "
-                    "hermes_herald profile config."
+                    "Exact alias copied from list_profile_models("
+                    "profile=<this profile>).pass_as_model. Call that tool "
+                    "first when overriding the target default. Do not invent "
+                    "slugs, do not add a provider prefix, and do not pass "
+                    "advertised_primary.model. Omit this field to use the "
+                    "target's default runtime."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional target provider slug copied from "
+                    "list_profile_models(profile=<this profile>) "
+                    "dispatchable_models[].provider. Required to pin a "
+                    "subscription when the same model exists on more than one "
+                    "provider and the alias is unpinned. If the alias already "
+                    "pins a provider, this must match it."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional reasoning effort for this run, sent as "
+                    "model_options.reasoning to the target. Omit to use the "
+                    "target's configured reasoning. 'none' requests thinking "
+                    "off; other values request a thinking budget. The target "
+                    "host may ignore, clamp, or drop the request according to "
+                    "its own reasoning policy."
                 ),
             },
         },
@@ -325,10 +352,33 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional exact model_routes alias advertised by the "
-                    "target's authenticated /v1/models endpoint. Herald "
-                    "verifies the alias before sending. Omit to use the "
-                    "target profile's default runtime."
+                    "Exact alias copied from list_profile_models("
+                    "profile=<this profile>).pass_as_model. Call that tool "
+                    "first when overriding the target default. Do not invent "
+                    "slugs or add a provider prefix. Omit to use the target "
+                    "profile's default runtime."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional target provider slug copied from "
+                    "list_profile_models(profile=<this profile>) "
+                    "dispatchable_models[].provider. Pin this when the same "
+                    "model exists on more than one provider."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional reasoning effort for this turn, sent as "
+                    "model_options.reasoning to the target. Omit to use the "
+                    "target's configured reasoning. 'none' requests thinking "
+                    "off; other values request a thinking budget. The target "
+                    "host may ignore, clamp, or drop the request according to "
+                    "its own reasoning policy."
                 ),
             },
             "stall_timeout_seconds": {
@@ -454,7 +504,10 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
         "the parent's, the subagent gets fresh credentials for that provider. "
         "If it's the same provider/aggregator, credentials are inherited. "
         "Set inherit_soul=true to load the active parent profile's full "
-        "SOUL.md as the child's identity; it is off by default.\n\n"
+        "SOUL.md as the child's identity; it is off by default. "
+        "reasoning_effort optionally sets this child's thinking budget "
+        "(minimal..ultra, or 'none' to disable) per call, without touching "
+        "the delegation config that core delegate_task reads.\n\n"
         "Runs asynchronously in a daemon background thread and returns a "
         "task_id immediately. Activity resets a stall timer (10 minutes by "
         "default), so productive children can run indefinitely. An optional "
@@ -520,6 +573,20 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
                     "list is intersected with the parent's capabilities; an "
                     "empty list creates a model-only child. If omitted, "
                     "inherit_toolsets controls the behaviour."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Optional per-call reasoning effort for this subagent. "
+                    "Omit to inherit the normal resolution order (core "
+                    "delegation.reasoning_effort config when set, otherwise "
+                    "the parent agent's level). 'none' requests thinking off; "
+                    "other values request a thinking budget. Herald assigns "
+                    "child.reasoning_config after build; the host may still "
+                    "clamp, drop, or substitute per its own reasoning policy."
                 ),
             },
             "inherit_toolsets": {
@@ -694,12 +761,17 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
     "name": "list_profile_models",
     "description": (
         "Discover exact fail-closed model routes before inference or dispatch. "
-        "Omit profile to list only provider/model routes explicitly configured "
-        "for this calling profile. Prefer configured_default; choose another "
-        "exact pair only when the task explicitly needs an override. Supply "
-        "profile to query a target's authenticated model_routes aliases for "
-        "dispatch_agent. Ambient credentials and unconfigured fallback providers "
-        "are excluded from local results."
+        "Omit profile to list this calling profile's llm_call provider/model "
+        "pairs. Supply profile to list the target's dispatch aliases — the "
+        "only strings allowed in dispatch_agent/dispatch_chat model=. Those "
+        "aliases come from the target's platforms.api_server.extra.model_routes, "
+        "not from origin hermes_herald.profiles; a short list means add aliases "
+        "on the target and restart its gateway. Copy one value from "
+        "pass_as_model; advertised_primary.model is the default when you omit "
+        "model, not a valid override. Optional query filters aliases by "
+        "substring when the same model exists under several names. Ambient "
+        "credentials and unconfigured fallback providers are excluded from "
+        "local results."
     ),
     "parameters": {
         "type": "object",
@@ -711,7 +783,121 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
                     "the calling profile's exact local llm_call routes."
                 ),
             },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional substring filter on alias or resolved_model "
+                    "(case-insensitive). Use when several aliases exist for "
+                    "similar models. Matches are listed separately; pass_as_model "
+                    "always contains the full exact-alias list."
+                ),
+            },
         },
+    },
+}
+
+
+LLM_DIRECT_SCHEMA: Dict[str, Any] = {
+    "name": "llm_direct",
+    "description": (
+        "Call a pre-configured OpenAI-compatible endpoint directly with FULL "
+        "parameter control — model, temperature, top_p, max_tokens, seed, stop "
+        "sequences, reasoning effort, and an extra_body passthrough for "
+        "vendor-specific fields. For LLM research and benchmarking where the "
+        "host-managed llm_call route is too constrained. Endpoints are named "
+        "in hermes_herald.llm_direct config (opt-in); credentials never ride "
+        "the tool call. Returns text, usage, and the provider-reported model."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "endpoint": {
+                "type": "string",
+                "description": (
+                    "Endpoint name from hermes_herald.llm_direct.endpoints "
+                    "config. Omit to use llm_direct.default_endpoint."
+                ),
+            },
+            "messages": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "enum": ["system", "user", "assistant"],
+                        },
+                        "content": {"type": "string"},
+                    },
+                    "required": ["role", "content"],
+                },
+                "description": "Chat messages: [{role, content}].",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Model id sent verbatim to the endpoint (no route "
+                    "aliasing). Omit to use the endpoint's default_model."
+                ),
+            },
+            "temperature": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 2,
+                "description": "Sampling temperature (0-2). Omit for endpoint default.",
+            },
+            "top_p": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Nucleus sampling mass (0-1). Omit for endpoint default.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum generated tokens. Omit for endpoint default.",
+            },
+            "seed": {
+                "type": "integer",
+                "description": "Deterministic sampling seed where supported.",
+            },
+            "stop": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 4,
+                "description": "Up to 4 stop sequences.",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["minimal", "low", "medium", "high", "xhigh", "max",
+                         "ultra", "none"],
+                "description": (
+                    "Reasoning effort: sent as reasoning_effort (OpenAI-style) "
+                    "plus extra_body.reasoning for provider profiles that "
+                    "read it. 'none' maps to reasoning_effort 'none'. Omit "
+                    "for endpoint default."
+                ),
+            },
+            "extra_body": {
+                "type": "object",
+                "description": (
+                    "Vendor-specific request fields merged into the JSON body "
+                    "(e.g. top_k, repetition_penalty). Keys starting with '_' "
+                    "are rejected. Reserved OpenAI fields (model, messages, "
+                    "temperature, top_p, max_tokens, seed, stop, "
+                    "reasoning_effort, reasoning) must be set via the matching "
+                    "tool parameters, not extra_body."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 600,
+                "description": "HTTP timeout (default 120, max 600).",
+            },
+        },
+        "required": ["messages"],
     },
 }
 
@@ -725,6 +911,7 @@ ALL_SCHEMAS = [
     CANCEL_DISPATCH_SCHEMA,
     DELEGATE_SUBAGENT_SCHEMA,
     LLM_CALL_SCHEMA,
+    LLM_DIRECT_SCHEMA,
     PING_PROFILE_SCHEMA,
     APPROVE_DISPATCH_SCHEMA,
     LIST_PROFILE_MODELS_SCHEMA,
@@ -1136,6 +1323,7 @@ def _migrate_legacy_run_history(state: dict) -> int:
             "requested_model": str(run.get("requested_model") or ""),
             "resolved_model": str(run.get("resolved_model") or run.get("model") or ""),
             "model_resolution": "legacy_state_cache",
+            "reasoning": str(run.get("reasoning") or ""),
             "status": str(run.get("status") or "unknown"),
             "output_preview": str(run.get("output_preview") or ""),
             "duration_seconds": run.get("duration_seconds"),
@@ -1219,6 +1407,7 @@ def _persist_run(
     requested_model: str = "",
     resolved_model: str = "",
     model_resolution: str = "",
+    reasoning: str = "",
     edge_id: str = "",
     trace_id: str = "",
     parent_edge_id: str = "",
@@ -1250,6 +1439,7 @@ def _persist_run(
             "requested_model": requested_model or "",
             "resolved_model": resolved_model or "",
             "model_resolution": model_resolution or "",
+            "reasoning": reasoning or "",
             "edge_id": edge_id,
             "trace_id": trace_id,
             "parent_edge_id": parent_edge_id,
@@ -1591,10 +1781,39 @@ def _resolve_profile(
     return resolved, None
 
 
+def _parse_optional_provider(raw) -> tuple[str, Optional[str]]:
+    """Return (provider, error). Empty/omitted is allowed."""
+    if raw is None:
+        return "", None
+    if not isinstance(raw, str):
+        return "", "'provider' must be a string when provided."
+    provider = raw.strip()
+    if not provider:
+        return "", None
+    if len(provider) > 80 or not re.match(r"^[A-Za-z0-9_.:-]+$", provider):
+        return "", (
+            "'provider' must be a short provider slug "
+            "(letters, digits, '_', '.', ':', '-')."
+        )
+    return provider, None
+
+
+def _entry_route_provider(entry: dict) -> str:
+    """Credential-free provider pin from a /v1/models row, if advertised."""
+    for key in ("provider", "owned_by"):
+        raw = entry.get(key)
+        if isinstance(raw, str):
+            value = raw.strip()
+            if value and value.lower() not in {"hermes", "hermes-agent"}:
+                return value
+    return ""
+
+
 def _verify_run_model_route(
     profile: str,
     pcfg: dict,
     requested_model: str,
+    requested_provider: str = "",
 ) -> tuple[dict, Optional[str]]:
     """Verify an explicit /v1/runs model as a target model_routes alias.
 
@@ -1659,10 +1878,23 @@ def _verify_run_model_route(
     if matched is not None:
         resolved_model = matched.get("root")
         if isinstance(resolved_model, str) and resolved_model.strip():
+            pinned_provider = _entry_route_provider(matched)
+            if (
+                requested_provider
+                and pinned_provider
+                and requested_provider != pinned_provider
+            ):
+                return {}, (
+                    f"Model route '{requested_model}' on {profile} is pinned to "
+                    f"provider '{pinned_provider}'. Remove provider= or pass "
+                    f"provider='{pinned_provider}'. No task was started."
+                )
             return {
                 "requested_model": requested_model,
                 "resolved_model": resolved_model.strip(),
                 "resolution_source": "target_model_routes",
+                "provider": requested_provider or pinned_provider,
+                "provider_pinned": bool(pinned_provider),
             }, None
         return {}, (
             f"Cannot verify model route '{requested_model}' for {profile}: "
@@ -1687,10 +1919,10 @@ def _verify_run_model_route(
         reason = "it is not an exact configured model_routes alias"
     return {}, (
         f"Model override '{requested_model}' is not supported for {profile}: "
-        f"{reason}. Available route aliases: {available_text}. Configure an "
-        f"exact platforms.api_server.extra.model_routes alias on the target, "
-        f"pass one of the available aliases, or omit model to use the target "
-        f"default. No task was started."
+        f"{reason}. pass_as_model: {available_text}. Call "
+        f"list_profile_models(profile={profile!r}) and copy one exact alias "
+        f"from pass_as_model into model=. Do not add a provider prefix. "
+        f"Omit model to use the target default. No task was started."
     )
 
 
@@ -1716,11 +1948,18 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     message = args.get("message", "")
     instructions = args.get("instructions")
     model_override = args.get("model")
+    requested_provider, provider_error = _parse_optional_provider(args.get("provider"))
+    if provider_error:
+        return _tool_error(provider_error)
     delivery = args.get("delivery", "callback")
     trace_id = args.get("trace_id", "")
     parent_edge_id = args.get("parent_edge_id", "")
     parent_hop = args.get("parent_hop", 0)
     max_hops = args.get("max_hops")
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
 
     if not profile:
         return _tool_error("'profile' is required.")
@@ -1800,13 +2039,22 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     route_resolution: Dict[str, str] = {}
     if requested_model:
         route_resolution, route_error = _verify_run_model_route(
-            profile, pcfg, requested_model,
+            profile, pcfg, requested_model, requested_provider,
         )
         if route_error:
             return _tool_error(route_error)
         # Send the exact verified alias. Sending the resolved root would miss
         # Hermes' exact alias lookup and silently select the target default.
         body["model"] = requested_model
+        transmit_provider = requested_provider or route_resolution.get("provider") or ""
+        if transmit_provider:
+            body["provider"] = transmit_provider
+    elif requested_provider:
+        # Pin provider for the target default model when no alias is sent.
+        body["provider"] = requested_provider
+    reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
+    if reasoning_model_options is not None:
+        body["model_options"] = reasoning_model_options
 
     try:
         result = _post_json(
@@ -1840,6 +2088,13 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
     # the origin before starting a background listener because ContextVars do
     # not necessarily survive arbitrary callback threads.
     resolved_model = route_resolution.get("resolved_model", "")
+    reasoning_label = ""
+    if reasoning_effort is not None:
+        reasoning_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
     from .callback import capture_session_routing
 
     routing = capture_session_routing(kwargs.get("parent_agent"))
@@ -1856,6 +2111,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             requested_model=requested_model,
             resolved_model=resolved_model,
             model_resolution=route_resolution.get("resolution_source", ""),
+            reasoning=reasoning_label,
             edge_id=edge_id,
             trace_id=trace_id,
             parent_edge_id=parent_edge_id,
@@ -1885,6 +2141,7 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             requested_model=requested_model,
             resolved_model=resolved_model,
             model_resolution=route_resolution.get("resolution_source", ""),
+            reasoning=reasoning_label,
         )
     except Exception as exc:
         logger.error("Remote run %s started but ledger insert failed: %s", run_id, exc)
@@ -2184,7 +2441,14 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     instructions = args.get("instructions")
     new_session = args.get("new_session", False)
     model_override = args.get("model")
+    requested_provider, provider_error = _parse_optional_provider(args.get("provider"))
+    if provider_error:
+        return _tool_error(provider_error)
     call_timeout = args.get("stall_timeout_seconds")
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
 
     if not profile:
         return _tool_error("'profile' is required.")
@@ -2211,7 +2475,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     }
     if requested_model:
         model_provenance, model_error = _verify_run_model_route(
-            profile, pcfg, requested_model,
+            profile, pcfg, requested_model, requested_provider,
         )
         if model_error:
             return _tool_error(model_error)
@@ -2277,6 +2541,12 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    transmit_provider = requested_provider or model_provenance.get("provider") or ""
+    if transmit_provider:
+        chat_body["provider"] = transmit_provider
+    reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
+    if reasoning_model_options is not None:
+        chat_body["model_options"] = reasoning_model_options
 
     parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
     parent_progress = getattr(parent_agent, "tool_progress_callback", None)
@@ -2332,6 +2602,14 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
 
     usage = result.get("usage", {})
 
+    reasoning_label = ""
+    if reasoning_effort is not None:
+        reasoning_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
+
     # Record bounded recovery state plus the durable full-text call ledger.
     chat_record_id = f"chat-{uuid.uuid4().hex}"
     edge_id = uuid.uuid4().hex
@@ -2349,6 +2627,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 "requested_model": model_provenance["requested_model"],
                 "resolved_model": model_provenance["resolved_model"],
                 "model_resolution": model_provenance["resolution_source"],
+                "reasoning": reasoning_label,
                 "status": "completed",
                 "completed_at": _utc_now_iso(),
                 "duration_seconds": None,
@@ -2384,6 +2663,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             requested_model=model_provenance["requested_model"],
             resolved_model=model_provenance["resolved_model"],
             model_resolution=model_provenance["resolution_source"],
+            reasoning=reasoning_label,
         )
     except Exception as exc:
         logger.error("Chat completed but ledger insert failed: %s", exc)
@@ -3128,7 +3408,95 @@ def _apply_soul_inheritance(child, inherit_soul: bool) -> None:
     setattr(child, "_cached_system_prompt", None)
 
 
+_VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+
+def _parse_subagent_reasoning_effort(raw):
+    """Parse the per-call reasoning_effort argument.
+
+    Returns None when omitted (inherit normal resolution). Returns the core
+    ``reasoning_config`` dict shape otherwise: {"enabled": False} for "none"
+    or {"enabled": True, "effort": level}. Mirrors core's
+    ``hermes_constants.parse_reasoning_effort`` contract, including the rule
+    that a disabled level must disable thinking rather than coerce away.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        # Schema constrains to strings; a boolean means the caller ignored the
+        # enum. False disables thinking, True is meaningless -> explicit error.
+        if raw is False:
+            return {"enabled": False}
+        raise ValueError(
+            "reasoning_effort must be one of: "
+            + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+        )
+    if not isinstance(raw, str):
+        raise ValueError(
+            "reasoning_effort must be one of: "
+            + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+        )
+    effort = raw.strip().lower()
+    if effort == "none":
+        return {"enabled": False}
+    if effort in _VALID_REASONING_EFFORTS:
+        return {"enabled": True, "effort": effort}
+    raise ValueError(
+        "reasoning_effort must be one of: "
+        + ", ".join(_VALID_REASONING_EFFORTS + ("none",))
+    )
+
+
+def _apply_reasoning_effort(child, reasoning_effort) -> None:
+    """Apply the per-call reasoning override before the child's first model call.
+
+    Mirrors the _apply_soul_inheritance seam: assignment after build, before
+    the first request. The reasoning_config kwarg was already consumed into
+    AIAgent state by _build_child_agent; per-request assembly reads the live
+    attribute (agent/reasoning_params.py has no construction-time snapshot),
+    so the override is visible to per-request assembly. Downstream host
+    policy (mandatory reasoning, length recovery, provider clamps) can still
+    drop or substitute the requested budget; Herald does not promise a
+    strict every-request guarantee against the host.
+    """
+    if reasoning_effort is None:
+        return
+    setattr(child, "reasoning_config", dict(reasoning_effort))
+    # Defensive: nothing currently caches reasoning state at build, but keep
+    # the same invalidation posture as SOUL inheritance in case core adds one.
+    for attr in ("_reasoning_config_cached", "_cached_reasoning_config"):
+        if hasattr(child, attr):
+            try:
+                delattr(child, attr)
+            except Exception:
+                pass
+
+
 _INHERITED_CONTEXT_MESSAGE_LIMIT = 20
+
+
+def _remote_reasoning_model_options(reasoning_effort) -> Optional[Dict[str, Any]]:
+    """Translate a parsed reasoning_config into the target API's model_options shape.
+
+    Both remote dispatch surfaces (/v1/runs and /v1/chat/completions) accept
+    ``model_options.reasoning.{enabled, effort}`` (api_server._request_reasoning_config);
+    the structured form takes precedence over the legacy reasoning_effort key.
+    Unknown levels are ignored by the target (never raised), so no level
+    validation happens here beyond what the parser already did.
+    Returns None when no override was requested.
+    """
+    if reasoning_effort is None:
+        return None
+    if reasoning_effort.get("enabled") is False:
+        return {"reasoning": {"enabled": False}}
+    return {
+        "reasoning": {
+            "enabled": True,
+            "effort": str(reasoning_effort.get("effort") or "medium"),
+        }
+    }
+
+
 _INHERITED_CONTEXT_CHAR_LIMIT = 12_000
 _NO_TOOLSETS_SENTINEL = "__herald_model_only__"
 
@@ -3303,6 +3671,10 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
     inherit_soul = args.get("inherit_soul", False) is True
     inherit_context = args.get("inherit_context", False) is True
     inherit_toolsets = args.get("inherit_toolsets", True) is not False
+    try:
+        reasoning_effort = _parse_subagent_reasoning_effort(args.get("reasoning_effort"))
+    except ValueError as e:
+        return _tool_error(str(e))
     parent_agent = _resolve_parent_agent(
         kwargs.get("parent_agent"), kwargs.get("session_id", "")
     )
@@ -3383,6 +3755,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         # SOUL.md is loaded from the active profile, while project context,
         # USER.md, memory, and parent conversation history remain excluded.
         _apply_soul_inheritance(child, inherit_soul)
+        _apply_reasoning_effort(child, reasoning_effort)
         if toolsets is not None:
             _enforce_subagent_toolset_policy(child, toolsets)
     except Exception as e:
@@ -3390,6 +3763,13 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
 
     task_id = f"subagent-{uuid.uuid4().hex[:12]}"
     effective_model = creds["model"] or getattr(parent_agent, "model", "?")
+    if reasoning_effort is not None:
+        effort_label = (
+            "none"
+            if reasoning_effort.get("enabled") is False
+            else str(reasoning_effort.get("effort", ""))
+        )
+        effective_model = f"{effective_model} (reasoning: {effort_label})"
     start_time = time.time()
 
     # Capture task-local routing identifiers BEFORE spawning the thread.
@@ -3790,8 +4170,233 @@ def handle_llm_call(args: dict, **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ping_profile — health check tool
+# llm_direct — opt-in full-control endpoint tool
 # ---------------------------------------------------------------------------
+
+def handle_llm_direct(args: dict, **kwargs) -> str:
+    """One direct OpenAI-compatible call to a configured endpoint, full control."""
+    if not cfg.llm_direct_enabled():
+        return _tool_error(
+            "llm_direct is disabled. Set hermes_herald.llm_direct.enabled: true "
+            "in config.yaml to opt in."
+        )
+
+    messages = args.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return _tool_error("'messages' is required (list of {role, content} objects).")
+    for index, message in enumerate(messages):
+        if (
+            not isinstance(message, dict)
+            or message.get("role") not in {"system", "user", "assistant"}
+            or not isinstance(message.get("content"), str)
+        ):
+            return _tool_error(
+                f"messages[{index}] must be an object with role "
+                "(system/user/assistant) and string content."
+            )
+
+    endpoint_name = (args.get("endpoint") or cfg.get_default_direct_endpoint() or "").strip()
+    if not endpoint_name:
+        return _tool_error(
+            "No endpoint given and hermes_herald.llm_direct.default_endpoint "
+            "is not set. Name one endpoint from llm_direct.endpoints."
+        )
+    try:
+        endpoint = cfg.get_endpoint_config(endpoint_name)
+    except ValueError as e:
+        return _tool_error(str(e))
+    if endpoint is None:
+        return _tool_error(
+            f"Endpoint '{endpoint_name}' is not configured under "
+            "hermes_herald.llm_direct.endpoints."
+        )
+
+    base_url = str(endpoint["base_url"]).rstrip("/")
+    api_key = str(endpoint.get("api_key") or "")
+    if not api_key:
+        return _tool_error(
+            f"Endpoint '{endpoint_name}' has no resolved api_key. "
+            "Set a nonempty ${ENV_VAR} reference in config."
+        )
+    secrets = (api_key,)
+
+    model = (args.get("model") or endpoint.get("default_model") or "")
+    if not isinstance(model, str) or not model.strip():
+        return _tool_error(
+            f"No model given and endpoint '{endpoint_name}' has no default_model."
+        )
+    model = model.strip()
+    allow_error = _llm_direct_allowlist_error(endpoint_name, endpoint, model)
+    if allow_error:
+        return allow_error
+
+    body: Dict[str, Any] = {"model": model, "messages": [dict(m) for m in messages]}
+
+    temperature = args.get("temperature")
+    if temperature is not None:
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) \
+                or not 0.0 <= float(temperature) <= 2.0:
+            return _tool_error("'temperature' must be a number from 0.0 to 2.0.")
+        body["temperature"] = float(temperature)
+    top_p = args.get("top_p")
+    if top_p is not None:
+        if isinstance(top_p, bool) or not isinstance(top_p, (int, float)) \
+                or not 0.0 <= float(top_p) <= 1.0:
+            return _tool_error("'top_p' must be a number from 0.0 to 1.0.")
+        body["top_p"] = float(top_p)
+    max_tokens = args.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+            return _tool_error("'max_tokens' must be a positive integer.")
+        body["max_tokens"] = max_tokens
+    seed = args.get("seed")
+    if seed is not None:
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            return _tool_error("'seed' must be an integer.")
+        body["seed"] = seed
+    stop = args.get("stop")
+    if stop is not None:
+        if (
+            not isinstance(stop, list)
+            or len(stop) > 4
+            or not all(isinstance(s, str) and s for s in stop)
+        ):
+            return _tool_error("'stop' must be a list of up to 4 non-empty strings.")
+        body["stop"] = stop
+
+    reasoning_raw = args.get("reasoning_effort")
+    if reasoning_raw is not None:
+        try:
+            reasoning_config = _parse_subagent_reasoning_effort(reasoning_raw)
+        except ValueError as e:
+            return _tool_error(str(e))
+        if not isinstance(reasoning_config, dict):
+            return _tool_error("reasoning_effort could not be parsed.")
+        if reasoning_config.get("enabled") is False:
+            body["reasoning_effort"] = "none"
+            body["reasoning"] = {"enabled": False}
+        else:
+            effort = str(reasoning_config.get("effort") or "medium")
+            body["reasoning_effort"] = effort
+            body["reasoning"] = {"enabled": True, "effort": effort}
+
+    extra_body = args.get("extra_body")
+    if extra_body is not None:
+        if not isinstance(extra_body, dict):
+            return _tool_error("'extra_body' must be an object.")
+        bad_keys = [k for k in extra_body if isinstance(k, str) and k.startswith("_")]
+        if bad_keys:
+            return _tool_error(
+                f"'extra_body' keys starting with '_' are rejected: {', '.join(bad_keys)}"
+            )
+        reserved = [
+            k for k in extra_body
+            if isinstance(k, str) and k in _LLM_DIRECT_RESERVED_BODY_KEYS
+        ]
+        if reserved:
+            return _tool_error(
+                "'extra_body' cannot override reserved fields: "
+                + ", ".join(sorted(reserved))
+                + ". Set those via the matching tool parameters."
+            )
+        body.update(extra_body)
+
+    final_model = body.get("model")
+    if not isinstance(final_model, str) or not final_model.strip():
+        return _tool_error("Final request is missing a model.")
+    allow_error = _llm_direct_allowlist_error(endpoint_name, endpoint, final_model.strip())
+    if allow_error:
+        return allow_error
+
+    timeout_seconds = args.get("timeout_seconds")
+    if timeout_seconds is None:
+        timeout_seconds = 120.0
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) \
+            or not 1.0 <= float(timeout_seconds) <= 600.0:
+        return _tool_error("'timeout_seconds' must be a number from 1 to 600.")
+    timeout_seconds = float(timeout_seconds)
+
+    url = f"{base_url}/chat/completions"
+    data = json.dumps(body).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = Request(url, data=data, headers=headers, method="POST")
+
+    start = time.monotonic()
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        return _tool_error(f"HTTP {e.code} from endpoint '{endpoint_name}'.")
+    except URLError as e:
+        return _tool_error(_redact_secrets(
+            f"Cannot reach endpoint '{endpoint_name}': {e.reason}",
+            secrets,
+        ))
+    except Exception as e:
+        return _tool_error(_redact_secrets(
+            f"llm_direct failed: {type(e).__name__}",
+            secrets,
+        ))
+    elapsed = round(time.monotonic() - start, 2)
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    text = ""
+    finish_reason = ""
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message_obj = choices[0].get("message")
+        if isinstance(message_obj, dict) and isinstance(message_obj.get("content"), str):
+            text = message_obj["content"]
+        finish_reason = str(choices[0].get("finish_reason") or "")
+    if not text.strip():
+        err = payload.get("error") if isinstance(payload, dict) else None
+        detail = err.get("message") if isinstance(err, dict) else ""
+        return _tool_error(_redact_secrets(
+            f"Empty completion from endpoint '{endpoint_name}'."
+            + (f" Provider error: {detail}" if detail else ""),
+            secrets,
+        ))
+
+    raw_usage = payload.get("usage") if isinstance(payload, dict) else None
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
+    reported_model = str(payload.get("model") or model) if isinstance(payload, dict) else model
+
+    return json.dumps({
+        "text": _redact_secrets(text, secrets),
+        "endpoint": endpoint_name,
+        "model": _redact_secrets(reported_model, secrets),
+        "finish_reason": finish_reason,
+        "usage": usage,
+        "duration_seconds": elapsed,
+    })
+
+
+_LLM_DIRECT_RESERVED_BODY_KEYS = frozenset({
+    "model", "messages", "temperature", "top_p", "max_tokens", "seed", "stop",
+    "reasoning_effort", "reasoning",
+})
+
+
+def _redact_secrets(text: str, secrets) -> str:
+    """Strip resolved credentials from any string that might reach the caller."""
+    out = str(text or "")
+    for secret in secrets:
+        if secret:
+            out = out.replace(str(secret), "[redacted]")
+    return out
+
+
+def _llm_direct_allowlist_error(endpoint_name, endpoint, model: str):
+    allowed = endpoint.get("allowed_models")
+    if isinstance(allowed, list) and model not in allowed:
+        return _tool_error(
+            f"Model '{model}' is not in endpoint '{endpoint_name}' allowed_models. "
+            f"Allowed: {', '.join(allowed)}."
+        )
+    return None
+
 
 def handle_ping_profile(args: dict, **kwargs) -> str:
     """Check if a target Hermes profile's API server is reachable."""
@@ -3857,6 +4462,9 @@ def handle_ping_profile(args: dict, **kwargs) -> str:
 def handle_list_profile_models(args: dict, **kwargs) -> str:
     """Return exact local llm_call routes or remote dispatch aliases."""
     profile = args.get("profile", "").strip()
+    query = args.get("query", "")
+    query = query.strip() if isinstance(query, str) else ""
+    needle = query.lower()
     if not profile:
         try:
             from agent import auxiliary_client as auxiliary
@@ -3879,7 +4487,13 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
             ),
             key=lambda route: (route["provider"], route["model"]),
         )
-        return json.dumps({
+        matches = [
+            route for route in routes
+            if not needle
+            or needle in route["provider"].lower()
+            or needle in route["model"].lower()
+        ]
+        payload = {
             "scope": "local",
             "configured_default": inventory["configured_default"],
             "available_routes": routes,
@@ -3888,9 +4502,16 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 "Prefer configured_default when it is present. Only when the task explicitly needs "
                 "an override, pass one exact available_routes provider/model pair "
                 "to llm_call. Unlisted pairs are rejected before the host call; "
-                "Hermes trust and provider-routing policy remain authoritative."
+                "Hermes trust and provider-routing policy remain authoritative. "
+                "When the same model appears on several providers, copy the "
+                "exact pair — do not pass a bare model name."
             ),
-        })
+        }
+        if query:
+            payload["query"] = query
+            payload["matches"] = matches
+            payload["match_count"] = len(matches)
+        return json.dumps(payload)
 
     pcfg, err = _resolve_profile(profile)
     if err:
@@ -3929,7 +4550,10 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         (
             {
                 "alias": entry["id"].strip(),
+                "pass_as": entry["id"].strip(),
                 "resolved_model": entry["root"].strip(),
+                "provider": _entry_route_provider(entry),
+                "provider_pinned": bool(_entry_route_provider(entry)),
             }
             for entry in entries
             if isinstance(entry, dict)
@@ -3943,13 +4567,38 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         key=lambda item: item["alias"],
     )
     default_model = primary["id"].strip() if primary else ""
-    return json.dumps({
+    pass_as_model = [item["pass_as"] for item in dispatchable]
+    matches = [
+        item for item in dispatchable
+        if not needle
+        or needle in item["alias"].lower()
+        or needle in item["resolved_model"].lower()
+        or needle in (item.get("provider") or "").lower()
+    ]
+    payload = {
         "profile": profile,
         "advertised_primary": {
             "model": default_model,
             "dispatchable_as_override": False,
             "is_runtime_evidence": False,
         },
+        "pass_as_model": pass_as_model,
         "dispatchable_models": dispatchable,
         "dispatchable_model_count": len(dispatchable),
-    })
+        "contract": (
+            "For dispatch_agent and dispatch_chat, copy pass_as into model= "
+            "and, when provider is non-empty, copy provider into provider=. "
+            "If provider is empty the alias is unpinned: pass provider= "
+            "explicitly or the target may pick among configured providers "
+            "(including ones without a subscription). Do not add a provider "
+            "prefix to model=, do not pass resolved_model, and do not pass "
+            "advertised_primary.model as an override. Omit model= to use the "
+            "target default."
+        ),
+    }
+    if query:
+        payload["query"] = query
+        payload["matches"] = matches
+        payload["match_count"] = len(matches)
+        payload["match_pass_as"] = [item["pass_as"] for item in matches]
+    return json.dumps(payload)

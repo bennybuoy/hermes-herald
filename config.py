@@ -11,6 +11,7 @@ import re
 import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -192,3 +193,114 @@ def get_chat_timeout() -> float:
     if val <= 0:
         return 600.0
     return val
+
+
+def get_endpoint_config(endpoint: str) -> Optional[Dict[str, Any]]:
+    """Return one configured direct-endpoint entry, credentials resolved.
+
+    Endpoints live under ``hermes_herald.llm_direct.endpoints`` in config.yaml:
+
+    .. code-block:: yaml
+
+        hermes_herald:
+          llm_direct:
+            enabled: true            # opt-in gate, default false
+            default_endpoint: nous    # optional default
+            endpoints:
+              nous:
+                base_url: https://api.nousresearch.com/v1
+                api_key: ${NOUS_API_KEY}        # env-ref resolved at call time
+                default_model: fable-1          # optional
+                allowed_models: [fable-1, glm-5.3]  # optional allowlist
+
+    ``base_url`` must be an explicit http(s) URL — no profile discovery, no
+    inheritance. Returns None when the endpoint is unknown; raises ValueError
+    on malformed entries so callers fail loudly.
+    """
+    if not endpoint or not isinstance(endpoint, str):
+        return None
+    cfg = _load_config()
+    section = cfg.get("llm_direct") or {}
+    if not isinstance(section, dict):
+        raise ValueError("hermes_herald.llm_direct must be a mapping.")
+    endpoints = section.get("endpoints") or {}
+    if not isinstance(endpoints, dict):
+        raise ValueError("hermes_herald.llm_direct.endpoints must be a mapping.")
+    entry = endpoints.get(endpoint)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise ValueError(f"hermes_herald.llm_direct.endpoints.{endpoint} must be a mapping.")
+    base_url = _normalize_direct_base_url(entry.get("base_url"), endpoint)
+    allowed = entry.get("allowed_models")
+    if allowed is not None and (
+        not isinstance(allowed, list) or not all(isinstance(m, str) for m in allowed)
+    ):
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.allowed_models must be a list of strings."
+        )
+    resolved = dict(entry)
+    resolved["base_url"] = base_url
+    resolved["api_key"] = _resolve_direct_api_key(entry.get("api_key"), endpoint)
+    return resolved
+
+
+def _normalize_direct_base_url(raw, endpoint: str) -> str:
+    """Return a credential-free absolute http(s) URL with a hostname."""
+    text = str(raw or "").strip()
+    parsed = urlsplit(text)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.base_url must be an "
+            f"explicit http(s) URL with a hostname (got {text!r})."
+        )
+    if parsed.username or parsed.password:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.base_url must not "
+            "embed credentials."
+        )
+    host = parsed.hostname
+    hostpart = f"[{host}]" if ":" in host else host
+    if parsed.port:
+        hostpart = f"{hostpart}:{parsed.port}"
+    return f"{parsed.scheme}://{hostpart}{parsed.path}".rstrip("/")
+
+
+def _resolve_direct_api_key(raw, endpoint: str) -> str:
+    """Require a ${ENV_VAR} reference that resolves to a nonempty secret."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key must be a "
+            "${ENV_VAR} reference."
+        )
+    text = raw.strip()
+    match = _ENV_VAR_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key must be a "
+            "${ENV_VAR} reference, not a literal secret."
+        )
+    resolved = os.environ.get(match.group(1), "")
+    if not resolved:
+        raise ValueError(
+            f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key environment "
+            f"variable {match.group(1)} is unset or empty."
+        )
+    return resolved
+
+
+def llm_direct_enabled() -> bool:
+    """Return True when hermes_herald.llm_direct.enabled is true (opt-in gate)."""
+    section = _load_config().get("llm_direct")
+    if not isinstance(section, dict):
+        return False
+    return section.get("enabled") is True
+
+
+def get_default_direct_endpoint() -> str:
+    """Return the configured default llm_direct endpoint name, or ''."""
+    section = _load_config().get("llm_direct")
+    if not isinstance(section, dict):
+        return ""
+    raw = section.get("default_endpoint")
+    return raw.strip() if isinstance(raw, str) else ""

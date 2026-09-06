@@ -63,6 +63,7 @@ def _connect() -> sqlite3.Connection:
             requested_model TEXT NOT NULL DEFAULT '',
             resolved_model TEXT NOT NULL DEFAULT '',
             model_resolution TEXT NOT NULL DEFAULT '',
+            reasoning TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL,
             dispatched_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -97,6 +98,10 @@ def _connect() -> sqlite3.Connection:
         )
     if "max_hops" not in columns:
         connection.execute("ALTER TABLE dispatches ADD COLUMN max_hops INTEGER")
+    if "reasoning" not in columns:
+        connection.execute(
+            "ALTER TABLE dispatches ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''"
+        )
     connection.commit()
     return connection
 
@@ -125,6 +130,7 @@ def record_dispatch(
     requested_model: str = "",
     resolved_model: str = "",
     model_resolution: str = "",
+    reasoning: str = "",
     status: str = "dispatched",
     output_preview: str = "",
     duration_seconds: Optional[float] = None,
@@ -142,17 +148,17 @@ def record_dispatch(
                 edge_id, run_id, origin_profile, target_profile, dispatch_type,
                 delivery, message, message_preview, instructions, trace_id,
                 parent_edge_id, hop_count, max_hops, origin_session_id, requested_model,
-                resolved_model, model_resolution, status, dispatched_at,
+                resolved_model, model_resolution, reasoning, status, dispatched_at,
                 updated_at, completed_at, output_preview, duration_seconds,
                 usage_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 edge_id, run_id, origin_profile, target_profile, dispatch_type,
                 delivery, message, message[:120], instructions or "", trace_id or "",
                 parent_edge_id or "", hop_count, max_hops, origin_session_id or "",
                 requested_model or "", resolved_model or "",
-                model_resolution or "", status, now, now, completed_at,
+                model_resolution or "", reasoning or "", status, now, now, completed_at,
                 (output_preview or "")[:500], duration_seconds,
                 json.dumps(usage or {}, ensure_ascii=False),
             ),
@@ -245,6 +251,7 @@ def _row_to_dict(row: sqlite3.Row, include_messages: bool) -> dict:
         "requested_model": row["requested_model"],
         "resolved_model": row["resolved_model"],
         "model_resolution": row["model_resolution"],
+        "reasoning": str(row["reasoning"] or ""),
         "status": row["status"],
         "dispatched_at": row["dispatched_at"],
         "updated_at": row["updated_at"],

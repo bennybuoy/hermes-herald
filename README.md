@@ -4,9 +4,9 @@
 
 <p>
   <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes%20Agent-compatible-8B5CF6" alt="Hermes Agent"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-22C55E" alt="Version 1.0.0">
+  <img src="https://img.shields.io/badge/version-1.1.0-22C55E" alt="Version 1.1.0">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
-  <img src="https://img.shields.io/badge/tools-11-orange" alt="11 Tools">
+  <img src="https://img.shields.io/badge/tools-12-orange" alt="12 Tools">
 </p>
 
 > **Your agents should not just talk to you. They should be able to talk to each other.**
@@ -115,6 +115,26 @@ hermes config set TUTOR_API_KEY "$HERALD_KEY"
 unset HERALD_KEY
 ```
 
+Herald does **not** invent the target's model catalog. `list_profile_models(profile="tutor")` is authenticated `GET /v1/models`, which advertises only the profile identity plus aliases you declare on **that target** — not every model its providers can run, and not anything in origin `hermes_herald.profiles`.
+
+Edit the target profile's `config.yaml` (`~/.hermes/profiles/tutor/config.yaml`):
+
+```yaml
+platforms:
+  api_server:
+    extra:
+      # ... host, port, key from the commands above ...
+      model_routes:
+        tutor-fast:
+          provider: ollama-cloud
+          model: glm-5.2
+        tutor-reasoning:
+          provider: openai-codex
+          model: gpt-5.6-sol
+```
+
+One alias per `(provider, model)` pair you want callable from Herald. Pin `provider` on each alias so the target cannot pick a subscription-less route for the same model name. Then restart the target gateway. A short listing means those aliases were never advertised — add them here, do not look for a Herald-side catalog.
+
 Start the target gateway:
 
 ```bash
@@ -166,7 +186,7 @@ re-copy it from the target's config before debugging further.
 Start a fresh origin session and look for:
 
 ```text
-hermes-herald: registered 11 tools
+hermes-herald: registered 12 tools
 ```
 
 Then verify reachability and authenticated model discovery:
@@ -376,6 +396,20 @@ Because the child is in-process, it is not durable across parent-process exit. U
 
 > If Hermes core’s global `delegation.child_timeout_seconds` is enabled, it can preempt Herald’s per-call policy. Set it to `0` or leave it unset when using Herald timeout controls.
 
+### Per-call reasoning effort
+
+`delegate_subagent` accepts `reasoning_effort` to set the child's thinking budget for this one call, without touching core's `delegation.reasoning_effort` config:
+
+```python
+delegate_subagent(
+    goal="Deep-dive the auth flow for security issues",
+    model="gpt-5",
+    reasoning_effort="high",   # minimal..ultra; 'none' disables thinking
+)
+```
+
+Omitted, the child keeps the normal resolution order (core `delegation.reasoning_effort` when configured, otherwise the parent's level). Herald assigns `child.reasoning_config` after build via the same post-build seam as SOUL inheritance. Downstream host policy can still clamp, drop, or substitute the requested budget (mandatory-reasoning rejection, length recovery, provider limits); do not treat the parameter as a strict every-request guarantee against the host.
+
 ---
 
 ## Pillar 3 — A lightweight inference lane
@@ -426,9 +460,38 @@ the host call; policy or provider failures are returned noisily without a
 Herald-side retry. Results expose the requested pair alongside the provider and
 model reported by the host facade.
 
+`llm_direct` is a separate, **opt-in** research lane. It does not use host
+routing. Endpoints are named in config (`hermes_herald.llm_direct.enabled: true`,
+explicit `http(s)` `base_url`, `api_key: ${ENV_VAR}` only). The tool never
+accepts a URL or credential as an argument. `extra_body` is for vendor-specific
+fields only — reserved OpenAI fields must go through the matching parameters.
+Redirects are refused so a bearer token cannot follow a 3xx to another origin.
+
+```yaml
+hermes_herald:
+  llm_direct:
+    enabled: true
+    default_endpoint: lab
+    endpoints:
+      lab:
+        base_url: https://llm.example.com/v1
+        api_key: ${LAB_API_KEY}
+        default_model: lab-model
+        allowed_models: [lab-model]
+```
+
+```python
+llm_direct(
+    messages=[{"role": "user", "content": "Reply with the single word OK"}],
+    temperature=0,
+    seed=7,
+    extra_body={"top_k": 40},
+)
+```
+
 ---
 
-## The 11 tools
+## The 12 tools
 
 | Tool | Purpose |
 |---|---|
@@ -436,6 +499,7 @@ model reported by the host facade.
 | `dispatch_agent` | Async cross-profile run with callback or detached delivery |
 | `delegate_subagent` | In-process child with per-call model and inheritance controls |
 | `llm_call` | Bare model inference without an agent loop |
+| `llm_direct` | Opt-in direct OpenAI-compatible call to a pre-configured endpoint (full parameter control; credentials stay in config) |
 | `check_dispatch` | Query one target run using its exact `{profile, run_id}` |
 | `collect_dispatches` | Query several run handles in one call |
 | `dispatch_status` | Read durable call history and credential-free configured/observed topology |
@@ -486,12 +550,18 @@ Self-routing requires both a matching route entry and `allow_self: true`. Async 
 
 Both `dispatch_agent` and `dispatch_chat` support target-controlled model choice.
 
+**Where aliases come from.** They live on the **target** Hermes profile, under `platforms.api_server.extra.model_routes`. The origin Herald route (`hermes_herald.profiles.<name>`) is only `url`, `api_key`, `capabilities`, and an optional default `model` that must already be one of those target aliases. Herald never writes `model_routes`.
+
+**What `/v1/models` lists.** The profile identity (not a valid override) plus those aliases. Provider catalogs, fallbacks, and ambient credentials are excluded on purpose. If a model you know the target can run is missing from `list_profile_models(profile=...)`, add an alias on the target and restart its gateway.
+
 When `model` is supplied explicitly or configured on the Herald profile route, Herald:
 
 1. authenticates to the target’s `GET /v1/models`;
 2. requires an exact `model_routes` alias with a resolved target model;
 3. refuses unknown, unverifiable, or primary-identity-only names before sending work;
 4. records requested and resolved model provenance in the ledger.
+
+Copy `pass_as` / `pass_as_model` into `model=`. Copy `provider` into `provider=` when the listing includes it. If `provider` is empty (`provider_pinned: false`), still pass `provider=` yourself — current Hermes `/v1/models` often omits the route's provider even when the YAML pin exists. An unpinned alias lets the target choose among configured providers, including ones with no subscription.
 
 Omit `model` to preserve the target’s normal default. Call `list_profile_models(profile=...)` before selecting an alias.
 
