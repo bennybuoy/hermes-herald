@@ -763,12 +763,15 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
         "Discover exact fail-closed model routes before inference or dispatch. "
         "Omit profile to list this calling profile's llm_call provider/model "
         "pairs. Supply profile to list the target's dispatch aliases — the "
-        "only strings allowed in dispatch_agent/dispatch_chat model=. Copy "
-        "one value from pass_as_model; advertised_primary.model is the default "
-        "when you omit model, not a valid override. Optional query filters "
-        "aliases by substring when the same model exists under several names. "
-        "Ambient credentials and unconfigured fallback providers are excluded "
-        "from local results."
+        "only strings allowed in dispatch_agent/dispatch_chat model=. Those "
+        "aliases come from the target's platforms.api_server.extra.model_routes, "
+        "not from origin hermes_herald.profiles; a short list means add aliases "
+        "on the target and restart its gateway. Copy one value from "
+        "pass_as_model; advertised_primary.model is the default when you omit "
+        "model, not a valid override. Optional query filters aliases by "
+        "substring when the same model exists under several names. Ambient "
+        "credentials and unconfigured fallback providers are excluded from "
+        "local results."
     ),
     "parameters": {
         "type": "object",

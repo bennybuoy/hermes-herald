@@ -79,6 +79,24 @@ hermes_herald:
 
 Store bearer tokens in the origin profile's `.env`, for example with `hermes config set REVIEWER_API_KEY <value>`. Do not commit or print them. The API-server key is a transport credential; model-provider credentials remain on the target profile.
 
+Dispatchable models are **not** configured in that origin block. They are aliases on the **target** profile:
+
+```yaml
+# ~/.hermes/profiles/reviewer/config.yaml
+platforms:
+  api_server:
+    extra:
+      model_routes:
+        reviewer-fast:
+          provider: ollama-cloud
+          model: glm-5.2
+        reviewer-reasoning:
+          provider: openai-codex
+          model: gpt-5.6-sol
+```
+
+`list_profile_models(profile="reviewer")` is `GET /v1/models`: profile identity plus those aliases only. Herald does not list the target's full provider catalog. A short listing means add aliases here and restart the target gateway. Pin `provider` on each alias. Origin `hermes_herald.profiles.reviewer.model` may name one of those aliases as a default; it cannot invent new ones.
+
 For remote targets, use a trusted private network or authenticated TLS. Herald does not add TLS.
 
 ## Cross-Profile Workflow
@@ -256,9 +274,11 @@ Safety and scope:
 3. Inspect `dispatch_status` for persisted provenance.
 4. Reconcile the existing run; do not redispatch blindly.
 
-### Persistent chat rejects a model alias
+### Persistent chat rejects a model alias, or the listing is missing a model
 
 Call `list_profile_models(profile=...)` and use one of the exact advertised route aliases. The target's primary identity or an arbitrary provider/model slug is not sufficient unless it is also declared as a route alias. Omit `model` to use the target default.
+
+If the listing is shorter than the models you know the target can run, edit **that target's** `platforms.api_server.extra.model_routes`, restart its gateway, and list again. Origin `hermes_herald.profiles` does not define the catalog.
 
 ### Approval notice does not arrive
 

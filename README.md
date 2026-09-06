@@ -115,6 +115,26 @@ hermes config set TUTOR_API_KEY "$HERALD_KEY"
 unset HERALD_KEY
 ```
 
+Herald does **not** invent the target's model catalog. `list_profile_models(profile="tutor")` is authenticated `GET /v1/models`, which advertises only the profile identity plus aliases you declare on **that target** — not every model its providers can run, and not anything in origin `hermes_herald.profiles`.
+
+Edit the target profile's `config.yaml` (`~/.hermes/profiles/tutor/config.yaml`):
+
+```yaml
+platforms:
+  api_server:
+    extra:
+      # ... host, port, key from the commands above ...
+      model_routes:
+        tutor-fast:
+          provider: ollama-cloud
+          model: glm-5.2
+        tutor-reasoning:
+          provider: openai-codex
+          model: gpt-5.6-sol
+```
+
+One alias per `(provider, model)` pair you want callable from Herald. Pin `provider` on each alias so the target cannot pick a subscription-less route for the same model name. Then restart the target gateway. A short listing means those aliases were never advertised — add them here, do not look for a Herald-side catalog.
+
 Start the target gateway:
 
 ```bash
@@ -530,12 +550,18 @@ Self-routing requires both a matching route entry and `allow_self: true`. Async 
 
 Both `dispatch_agent` and `dispatch_chat` support target-controlled model choice.
 
+**Where aliases come from.** They live on the **target** Hermes profile, under `platforms.api_server.extra.model_routes`. The origin Herald route (`hermes_herald.profiles.<name>`) is only `url`, `api_key`, `capabilities`, and an optional default `model` that must already be one of those target aliases. Herald never writes `model_routes`.
+
+**What `/v1/models` lists.** The profile identity (not a valid override) plus those aliases. Provider catalogs, fallbacks, and ambient credentials are excluded on purpose. If a model you know the target can run is missing from `list_profile_models(profile=...)`, add an alias on the target and restart its gateway.
+
 When `model` is supplied explicitly or configured on the Herald profile route, Herald:
 
 1. authenticates to the target’s `GET /v1/models`;
 2. requires an exact `model_routes` alias with a resolved target model;
 3. refuses unknown, unverifiable, or primary-identity-only names before sending work;
 4. records requested and resolved model provenance in the ledger.
+
+Copy `pass_as` / `pass_as_model` into `model=`. Copy `provider` into `provider=` when the listing includes it. If `provider` is empty (`provider_pinned: false`), still pass `provider=` yourself — current Hermes `/v1/models` often omits the route's provider even when the YAML pin exists. An unpinned alias lets the target choose among configured providers, including ones with no subscription.
 
 Omit `model` to preserve the target’s normal default. Call `list_profile_models(profile=...)` before selecting an alias.
 
