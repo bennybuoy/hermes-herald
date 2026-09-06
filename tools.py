@@ -4329,16 +4329,7 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
         with urlopen(req, timeout=timeout_seconds) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
-        err_body = ""
-        try:
-            err_body = e.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        return _tool_error(_redact_secrets(
-            f"HTTP {e.code} from endpoint '{endpoint_name}'"
-            + (f": {err_body}" if err_body else f": {e.reason}"),
-            secrets,
-        ))
+        return _tool_error(f"HTTP {e.code} from endpoint '{endpoint_name}'.")
     except URLError as e:
         return _tool_error(_redact_secrets(
             f"Cannot reach endpoint '{endpoint_name}': {e.reason}",

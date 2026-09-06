@@ -9,8 +9,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import yaml
+
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
+MANIFEST_PATH = PLUGIN_DIR / "plugin.yaml"
 SKILL_PATH = PLUGIN_DIR / "skills" / "agent-dispatch" / "SKILL.md"
 
 
@@ -27,13 +30,18 @@ def _load_plugin_entry():
     return module
 
 
+def _load_manifest():
+    return yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
 def test_plugin_registers_all_tools_and_bundled_skill():
     plugin = _load_plugin_entry()
     ctx = MagicMock()
+    manifest = _load_manifest()
 
     plugin.register(ctx)
 
-    assert ctx.register_tool.call_count == 12
+    assert ctx.register_tool.call_count == len(manifest["provides_tools"])
     ctx.register_skill.assert_called_once_with("agent-dispatch", SKILL_PATH)
 
 
@@ -75,10 +83,11 @@ def test_registered_llm_call_handler_receives_host_llm_facade(monkeypatch):
 
 def test_bundled_skill_matches_v1_contract():
     text = SKILL_PATH.read_text(encoding="utf-8")
+    manifest = _load_manifest()
 
-    assert "version: 1.0.0" in text
+    assert f"version: {manifest['version']}" in text
     assert "hermes_herald:" in text
-    assert "11 tools" in text
+    assert f"{len(manifest['provides_tools'])} tools" in text
     assert "interrupt_after_seconds" in text
     assert "inherit_soul=true" in text
     assert 'skill_view("hermes-herald:agent-dispatch")' in text

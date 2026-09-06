@@ -1,7 +1,7 @@
 ---
 name: agent-dispatch
 description: Configure, operate, troubleshoot, and choose between Hermes Herald's cross-profile dispatch, persistent chat, model-selectable subagents, bare LLM calls, run management, and approval relay tools.
-version: 1.0.0
+version: 1.1.0
 author: Ben
 license: MIT
 metadata:
@@ -11,7 +11,7 @@ metadata:
 
 # Hermes Herald / Agent Dispatch
 
-Hermes Herald adds 11 tools for communicating with named Hermes profiles, running model-selectable local subagents, making bare LLM calls, and managing asynchronous runs. The plugin manifest and config namespace are both `hermes-herald` / `hermes_herald`.
+Hermes Herald adds 12 tools for communicating with named Hermes profiles, running model-selectable local subagents, making bare LLM calls, and managing asynchronous runs. The plugin manifest and config namespace are both `hermes-herald` / `hermes_herald`.
 
 ## When to Use
 
@@ -296,8 +296,8 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
 
 Also verify:
 
-- `plugin.yaml` advertises the same 11 tools registered in `__init__.py`;
+- `plugin.yaml` advertises the same 12 tools registered in `__init__.py`;
 - the plugin registers the bundled `agent-dispatch` skill;
-- `plugin.yaml`, README, release card, and hero all say v1.0.0;
+- `plugin.yaml`, README, release card, and hero all say v1.1.0;
 - the working tree is understood and `git diff --check` passes;
 - running Hermes processes were restarted before live verification.

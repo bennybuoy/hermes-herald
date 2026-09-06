@@ -4,9 +4,9 @@
 
 <p>
   <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes%20Agent-compatible-8B5CF6" alt="Hermes Agent"></a>
-  <img src="https://img.shields.io/badge/version-1.0.0-22C55E" alt="Version 1.0.0">
+  <img src="https://img.shields.io/badge/version-1.1.0-22C55E" alt="Version 1.1.0">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
-  <img src="https://img.shields.io/badge/tools-11-orange" alt="11 Tools">
+  <img src="https://img.shields.io/badge/tools-12-orange" alt="12 Tools">
 </p>
 
 > **Your agents should not just talk to you. They should be able to talk to each other.**

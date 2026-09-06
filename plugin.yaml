@@ -1,5 +1,5 @@
 name: hermes-herald
-version: 1.0.0
+version: 1.1.0
 description: "Hermes Herald — directed cross-profile dispatch with a durable SQLite call ledger, detached graph routing, configured model-route discovery, model-selectable in-process subagents, and host-owned bare LLM inference."
 author: Ben
 provides_tools:

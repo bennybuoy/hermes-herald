@@ -184,20 +184,23 @@ def test_llm_direct_param_validation(monkeypatch):
         assert field in result["error"]
 
 
-def test_llm_direct_http_error_surfaces_provider_detail(monkeypatch):
+def test_llm_direct_http_error_exposes_only_endpoint_and_status(monkeypatch):
     _enable_llm_direct(monkeypatch)
+    import io
     import urllib.error
 
     def fake_urlopen(req, timeout=None):
+        body = io.BytesIO(b'{"error":"provider payload must not escape", "secret":"nope"}')
         raise urllib.error.HTTPError(
-            req.full_url, 429, "rate limited",
-            hdrs=None, fp=None,
+            req.full_url, 429, "rate limited", hdrs=None, fp=body,
         )
 
     with mock_patch.object(tools, "urlopen", fake_urlopen):
         result = json.loads(tools.handle_llm_direct({"messages": _MESSAGES}))
     assert result["status"] == "error"
-    assert "HTTP 429" in result["error"]
+    assert result["error"] == "HTTP 429 from endpoint 'test'."
+    assert "provider payload must not escape" not in result["error"]
+    assert "http://127.0.0.1:9/v1/chat/completions" not in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +498,7 @@ def test_llm_direct_uses_module_urlopen_not_urllib_default(monkeypatch):
     assert calls == ["http://127.0.0.1:9/v1/chat/completions"]
 
 
-def test_llm_direct_redacts_credential_from_http_error(monkeypatch):
+def test_llm_direct_http_error_exposes_no_provider_detail(monkeypatch):
     import io
     import urllib.error
     _enable_llm_direct(monkeypatch)
@@ -509,9 +512,9 @@ def test_llm_direct_redacts_credential_from_http_error(monkeypatch):
     monkeypatch.setattr(tools, "urlopen", fake_urlopen)
     result = json.loads(tools.handle_llm_direct({"messages": _MESSAGES}))
     assert result["status"] == "error"
-    assert "HTTP 401" in result["error"]
+    assert result["error"] == "HTTP 401 from endpoint 'test'."
     assert "test-key" not in result["error"]
-    assert "[redacted]" in result["error"]
+    assert "invalid token" not in result["error"]
 
 
 def test_llm_direct_redacts_credential_from_success_text(monkeypatch):
