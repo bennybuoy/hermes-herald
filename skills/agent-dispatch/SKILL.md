@@ -188,8 +188,9 @@ delegate_subagent(
 Key contracts:
 
 - It works in the classic interactive CLI and desktop/TUI, where Herald resolves the exact commissioning UI session. On the API server, resolution uses only the exact session_id-to-run_id entry in the gateway adapter's active-run registry and a miss fails closed; with no detached delivery capability (e.g. `/v1/runs`), the child runs in-turn and the tool result returns the final summary synchronously.
-- It returns a `task_id` immediately and auto-delivers the final summary or error.
-- It runs in a daemon background thread and dies with the parent process.
+- In async-capable sessions it returns a `task_id` immediately and auto-delivers the final summary or error from a daemon background thread.
+- In supported API runs without detached delivery it waits for the child and returns `{task_id, status, summary|error, model, api_calls, duration_seconds}` directly. `/v1/chat/completions` and explicit/resumed session IDs that do not match an active run ID fail closed.
+- Both execution paths are in-process and die with the parent process.
 - Bare and full model names pass through Hermes's model-switch pipeline.
 - `inherit_context=true` copies only a bounded recent parent user/assistant text window (20 messages, 12,000 characters). System prompts, tool calls/results, memory, and hidden state are excluded. Explicit `context` is always included.
 - `inherit_soul=true` loads the active profile's full `SOUL.md` as primary identity. It remains off by default and does not inherit conversation history, `USER.md`, memory, or project context files.

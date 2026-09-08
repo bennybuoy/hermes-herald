@@ -388,7 +388,7 @@ delegate_subagent(
 | `toolsets=[]` | omitted | Creates a model-only child |
 | `toolsets=[...]` | omitted | Requests an exact subset, intersected with parent capabilities; inherited MCP toolsets are stripped unless explicitly named |
 
-The child runs asynchronously in a daemon thread and returns a `task_id` immediately. Streamed text and tool events reset the stall timer. `interrupt_after_seconds` requests cooperative interruption after a wall-clock threshold; it cannot instantly kill a provider or blocking tool call.
+In async-capable sessions the child runs in a daemon thread and returns a `task_id` immediately. Supported API runs instead wait for the child and return its final result in-turn; `/v1/chat/completions` and explicit/resumed session IDs that do not match an active run ID fail closed. Streamed text and tool events reset the stall timer. `interrupt_after_seconds` requests cooperative interruption after a wall-clock threshold; it cannot instantly kill a provider or blocking tool call.
 
 Because the child is in-process, it is not durable across parent-process exit. Use `dispatch_agent` when process isolation or durable target execution matters.
 
