@@ -3709,13 +3709,14 @@ def _run_delegate_subagent_in_turn(
     parent_agent,
     reasoning_effort,
 ) -> str:
-    """Run the delegate_subagent child on the calling thread and return its JSON.
+    """Wait in the calling tool turn for the child and return its terminal JSON.
 
     Sessions without async delivery (for example ``/v1/runs`` binds
-    ``async_delivery=False``) can never receive a queued completion, so the
-    child runs synchronously on THIS thread — no background thread and no
-    completion_queue put — and the HTTP turn waits for the final
-    ``{task_id, status, summary|error}`` JSON instead of returning detached.
+    ``async_delivery=False``) cannot receive a detached completion. The
+    policy helper supervises the child in a context-preserving worker thread,
+    while this tool call waits for the terminal result. Nothing is put on
+    completion_queue; the HTTP turn receives the final
+    ``{task_id, status, summary|error}`` JSON instead of a detached handle.
     """
     goal = args.get("goal", "")
     model_name = args.get("model", "")

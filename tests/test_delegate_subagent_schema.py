@@ -108,7 +108,7 @@ def test_async_capable_session_returns_dispatched_and_queues_completion(monkeypa
     assert updates and updates[0][1].get("status") == "completed"
 
 
-def test_in_turn_child_runs_on_caller_thread_when_async_delivery_off(monkeypatch):
+def test_in_turn_child_returns_terminal_result_without_queue_when_async_delivery_off(monkeypatch):
     import tools.delegate_tool as delegate_tool
     import tools.process_registry as process_registry
 
