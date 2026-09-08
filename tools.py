@@ -15,11 +15,15 @@ Twelve tools for cross-profile dispatch, local delegation, and bare inference:
   - list_profile_models: GET /v1/models, discover safe aliases for both dispatch modes
 
 All HTTP is done with urllib.request (stdlib). Handlers are synchronous
-except delegate_subagent which runs in a background thread.
+except delegate_subagent, which returns immediately from a daemon
+background thread in async-capable sessions; supported API runs without
+detached delivery instead block in-turn and return the terminal
+summary/error payload.
 """
 
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import json
 import logging
@@ -496,8 +500,14 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
         "fan-out across models (e.g. review code with a fast model while "
         "the parent uses a reasoning model). The subagent runs in the same "
         "process with its own isolated context, terminal session, and "
-        "toolset. The immediate return contains task metadata; the final "
-        "result (summary or error) is auto-delivered when the child completes.\n\n"
+        "toolset. The return contract depends on the session's delivery "
+        "capability: async-capable sessions get task metadata immediately "
+        "and the final result (summary or error) is auto-delivered as a new "
+        "message when the child completes, while supported API runs without "
+        "detached delivery block this tool call and return the terminal "
+        "{task_id, status, summary|error, model, api_calls, "
+        "duration_seconds} payload in-turn. Sessions with no live parent "
+        "context (for example /v1/chat/completions) fail closed.\n\n"
         "The model name is resolved leniently via the same /model switch "
         "pipeline — bare names like 'opus', 'gpt-5', 'glm' work, as do "
         "full 'vendor/model' slugs. If the resolved provider differs from "
@@ -508,12 +518,15 @@ DELEGATE_SUBAGENT_SCHEMA: Dict[str, Any] = {
         "reasoning_effort optionally sets this child's thinking budget "
         "(minimal..ultra, or 'none' to disable) per call, without touching "
         "the delegation config that core delegate_task reads.\n\n"
-        "Runs asynchronously in a daemon background thread and returns a "
-        "task_id immediately. Activity resets a stall timer (10 minutes by "
-        "default), so productive children can run indefinitely. An optional "
-        "wall-clock threshold requests cooperative interruption for that call. "
-        "The final result (summary or error) is auto-delivered as "
-        "a new message when the child finishes. This is in-process rather "
+        "In async-capable sessions it runs in a daemon background thread and "
+        "returns a task_id immediately. Activity resets a stall timer (10 "
+        "minutes by default), so productive children can run indefinitely. "
+        "An optional wall-clock threshold requests cooperative interruption "
+        "for that call. The final result (summary or error) is auto-delivered "
+        "as a new message when the child finishes. In supported API runs "
+        "without detached delivery the same stall/wall-clock policy applies "
+        "but the tool call blocks and returns the terminal summary or error "
+        "directly. This is in-process rather "
         "than durable: use dispatch_agent for profile isolation or work that "
         "must survive the current process."
     ),
@@ -3258,8 +3271,15 @@ def _run_child_with_timeout_policy(
                     done.set()
 
     child.tool_progress_callback = _progress_callback
+    # Profile/session authority (HERMES home override, secret scope, session
+    # ContextVars) lives on THIS thread's context. A bare Thread starts with a
+    # fresh context, so run the worker under a snapshot of the caller's context
+    # or the child resolves process/default-profile state instead of the
+    # commissioning profile (isolation bug for multiplexed API runs).
+    worker_context = contextvars.copy_context()
     worker = threading.Thread(
-        target=_worker,
+        target=worker_context.run,
+        args=(_worker,),
         name="delegate-subagent-policy-worker",
         daemon=True,
     )
@@ -3875,9 +3895,16 @@ def _run_delegate_subagent_in_turn(
 def handle_delegate_subagent(args: dict, **kwargs) -> str:
     """Spawn an in-process subagent with per-call model and timeout policy.
 
-    Runs asynchronously in a background thread. Returns immediately with
-    a task_id. The result re-enters the conversation as a new message via
-    process_registry.completion_queue when the subagent finishes.
+    In async-capable sessions it runs in a daemon background thread and
+    returns immediately with a task_id; the result re-enters the
+    conversation as a new message via process_registry.completion_queue
+    when the subagent finishes. In supported API runs without detached
+    delivery (async_delivery_supported() false) it delegates to
+    _run_delegate_subagent_in_turn, which still uses the policy worker
+    thread for stall/wall-clock supervision but blocks the tool call and
+    returns the terminal {task_id, status, summary|error, model,
+    api_calls, duration_seconds} JSON directly. Sessions with no live
+    parent context (e.g. /v1/chat/completions) fail closed.
 
     Uses the core delegate_task internals (_build_child_agent +
     _run_single_child) directly, injecting a per-call model that the

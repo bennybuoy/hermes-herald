@@ -1,6 +1,5 @@
 """Schema/handler contract tests for delegate_subagent."""
 
-import inspect
 import threading
 import time
 from types import SimpleNamespace
@@ -10,21 +9,20 @@ import pytest
 from hermes_herald import tools
 
 
-def test_delegate_subagent_schema_matches_async_handler():
+def test_delegate_subagent_schema_documents_conditional_return_contract():
     description = tools.DELEGATE_SUBAGENT_SCHEMA["description"]
     properties = tools.DELEGATE_SUBAGENT_SCHEMA["parameters"]["properties"]
-    source = inspect.getsource(tools.handle_delegate_subagent)
 
-    assert "asynchronously" in description
+    # Async-capable sessions: immediate task metadata + auto-delivery.
     assert "task_id" in description
     assert "auto-delivered" in description
-    assert "Runs synchronously" not in description
-    assert "Only the final summary is returned" not in description
-    assert "final result (summary or error)" in description
-    assert "final summary" not in description
-    assert "in-process rather than durable" in description
-    assert "hard wall-clock timeout" not in description
-    assert "cooperative interruption" in description
+    # Supported API runs without detached delivery: blocking terminal payload.
+    assert "block this tool call" in description
+    assert "duration_seconds} payload in-turn" in description
+    # Fail-closed exclusions stay documented.
+    assert "/v1/chat/completions" in description
+    assert "fail closed" in description
+    # Parameter contract unchanged.
     assert properties["inherit_soul"]["type"] == "boolean"
     assert properties["inherit_soul"]["default"] is False
     assert "full SOUL.md" in properties["inherit_soul"]["description"]
@@ -38,11 +36,76 @@ def test_delegate_subagent_schema_matches_async_handler():
     assert properties["interrupt_after_seconds"]["minimum"] == 30
     assert "cooperative" in properties["interrupt_after_seconds"]["description"]
 
-    assert "thread.start()" in source
-    assert '"task_id": task_id' in source
-    assert '"status": "dispatched"' in source
-    assert source.count("_subagent_api_call_count") == 2
-    assert '"api_calls": 0' not in source
+
+def test_async_capable_session_returns_dispatched_and_queues_completion(monkeypatch):
+    import tools.delegate_tool as delegate_tool
+    import tools.process_registry as process_registry
+
+    monkeypatch.setattr(tools, "_async_delivery_supported", lambda: True)
+
+    class FakeQueue:
+        def __init__(self):
+            self.events = []
+
+        def put(self, evt):
+            self.events.append(evt)
+
+    queue = FakeQueue()
+    monkeypatch.setattr(
+        process_registry.process_registry, "completion_queue", queue
+    )
+
+    parent = SimpleNamespace(model="parent-model", _session_messages=[])
+    child = SimpleNamespace(tool_progress_callback=None)
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_agent", lambda **kwargs: child
+    )
+
+    def fake_run_single_child(**kwargs):
+        assert kwargs.get("child") is child
+        return {"status": "completed", "summary": "async child summary"}
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run_single_child)
+
+    monkeypatch.setattr(tools, "_load_state", lambda: {"runs": []})
+    monkeypatch.setattr(tools, "_save_state", lambda state: None)
+    updates = []
+    finished = threading.Event()
+
+    def fake_update_status(*args, **kwargs):
+        updates.append((args, kwargs))
+        finished.set()
+
+    monkeypatch.setattr(tools, "_update_run_status", fake_update_status)
+    monkeypatch.setattr(
+        tools,
+        "_capture_subagent_routing",
+        lambda parent_agent=None: {
+            "session_id": "context-session",
+            "session_key": "context-key",
+            "origin_ui_session_id": "ui-session-9",
+        },
+    )
+
+    result = tools.json.loads(tools.handle_delegate_subagent(
+        {"goal": "audit that"}, parent_agent=parent,
+    ))
+
+    # Immediate return carries task metadata, not the child's terminal summary.
+    assert result["status"] == "dispatched"
+    assert result["task_id"].startswith("subagent-")
+    assert "summary" not in result
+    assert "will be delivered" in result["message"].lower()
+
+    # The final result is auto-delivered as a new queued message.
+    assert finished.wait(timeout=5)
+    assert [evt["type"] for evt in queue.events] == ["async_delegation"]
+    evt = queue.events[0]
+    assert evt["delegation_id"] == result["task_id"]
+    assert evt["status"] == "completed"
+    assert evt["summary"] == "async child summary"
+    assert evt["session_id"] == "context-session"
+    assert updates and updates[0][1].get("status") == "completed"
 
 
 def test_in_turn_child_runs_on_caller_thread_when_async_delivery_off(monkeypatch):
@@ -404,6 +467,100 @@ def test_interrupt_threshold_is_cooperative_and_reports_interrupt_kind():
     error, kind = tools._describe_subagent_error(caught.value)
     assert kind == "interrupt"
     assert "cooperative interrupt threshold" in error
+
+
+def test_timeout_policy_worker_inherits_caller_contextvars(monkeypatch, tmp_path):
+    import hermes_constants
+    import gateway.session_context as session_context
+
+    # Keep the fallback deterministic: no ambient session identity in os.environ.
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+    expected_home = str(tmp_path / "profile-home-a")
+    observed = {}
+
+    def run_child():
+        observed["home"] = hermes_constants.get_hermes_home_override()
+        observed["platform"] = session_context.get_session_env(
+            "HERMES_SESSION_PLATFORM"
+        )
+        observed["session_id"] = session_context.get_session_env(
+            "HERMES_SESSION_ID"
+        )
+        return {"status": "completed", "summary": "ok"}
+
+    child = SimpleNamespace(tool_progress_callback=None)
+    home_token = hermes_constants.set_hermes_home_override(expected_home)
+    session_context.set_session_vars(
+        platform="api_server", session_id="run-ctx-a", async_delivery=False,
+    )
+    try:
+        result = tools._run_child_with_timeout_policy(
+            child=child,
+            run_child=run_child,
+            stall_timeout_seconds=600,
+            interrupt_after_seconds=None,
+            poll_interval_seconds=0.01,
+        )
+    finally:
+        hermes_constants.reset_hermes_home_override(home_token)
+        session_context.reset_session_vars()
+
+    assert result == {"status": "completed", "summary": "ok"}
+    assert observed["home"] == expected_home
+    assert observed["platform"] == "api_server"
+    assert observed["session_id"] == "run-ctx-a"
+
+
+def test_timeout_policy_worker_keeps_concurrent_contexts_distinct(tmp_path):
+    import hermes_constants
+    import gateway.session_context as session_context
+
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def scenario(index):
+        expected_home = str(tmp_path / f"profile-home-{index}")
+        expected_session = f"run-ctx-{index}"
+        observed = {}
+
+        def run_child():
+            observed["home"] = hermes_constants.get_hermes_home_override()
+            observed["session_id"] = session_context.get_session_env(
+                "HERMES_SESSION_ID"
+            )
+            time.sleep(0.05)  # keep the two workers' windows overlapped
+            return {"status": "completed", "summary": f"child-{index}"}
+
+        child = SimpleNamespace(tool_progress_callback=None)
+        home_token = hermes_constants.set_hermes_home_override(expected_home)
+        session_context.set_session_vars(session_id=expected_session)
+        try:
+            barrier.wait(timeout=5)
+            result = tools._run_child_with_timeout_policy(
+                child=child,
+                run_child=run_child,
+                stall_timeout_seconds=600,
+                interrupt_after_seconds=None,
+                poll_interval_seconds=0.01,
+            )
+        finally:
+            hermes_constants.reset_hermes_home_override(home_token)
+            session_context.reset_session_vars()
+        results[index] = (observed, result)
+
+    threads = [threading.Thread(target=scenario, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert set(results) == {0, 1}
+    for index, (observed, result) in results.items():
+        assert result == {"status": "completed", "summary": f"child-{index}"}
+        assert observed["home"] == str(tmp_path / f"profile-home-{index}")
+        assert observed["session_id"] == f"run-ctx-{index}"
 
 
 def test_subagent_api_call_count_uses_result_and_live_child_activity():
