@@ -24,7 +24,7 @@ from hermes_herald import callback
 
 # A deliberately credential-shaped API key + command. None of these must ever
 # appear in tool output, the state file, or origin-session notifications.
-_API_KEY = "AK_SECRET_VALUE_123xyz"
+_API_KEY = "FIXTUREKEY123"
 _SECRET_IN_COMMAND = "TOKEN_LEAK_CANARY_987"
 
 PROFILE_CFG = {"url": "http://localhost:9999", "api_key": _API_KEY}

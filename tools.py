@@ -108,9 +108,8 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
             "instructions": {
                 "type": "string",
                 "description": (
-                    "Optional system prompt override for the target session. "
-                    "Use to set role/behavior (e.g. 'You are a pedagogical "
-                    "reviewer...'). "
+                    "Optional instructions that set the target session's role "
+                    "and behavior (e.g. 'You are a pedagogical reviewer...'). "
                     "Avoid placing secrets or credentials in the task text — "
                     "the dispatch ledger stores the full message as supplied."
                 ),
@@ -335,7 +334,7 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
             "instructions": {
                 "type": "string",
                 "description": (
-                    "Optional system prompt override for this turn. "
+                    "Optional instructions that set the role for this turn. "
                     "Resend it on subsequent calls when it is still required. "
                     "Avoid placing secrets or credentials in the task text — "
                     "the dispatch ledger stores the full message as supplied."
@@ -2819,12 +2818,12 @@ def _request_dispatch_approval_consent(
         f"(untrusted data): {reason}"
     )
     try:
-        try:
-            from tools.approval_prompt import request_elicitation_consent
-        except ImportError:
-            # Pre-Sep-2026-split hosts define this on tools.approval; the
-            # compat pointer there is revert-scheduled for removal and warns.
-            from tools.approval import request_elicitation_consent
+        # Import the defining module directly. ``tools.approval`` re-exported
+        # this only as a revert-scheduled compat pointer, and importing it
+        # through that alias makes the plugin unloadable once the compat layer
+        # is removed (2026-09-14). The defining module is present on every core
+        # this plugin supports.
+        from tools.approval_prompt import request_elicitation_consent
 
         return request_elicitation_consent(
             message,
