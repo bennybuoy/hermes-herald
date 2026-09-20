@@ -298,6 +298,6 @@ Also verify:
 
 - `plugin.yaml` advertises the same 12 tools registered in `__init__.py`;
 - the plugin registers the bundled `agent-dispatch` skill;
-- `plugin.yaml`, README, release card, and hero all say v1.1.0;
+- `plugin.yaml`, README, release card, and hero all advertise the same version as `plugin.yaml`;
 - the working tree is understood and `git diff --check` passes;
 - running Hermes processes were restarted before live verification.

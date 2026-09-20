@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: NousResearch/hermes-agent
-          ref: 212e84176dac687247513885b2670600b6e0d1ed
+          ref: 9fc80ac70f6b97e36556c33bc4895b75558d4136
           path: hermes-agent
 
       - name: Set up Python 3.11

@@ -4,7 +4,7 @@
 
 <p>
   <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes%20Agent-compatible-8B5CF6" alt="Hermes Agent"></a>
-  <img src="https://img.shields.io/badge/version-1.1.0-22C55E" alt="Version 1.1.0">
+  <img src="https://img.shields.io/badge/version-1.1.1-22C55E" alt="Version 1.1.1">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
   <img src="https://img.shields.io/badge/tools-12-orange" alt="12 Tools">
 </p>
@@ -632,6 +632,22 @@ Reliability properties include redirect refusal for credentialed HTTP, atomic st
 - Persistent chat stores one target session handle per configured profile name; use `new_session=True` to start fresh.
 - A target gateway restart can interrupt active work even when the origin still knows the handle.
 
+### Multiplex limitation (known, unfixed)
+
+Herald resolves its configuration home and interpolates credentials from the process
+environment rather than from Hermes' per-profile scope (`hermes_constants.get_hermes_home()`
+and `agent.secret_scope.get_secret()`), and its config cache is not keyed by home.
+
+Each of the 18 single-profile gateways Herald runs on today serves exactly one profile, so
+this is not exercised there. Under Hermes **multiplex** mode — one process serving several
+profiles — an origin profile can read another origin profile's configuration and dispatch
+ledger, and credential interpolation can return the wrong profile's secrets or report a
+present key as missing.
+
+**Until this is fixed, run Herald origins as separate single-profile processes; do not run
+Herald origins in a multiplexed gateway.** These are pre-existing defects, not introduced by
+the current release.
+
 ---
 
 ## Development and tests
@@ -642,7 +658,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **128 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **199 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

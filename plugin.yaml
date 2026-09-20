@@ -2,6 +2,10 @@ name: hermes-herald
 version: 1.1.1
 description: "Hermes Herald — directed cross-profile dispatch with a durable SQLite call ledger, detached graph routing, configured model-route discovery, model-selectable in-process subagents, and host-owned bare LLM inference."
 author: Ben
+# The approval-consent gate imports tools.approval_prompt.request_elicitation_consent,
+# which first exists in Hermes 0.21.0 (module extracted 2026-09-02). Earlier cores
+# only expose it via the removed compat re-export, so the gate fails closed there.
+requires_hermes: ">=0.21.0"
 provides_tools:
   - dispatch_agent
   - check_dispatch
