@@ -103,3 +103,17 @@ def test_bundled_skill_matches_v1_contract():
     )
     for claim in stale_claims:
         assert claim not in text
+
+
+def test_readme_documents_multiplex_scope_and_matching_release():
+    readme = (PLUGIN_DIR / "README.md").read_text(encoding="utf-8")
+    version = _load_manifest()["version"]
+    assert "### Multiplex support" in readme
+    section = readme.split("### Multiplex support", 1)[1].split("\n---", 1)[0]
+    assert "multiplexed gateway" in section
+    assert "A→B→A" in section
+    assert "PluginManager" in section
+    assert "shared ledger" in section
+    assert "Multiplex limitation (known, unfixed)" not in readme
+    assert f"badge/version-{version}-" in readme
+    assert f'alt="Version {version}"' in readme

@@ -4,7 +4,7 @@
 
 <p>
   <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes%20Agent-compatible-8B5CF6" alt="Hermes Agent"></a>
-  <img src="https://img.shields.io/badge/version-1.1.1-22C55E" alt="Version 1.1.1">
+  <img src="https://img.shields.io/badge/version-1.1.2-22C55E" alt="Version 1.1.2">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
   <img src="https://img.shields.io/badge/tools-12-orange" alt="12 Tools">
 </p>
@@ -632,21 +632,22 @@ Reliability properties include redirect refusal for credentialed HTTP, atomic st
 - Persistent chat stores one target session handle per configured profile name; use `new_session=True` to start fresh.
 - A target gateway restart can interrupt active work even when the origin still knows the handle.
 
-### Multiplex limitation (known, unfixed)
+### Multiplex support
 
-Herald resolves its configuration home and interpolates credentials from the process
-environment rather than from Hermes' per-profile scope (`hermes_constants.get_hermes_home()`
-and `agent.secret_scope.get_secret()`), and its config cache is not keyed by home.
+Herald origins may run in separate single-profile processes or inside a multiplexed gateway.
+Configuration and the default state and ledger paths follow Hermes' active profile home;
+the config cache is keyed by canonical home. `${VAR}` credentials resolve at call time
+through the active profile's secret scope, not another origin's process environment.
+Single-profile processes retain their environment-based configuration and credentials.
 
-Each of the 18 single-profile gateways Herald runs on today serves exactly one profile, so
-this is not exercised there. Under Hermes **multiplex** mode — one process serving several
-profiles — an origin profile can read another origin profile's configuration and dispatch
-ledger, and credential interpolation can return the wrong profile's secrets or report a
-present key as missing.
+An A→B→A integration test through the real `PluginManager`, gateway profile scope, and
+registered `dispatch_status` handler proves separate route tables, ledger rows, credentials,
+and recovered sessions and approvals for two origins in one process.
 
-**Until this is fixed, run Herald origins as separate single-profile processes; do not run
-Herald origins in a multiplexed gateway.** These are pre-existing defects, not introduced by
-the current release.
+This is profile scoping, not a sandbox for untrusted plugins. An explicitly configured
+shared ledger still exposes the combined history to its participating origins. Keep JSON
+state files private to each origin. Missing scoped credentials never borrow another
+origin's key, and route capability grants and target authentication remain required.
 
 ---
 
@@ -658,7 +659,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **199 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **215 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 

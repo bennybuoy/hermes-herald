@@ -1,7 +1,7 @@
 ---
 name: agent-dispatch
 description: Configure, operate, troubleshoot, and choose between Hermes Herald's cross-profile dispatch, persistent chat, model-selectable subagents, bare LLM calls, run management, and approval relay tools.
-version: 1.1.1
+version: 1.1.2
 author: Ben
 license: MIT
 metadata:
