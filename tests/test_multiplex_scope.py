@@ -144,3 +144,25 @@ def test_credentials_fail_closed_in_multiplex(tmp_path, monkeypatch, kind, scope
             route, error = tools._resolve_profile("target-test", operation="dispatch")
             assert route == {}
             assert "api_key" in error
+
+
+@pytest.mark.parametrize("kind,filename", [
+    ("state", "hermes-herald-runs.json"),
+    ("ledger", "hermes-herald.db"),
+])
+def test_storage_paths_follow_active_home(tmp_path, monkeypatch, kind, filename):
+    launch = write_home(tmp_path / "launch", "launch")
+    served = write_home(tmp_path / "served", "served")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    resolve = getattr(config, f"get_{kind}_file_path")
+    assert resolve() == launch / filename
+    with home_scope(served):
+        assert resolve() == served / filename
+    assert resolve() == launch / filename
+    custom = tmp_path / f"custom-{filename}"
+    with (served / "config.yaml").open("a") as stream:
+        stream.write(f"  {kind}_file: {custom}\n")
+    importlib.reload(config)
+    with home_scope(served):
+        assert resolve() == custom
+    assert resolve() == launch / filename
