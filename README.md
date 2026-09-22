@@ -642,7 +642,10 @@ Single-profile processes retain their environment-based configuration and creden
 
 An A→B→A integration test through the real `PluginManager`, gateway profile scope, and
 registered `dispatch_status` handler proves separate route tables, ledger rows, credentials,
-and recovered sessions and approvals for two origins in one process.
+and recovered sessions and approvals for two origins in one process. Background listeners
+and delegated subagent threads carry the origin's profile context across thread hops
+(`contextvars.copy_context()` at spawn), and custom `state_file`/`ledger_file` paths expand
+`${HERMES_HOME}`/`$HERMES_HOME` (and other variables) within the active profile scope.
 
 This is profile scoping, not a sandbox for untrusted plugins. An explicitly configured
 shared ledger still exposes the combined history to its participating origins. Keep JSON
@@ -659,7 +662,7 @@ HERMES_HERALD_PLUGIN_DIR=../ HERMES_SOURCE_DIR=/path/to/hermes-agent \
   python3 -m pytest -v
 ```
 
-The release suite currently contains **215 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
+The release suite currently contains **222 tests** covering streaming persistent chat, local and remote model-route discovery, public host-owned LLM execution and trust gates, activity-aware stalls, subagent inheritance controls, async SSE recovery, polling fallback, transactional cancellation, session-owned deny-only approval relay, durable ledger migration, graph lineage and hop budgets, redirect credential isolation, exact TUI parent resolution, bare inference validation, and release contracts.
 
 ## License
 
