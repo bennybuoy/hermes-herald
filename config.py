@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -25,7 +27,7 @@ _config_cache: Optional[dict] = None
 
 def _resolve_hermes_home() -> Path:
     """Find the active HERMES_HOME directory."""
-    return Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+    return get_hermes_home()
 
 
 def _load_config() -> dict:
