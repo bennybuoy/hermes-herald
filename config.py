@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlsplit
 
+from agent.secret_scope import get_secret
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -56,7 +57,7 @@ def _load_config() -> dict:
 
 
 def _resolve_env_var(value: str) -> str:
-    """Resolve a ``${VAR_NAME}`` string from os.environ.
+    """Resolve a ``${VAR_NAME}`` string from the active profile's secrets.
 
     If the value doesn't match the env var pattern, return it as-is.
     If the env var is not set, return an empty string (the API server will
@@ -64,7 +65,7 @@ def _resolve_env_var(value: str) -> str:
     """
     m = _ENV_VAR_RE.match(value.strip())
     if m:
-        return os.environ.get(m.group(1), "")
+        return get_secret(m.group(1), "")
     return value
 
 
@@ -280,7 +281,7 @@ def _resolve_direct_api_key(raw, endpoint: str) -> str:
             f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key must be a "
             "${ENV_VAR} reference, not a literal secret."
         )
-    resolved = os.environ.get(match.group(1), "")
+    resolved = get_secret(match.group(1), "")
     if not resolved:
         raise ValueError(
             f"hermes_herald.llm_direct.endpoints.{endpoint}.api_key environment "

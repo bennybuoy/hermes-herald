@@ -5,6 +5,7 @@ import importlib
 
 import pytest
 
+from agent import secret_scope
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_herald import config
 
@@ -26,6 +27,9 @@ def write_home(home, origin):
         "      url: https://target.invalid\n"
         "      api_key: ${HERALD_TEST_KEY}\n"
         "      capabilities: [dispatch, chat]\n"
+        "  llm_direct:\n    enabled: true\n    endpoints:\n      test:\n"
+        "        base_url: https://inference.invalid/v1\n"
+        "        api_key: ${HERALD_TEST_KEY}\n"
     )
     return home
 
@@ -76,3 +80,67 @@ def test_config_cache_canonicalizes_home_aliases(tmp_path, monkeypatch):
     config._config_cache.clear()
     with home_scope(alias):
         assert config.list_profiles() == ["target-edited"]
+
+
+@contextmanager
+def credential_scope(secrets, *, multiplex):
+    previous = secret_scope.is_multiplex_active()
+    token = secret_scope.set_secret_scope(secrets)
+    secret_scope.set_multiplex_active(multiplex)
+    try:
+        yield
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous)
+
+
+def credential_reader(kind):
+    if kind == "profile":
+        return lambda: config.get_profile_config("target-test")["api_key"]
+    return lambda: config.get_endpoint_config("test")["api_key"]
+
+
+@pytest.mark.parametrize("kind", ["profile", "direct"])
+def test_credentials_follow_scope_at_call_time(tmp_path, monkeypatch, kind):
+    home = write_home(tmp_path / "home", "test")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERALD_TEST_KEY", "launch-test-key")
+    read_key = credential_reader(kind)
+    with credential_scope(None, multiplex=False):
+        assert read_key() == "launch-test-key"
+    for name in ("a", "b", "a"):
+        env_file = tmp_path / f"{name}.env"
+        env_file.write_text(f"HERALD_TEST_KEY={name}-test-key\n")
+        with credential_scope(secret_scope.load_env_file(env_file), multiplex=True):
+            assert read_key() == f"{name}-test-key"
+    with credential_scope(None, multiplex=False):
+        assert read_key() == "launch-test-key"
+
+
+@pytest.mark.parametrize("kind", ["profile", "direct"])
+@pytest.mark.parametrize("scope", [{}, None], ids=["missing", "unscoped"])
+def test_credentials_fail_closed_in_multiplex(tmp_path, monkeypatch, kind, scope):
+    from hermes_herald import tools
+
+    home = write_home(tmp_path / "home", "test")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERALD_TEST_KEY", "must-not-fall-back")
+    read_key = credential_reader(kind)
+    with credential_scope(scope, multiplex=True):
+        if scope is None:
+            with pytest.raises(secret_scope.UnscopedSecretError):
+                read_key()
+        elif kind == "direct":
+            with pytest.raises(ValueError, match="unset or empty"):
+                read_key()
+            result = tools.handle_llm_direct({
+                "endpoint": "test", "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            assert "must-not-fall-back" not in result
+            assert "unset or empty" in result
+        else:
+            assert read_key() == ""
+            route, error = tools._resolve_profile("target-test", operation="dispatch")
+            assert route == {}
+            assert "api_key" in error
