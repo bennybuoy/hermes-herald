@@ -20,6 +20,7 @@ except delegate_subagent which runs in a background thread.
 
 from __future__ import annotations
 
+import contextvars
 import ipaddress
 import json
 import logging
@@ -3257,8 +3258,10 @@ def _run_child_with_timeout_policy(
                     done.set()
 
     child.tool_progress_callback = _progress_callback
+    worker_context = contextvars.copy_context()
     worker = threading.Thread(
-        target=_worker,
+        target=worker_context.run,
+        args=(_worker,),
         name="delegate-subagent-policy-worker",
         daemon=True,
     )
@@ -3899,8 +3902,10 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
             except ImportError:
                 pass
 
+    background_context = contextvars.copy_context()
     thread = threading.Thread(
-        target=_run_in_background,
+        target=background_context.run,
+        args=(_run_in_background,),
         name=f"delegate-subagent-{task_id}",
         daemon=True,
     )

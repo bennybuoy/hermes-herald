@@ -25,6 +25,7 @@ independent and use this module only for completion and approval delivery.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
@@ -1286,9 +1287,11 @@ def start_listener(
 
         _delivery_routes[run_id] = route
         with _listeners_lock:
+            listener_context = contextvars.copy_context()
             thread = threading.Thread(
-                target=_listen_sse,
+                target=listener_context.run,
                 args=(
+                    _listen_sse,
                     run_id,
                     profile,
                     url,

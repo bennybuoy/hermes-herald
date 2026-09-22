@@ -149,6 +149,48 @@ def test_credentials_fail_closed_in_multiplex(tmp_path, monkeypatch, kind, scope
             assert "api_key" in error
 
 
+def test_start_listener_thread_preserves_profile_home_and_secret_scope(
+    tmp_path, monkeypatch,
+):
+    from hermes_herald import callback, tools
+
+    launch = write_home(tmp_path / "launch", "launch")
+    served = write_home(tmp_path / "served", "served")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("HERALD_TEST_KEY", "launch-test-key")
+    run_id = "thread-scoped-run"
+    observed_keys = []
+    errors = []
+
+    def complete_in_listener(*_args):
+        try:
+            observed_keys.append(config._resolve_env_var("${HERALD_TEST_KEY}"))
+            tools._update_run_status(run_id, status="completed")
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(callback, "_listen_sse", complete_in_listener)
+    with home_scope(served), credential_scope(
+        {"HERALD_TEST_KEY": "served-test-key"}, multiplex=True,
+    ):
+        tools._persist_run(run_id, "target-served", "thread scope")
+        callback.start_listener(
+            run_id, "target-served", "https://target.invalid",
+            "transport-key", "thread scope",
+        )
+        listener = callback._listeners[run_id]
+        listener.join(timeout=5)
+        assert not listener.is_alive()
+        state = tools._load_state()
+
+    callback._cleanup_listener(run_id)
+    assert not any(isinstance(exc, secret_scope.UnscopedSecretError) for exc in errors)
+    assert errors == []
+    assert observed_keys == ["served-test-key"]
+    assert next(run for run in state["runs"] if run["run_id"] == run_id)["status"] == "completed"
+    assert not (launch / "hermes-herald-runs.json").exists()
+
+
 @pytest.mark.parametrize("kind,filename", [
     ("state", "hermes-herald-runs.json"),
     ("ledger", "hermes-herald.db"),
