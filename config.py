@@ -19,10 +19,9 @@ logger = logging.getLogger(__name__)
 
 _ENV_VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
-# Cache the loaded config so we don't re-read config.yaml on every tool call.
-# The gateway restarts to pick up config changes, so a process-lifetime cache
-# is fine.
-_config_cache: Optional[dict] = None
+# Cache raw config per canonical home; resolve credentials at call time.
+# The gateway restarts to pick up config changes.
+_config_cache: dict[str, dict] = {}
 
 
 def _resolve_hermes_home() -> Path:
@@ -36,11 +35,11 @@ def _load_config() -> dict:
     Returns an empty dict if the section is missing or the file is unreadable.
     The result is cached for the process lifetime.
     """
-    global _config_cache
-    if _config_cache is not None:
-        return _config_cache
+    hermes_home = _resolve_hermes_home().resolve()
+    home_key = str(hermes_home)
+    if home_key in _config_cache:
+        return _config_cache[home_key]
 
-    hermes_home = _resolve_hermes_home()
     config_path = hermes_home / "config.yaml"
     try:
         import yaml
@@ -48,13 +47,12 @@ def _load_config() -> dict:
             full_config = yaml.safe_load(f) or {}
     except Exception as e:
         logger.warning("hermes-herald: cannot load %s: %s", config_path, e)
-        _config_cache = {}
-        return _config_cache
+        _config_cache[home_key] = {}
+        return _config_cache[home_key]
 
-    _config_cache = full_config.get("hermes_herald", {}) or {}
-    if not isinstance(_config_cache, dict):
-        _config_cache = {}
-    return _config_cache
+    section = full_config.get("hermes_herald", {}) or {}
+    _config_cache[home_key] = section if isinstance(section, dict) else {}
+    return _config_cache[home_key]
 
 
 def _resolve_env_var(value: str) -> str:
