@@ -2,6 +2,9 @@
 
 from contextlib import contextmanager
 import importlib
+import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -166,3 +169,53 @@ def test_storage_paths_follow_active_home(tmp_path, monkeypatch, kind, filename)
     with home_scope(served):
         assert resolve() == custom
     assert resolve() == launch / filename
+
+
+def write_recovery_state(home, origin):
+    pending = {
+        "run_id": f"approval-{origin}", "profile": "shared-target",
+        "delivery_id": f"delivery-{origin}", "command": f"display {origin}",
+    }
+    (home / "hermes-herald-runs.json").write_text(json.dumps({"runs": [
+        {"run_id": f"chat-{origin}", "profile": "shared-target",
+         "session_id": f"session-{origin}", "type": "chat", "status": "completed"},
+        {"run_id": f"approval-{origin}", "profile": "shared-target",
+         "status": "waiting_for_approval", "pending_approval": pending},
+    ]}))
+
+
+@contextmanager
+def loaded_plugin(home):
+    from hermes_cli.plugins import PluginManager
+    from hermes_cli.plugins_manifest import parse_manifest_file
+
+    root = Path(os.environ["HERMES_HERALD_PLUGIN_DIR"])
+    manifest = parse_manifest_file(root / "plugin.yaml", root, "user", "")
+    assert manifest is not None
+    manager = PluginManager(scope_key=str(home.resolve()))
+    try:
+        manager._load_plugin(manifest)
+        loaded = manager._plugins[manifest.name]
+        assert loaded.enabled, loaded.error
+        yield loaded.module
+    finally:
+        manager.unload()
+
+
+@pytest.mark.parametrize("kind", ["sessions", "approvals"])
+def test_boot_recovery_uses_manager_home(tmp_path, monkeypatch, kind):
+    launch = write_home(tmp_path / "launch", "launch")
+    served = write_home(tmp_path / "served", "served")
+    for home, origin in [(launch, "launch"), (served, "served")]:
+        write_recovery_state(home, origin)
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    # No caller home override: register() must inherit the manager's own scope.
+    with credential_scope({}, multiplex=True), loaded_plugin(served) as plugin:
+        callback = importlib.import_module(f"{plugin.__name__}.callback")
+        if kind == "sessions":
+            assert callback.get_profile_session_id("shared-target") == "session-served"
+        else:
+            recovered = callback.get_pending_approval("approval-served")
+            assert recovered is not None
+            assert recovered["delivery_id"] == "delivery-served"
+            assert callback.get_pending_approval("approval-launch") is None
