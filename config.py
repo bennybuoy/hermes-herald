@@ -19,6 +19,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 _ENV_VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_PATH_ENV_VAR_RE = re.compile(r"\$(?:\{([^}]*)\}|([A-Za-z0-9_]+))")
 
 # Cache raw config per canonical home; resolve credentials at call time.
 # The gateway restarts to pick up config changes.
@@ -157,13 +158,28 @@ def get_default_profile() -> Optional[str]:
     return cfg.get("default_profile")
 
 
+def _expand_storage_path(raw: Any) -> Path:
+    """Expand a configured storage path within the active profile scope."""
+    value = os.path.expanduser(str(raw))
+    home = str(_resolve_hermes_home())
+
+    def replace(match: re.Match) -> str:
+        name = match.group(1) if match.group(1) is not None else match.group(2)
+        if name == "HERMES_HOME":
+            return home
+        resolved = get_secret(name)
+        return match.group(0) if resolved is None else resolved
+
+    return Path(_PATH_ENV_VAR_RE.sub(replace, value))
+
+
 def get_state_file_path() -> Path:
     """Return the path to the run-state JSON file."""
     cfg = _load_config()
     raw = cfg.get("state_file")
     if not raw:
         return _resolve_hermes_home() / "hermes-herald-runs.json"
-    return Path(os.path.expandvars(os.path.expanduser(str(raw))))
+    return _expand_storage_path(raw)
 
 
 def get_ledger_file_path() -> Path:
@@ -176,7 +192,7 @@ def get_ledger_file_path() -> Path:
     raw = cfg.get("ledger_file")
     if not raw:
         return _resolve_hermes_home() / "hermes-herald.db"
-    return Path(os.path.expandvars(os.path.expanduser(str(raw))))
+    return _expand_storage_path(raw)
 
 
 def get_chat_timeout() -> float:

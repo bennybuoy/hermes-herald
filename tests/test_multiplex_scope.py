@@ -213,6 +213,58 @@ def test_storage_paths_follow_active_home(tmp_path, monkeypatch, kind, filename)
     assert resolve() == launch / filename
 
 
+@pytest.mark.parametrize("kind,filename", [
+    ("state", "custom-state.json"),
+    ("ledger", "custom-ledger.db"),
+])
+@pytest.mark.parametrize(
+    "home_ref", ["${HERMES_HOME}", "$HERMES_HOME"], ids=["braced", "bare"],
+)
+def test_custom_storage_paths_expand_active_home(
+    tmp_path, monkeypatch, kind, filename, home_ref,
+):
+    launch = write_home(tmp_path / "launch", "launch")
+    served = write_home(tmp_path / "served", "served")
+    for home in (launch, served):
+        with (home / "config.yaml").open("a") as stream:
+            stream.write(f"  {kind}_file: {home_ref}/{filename}\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    importlib.reload(config)
+    resolve = getattr(config, f"get_{kind}_file_path")
+
+    assert resolve() == launch / filename
+    with home_scope(served):
+        assert resolve() == served / filename
+    assert resolve() == launch / filename
+
+
+@pytest.mark.parametrize("kind,filename", [
+    ("state", "custom-state.json"),
+    ("ledger", "custom-ledger.db"),
+])
+def test_custom_storage_paths_expand_other_profile_variables(
+    tmp_path, monkeypatch, kind, filename,
+):
+    launch = write_home(tmp_path / "launch", "launch")
+    served = write_home(tmp_path / "served", "served")
+    for home in (launch, served):
+        with (home / "config.yaml").open("a") as stream:
+            stream.write(f"  {kind}_file: ${{HERALD_STORAGE_ROOT}}/{filename}\n")
+    launch_root = tmp_path / "launch-storage"
+    served_root = tmp_path / "served-storage"
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    monkeypatch.setenv("HERALD_STORAGE_ROOT", str(launch_root))
+    importlib.reload(config)
+    resolve = getattr(config, f"get_{kind}_file_path")
+
+    assert resolve() == launch_root / filename
+    with home_scope(served), credential_scope(
+        {"HERALD_STORAGE_ROOT": str(served_root)}, multiplex=True,
+    ):
+        assert resolve() == served_root / filename
+    assert resolve() == launch_root / filename
+
+
 def write_recovery_state(home, origin):
     pending = {
         "run_id": f"approval-{origin}", "profile": "shared-target",
