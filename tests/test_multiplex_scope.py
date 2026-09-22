@@ -219,3 +219,52 @@ def test_boot_recovery_uses_manager_home(tmp_path, monkeypatch, kind):
             assert recovered is not None
             assert recovered["delivery_id"] == "delivery-served"
             assert callback.get_pending_approval("approval-launch") is None
+
+
+def test_real_plugin_managers_isolate_a_b_a(tmp_path, monkeypatch):
+    from gateway.run import _profile_runtime_scope
+    from tools.registry import registry
+
+    a = write_home(tmp_path / "a", "a")
+    b = write_home(tmp_path / "b", "b")
+    for home, name in [(a, "a"), (b, "b")]:
+        write_recovery_state(home, name)
+        (home / ".env").write_text(f"HERALD_TEST_KEY={name}-test-key\n")
+    monkeypatch.setenv("HERMES_HOME", str(a))
+    monkeypatch.setenv("HERALD_TEST_KEY", "launch-test-key")
+    with credential_scope({}, multiplex=True), loaded_plugin(a) as pa, loaded_plugin(b) as pb:
+        assert pa is not pb
+        with _profile_runtime_scope(a, hydrate_secrets=False):
+            ledger_a = importlib.import_module(f"{pa.__name__}.ledger")
+            ledger_a.record_dispatch(
+                edge_id="edge-a", run_id="ledger-a", origin_profile="a",
+                target_profile="target-a", dispatch_type="run", delivery="none",
+                message="private-a", trace_id="trace-a", status="completed",
+            )
+        credentials = []
+        for home, name, plugin in [(a, "a", pa), (b, "b", pb), (a, "a", pa)]:
+            with _profile_runtime_scope(home, hydrate_secrets=False):
+                entry = registry.get_entry("dispatch_status")
+                assert entry is not None
+                assert entry.handler.__module__ == f"{plugin.__name__}.tools"
+                result = json.loads(entry.handler({}))
+                expected_ids = {f"chat-{name}", f"approval-{name}"}
+                if name == "a":
+                    expected_ids.add("ledger-a")
+                assert {row["run_id"] for row in result["dispatches"]} == expected_ids
+                assert result["total"] == len(expected_ids)
+                topology = result["topology"]
+                assert topology["origin_profile"] == name
+                assert [route["profile"] for route in topology["configured_outbound"]] == [f"target-{name}"]
+                cfg = importlib.import_module(f"{plugin.__name__}.config")
+                credentials.append((
+                    cfg.get_profile_config(f"target-{name}")["api_key"],
+                    cfg.get_endpoint_config("test")["api_key"],
+                ))
+                callback = importlib.import_module(f"{plugin.__name__}.callback")
+                assert callback.get_profile_session_id("shared-target") == f"session-{name}"
+                other = "b" if name == "a" else "a"
+                assert callback.get_pending_approval(f"approval-{other}") is None
+        assert credentials == [(f"{name}-test-key", f"{name}-test-key") for name in ("a", "b", "a")]
+    assert os.environ["HERMES_HOME"] == str(a)
+    assert os.environ["HERALD_TEST_KEY"] == "launch-test-key"
