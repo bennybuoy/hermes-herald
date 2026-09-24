@@ -654,6 +654,35 @@ origin's key, and route capability grants and target authentication remain requi
 
 ---
 
+## Releasing a version
+
+Every version bump must complete the **full publish ceremony**, not just the commit. The
+v1.2.0 gap (main pushed with `chore: release v1.2.0`, but no tag, no GitHub Release, and
+stale artwork) shipped publicly because the contract script checked identity strings only.
+
+Release checklist, in order:
+
+1. Bump `version` in `plugin.yaml` **and** `skills/agent-dispatch/SKILL.md` (frontmatter).
+2. Update the version badge and any version text in `README.md` (`img.shields.io/badge/version-…`).
+3. Update release artwork so visible version strings match (`assets/hero-banner.png`,
+   `assets/release-x-card.png`). The contract script checks the machine-readable surfaces;
+   artwork is on you — verify it by opening the image, not by assumption.
+4. Add release notes for everything since the previous tag.
+5. Run `python3 scripts/check_release_contract.py` — it now also fails on version drift
+   across `plugin.yaml`, the skill frontmatter, and the README badge.
+6. Push the release commit to `main`.
+7. **Tag the exact SHA and push the tag** (`git tag vX.Y.Z <sha> && git push public vX.Y.Z`).
+   Every previous tag must have a corresponding GitHub Release — check for older gaps while
+   you are here.
+8. Create the GitHub Release from that tag (attach release notes), then **read it back**
+   (`gh release view`) before calling the release done.
+
+The commit alone is not the release. A `chore: release vX.Y.Z` on `main` without a matching
+tag and GitHub Release is a half-release: install instructions say one version while the
+published surface says another.
+
+---
+
 ## Development and tests
 
 ```bash

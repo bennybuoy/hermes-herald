@@ -110,6 +110,8 @@ list_profile_models(profile="reviewer")
 
 `ping_profile` establishes reachability. `list_profile_models` authenticates to the target and returns exact `model_routes` aliases that may be supplied to `dispatch_agent` or `dispatch_chat`.
 
+**Catalogue before dispatch — always.** Never guess a model alias or pass a bare model name to `dispatch_agent`/`dispatch_chat`: the target accepts unknown names and silently runs its default model instead, which burns the run on the wrong model (and, with a broken default provider binding, fails mid-run with a provider error after the task has started). The preflight only protects aliases you could have looked up. Call `list_profile_models(profile=...)` first, copy one exact `pass_as_model` alias, and pin `provider` when the listing shows one. If the catalogue call fails or the alias is missing, fix that before dispatching — do not "just send it" against the raw `/v1/runs` endpoint, which bypasses every guardrail.
+
 ### 2. Write a self-contained brief
 
 A `dispatch_agent` run does not inherit the origin conversation. Include the goal, paths/URLs/errors, constraints, output format, and verification requirements in `message`.
@@ -279,6 +281,17 @@ Safety and scope:
 Call `list_profile_models(profile=...)` and use one of the exact advertised route aliases. The target's primary identity or an arbitrary provider/model slug is not sufficient unless it is also declared as a route alias. Omit `model` to use the target default.
 
 If the listing is shorter than the models you know the target can run, edit **that target's** `platforms.api_server.extra.model_routes`, restart its gateway, and list again. Origin `hermes_herald.profiles` does not define the catalog.
+
+**Multiplexed targets can advertise the wrong catalog.** When the target gateway runs `gateway.multiplex_profiles: true`, all profiles share one listener at `/p/<profile>/…`. Known Hermes-core behavior at time of writing: the `/v1/models` listing (and model-route lookup) can reflect the **launch profile's** `model_routes` instead of the URL-selected profile's — so aliases declared on the target profile may be missing, and every `/p/<name>/` listing may look identical. Two consequences:
+
+- Do not treat a missing alias as proof it is not configured; compare against the target profile's `config.yaml`.
+- An alias the listing omits may still be honored on dispatch if the target's route table resolves it — but a **silent fallback to the target's default model** is also possible. Prefer pinning `provider` and verifying the run's reported model after it starts.
+
+If the target's declared aliases are missing from its listing under multiplexing, file or watch the upstream Hermes issue; declaring the same alias on the launch profile is a workaround, not a fix.
+
+### Stale origin URL after moving to a multiplexed gateway
+
+If `ping_profile` says the target is unreachable but the target gateway is up, check whether the URL predates multiplexing. Per-profile listeners on their own ports (`http://host:8662`) are replaced by the shared listener at `http://host:8642/p/<profile>/`. Update `hermes_herald.profiles.<name>.url` to the `/p/<profile>/` path. A stale URL makes every dispatch fail with "target API server is unreachable" even though the target serves traffic happily.
 
 ### Approval notice does not arrive
 
