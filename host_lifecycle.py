@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import secrets
 import threading
+from dataclasses import asdict, is_dataclass
 
 MAX_TASKS = 128
 
@@ -22,7 +23,7 @@ HOST_DELEGATE_SUBAGENT_SCHEMA = {
         "Hermes determines child role and further delegation from its depth policy; "
         "exact tool restrictions (including model-only), conversation/SOUL inheritance "
         "options and per-call reasoning/timeouts are unsupported and rejected before "
-        "launch. Use in_process for those options. Provide self-contained goal/context. "
+        "launch in both execution modes. Provide self-contained goal/context. "
         "Model/provider are exact lifecycle routing values, not the lenient /model "
         "switch pipeline. Omitted provider uses delegation config before the parent. "
         "Task handles last only for this plugin host lifetime (128 retained tasks); "
@@ -71,6 +72,11 @@ _PUBLIC_FIELDS = {
 }
 
 
+def lifecycle_record(value):
+    """Normalize native immutable records and isolated-host wire mappings."""
+    return asdict(value) if is_dataclass(value) else dict(value)
+
+
 class HostLifecycleAdapter:
     """One bounded, non-persistent handle table per Herald registration.
 
@@ -93,10 +99,10 @@ class HostLifecycleAdapter:
         unsupported = set(args) - _ACTION_FIELDS[action] - {"action"}
         if unsupported:
             names = ", ".join(sorted(unsupported))
-            raise ValueError(f"Unsupported {action} options: {names}. Use in_process to preserve requested policies; "
-                             "omit options only if those policies are not needed.")
+            raise ValueError(f"Unsupported {action} options: {names}. The public lifecycle cannot preserve these policies; "
+                             "no child was launched. Omit options only if those policies are not needed.")
         if "inherit_toolsets" in args and args["inherit_toolsets"] is not True:
-            raise ValueError("inherit_toolsets must be true in host mode. Use in_process for model-only or exact toolsets.")
+            raise ValueError("inherit_toolsets must be true. The public lifecycle cannot preserve model-only or exact toolsets.")
         HostLifecycleAdapter._validate_fields(args, action)
         return action
 
@@ -132,9 +138,8 @@ class HostLifecycleAdapter:
             # Never print, log, or echo them; leave the task available for retry.
             return json.dumps({"status": "error", "delivery": "poll",
                                "error": "Hermes lifecycle call failed. Retry from the owning active session; "
-                                        "host mode requires the PR #133762 transport candidate "
-                                        "c2a785b4e3a59ba49dc564e23e5bffab89dd9cce. "
-                                        "Check delegation routing/policy, or use in_process."})
+                                        "requires the public ctx.subagent_lifecycle facade with per-launch provider support. "
+                                        "Upgrade Hermes and check delegation routing/policy. No legacy fallback."})
         return json.dumps(payload)
 
     def _perform(self, action, args, session):
@@ -144,14 +149,15 @@ class HostLifecycleAdapter:
                 if len(self._tasks) >= MAX_TASKS:
                     return {"status": "error", "delivery": "poll",
                             "error": "Herald host task capacity reached (128 retained tasks). No child launched. "
-                                     "Retrieve outstanding results before restarting the host; use in_process if needed."}
+                                     "Retrieve outstanding results before restarting; no task was evicted."}
                 task = "herald-host-" + secrets.token_hex(16)
                 request = {name: args[name] for name in ("goal", "context", "model", "provider") if name in args}
-                request.update(role="leaf", parent_session_id=session)
+                request.update(role="leaf", parent_session_id=session, provider=args.get("provider"))
                 handle = service.launch(request)
+                public_handle = lifecycle_record(handle)
                 self._tasks[task] = (session, handle)
             return {"status": "dispatched", "delivery": "poll", "task_id": task,
-                    "model": handle.get("model"), "provider": handle.get("provider"),
+                    "model": public_handle.get("model"), "provider": public_handle.get("provider"),
                     "next_action": {"action": "result", "task_id": task}}
         task = args["task_id"]
         with self._lock:
@@ -162,7 +168,7 @@ class HostLifecycleAdapter:
                              "host restart loses handles."}
         handle = record[1]
         # This core check is necessary even when the local session label matches.
-        status = service.status(handle)
+        status = lifecycle_record(service.status(handle))
         if status.get("state") == "UNKNOWN":
             return {"status": "error", "delivery": "poll", "task_id": task,
                     "error": "Hermes rejected task ownership or the result expired. Use the owning active session; "
@@ -172,9 +178,9 @@ class HostLifecycleAdapter:
         elif action == "steer":
             raw = {"accepted": service.steer(handle, args["text"])}
         elif action == "cancel":
-            raw = service.cancel(handle, reason=args.get("reason", "Herald caller requested cancellation"))
+            raw = lifecycle_record(service.cancel(handle, reason=args.get("reason", "Herald caller requested cancellation")))
         else:
-            raw = service.result(handle)
+            raw = lifecycle_record(service.result(handle))
         fields = ("accepted",) if action == "steer" else _PUBLIC_FIELDS[action]
         public = {name: raw[name] for name in fields if name in raw}
         payload = {"task_id": task, "delivery": "poll", **public}

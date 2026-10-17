@@ -89,7 +89,10 @@ def test_bundled_skill_matches_v1_contract():
     assert "hermes_herald:" in text
     assert f"{len(manifest['provides_tools'])} tools" in text
     assert "interrupt_after_seconds" in text
-    assert "inherit_soul=true" in text
+    assert "ctx.subagent_lifecycle" in text
+    assert "both modes reject" in text
+    assert "`inherit_soul`" in text
+    assert "no legacy fallback" in text
     assert 'skill_view("hermes-herald:agent-dispatch")' in text
 
     stale_claims = (

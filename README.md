@@ -16,7 +16,7 @@ Hermes Herald turns one Hermes Agent into a **conductor of specialist agents and
 | Herald adds | Why you would want it |
 |---|---|
 | **📡 A network of named Hermes agents** | Ask another profile a question, continue the conversation later, or send independent work to several specialists in parallel. Each target keeps its own identity, memory, skills, credentials, tools, and runtime. |
-| **🔀 A model switchboard for subagents** | Spawn a local child with the model, context, SOUL identity, and tool access appropriate to this one task—without changing the parent agent. |
+| **🔀 A model switchboard for subagents** | Launch a local child through the public lifecycle with an exact provider/model pair and explicit task context—without changing the parent agent. |
 | **🧠 A lightweight inference lane** | Use a model for classification, extraction, translation, scoring, or JSON generation without paying for an agent loop and a large tool schema. |
 
 These are independent. You can use Herald only for `llm_call`, only for model-selectable subagents, or build a multi-host network of persistent specialist profiles.
@@ -29,7 +29,13 @@ These are independent. You can use Herald only for `llm_call`, only for model-se
 > to the supported workflow. This is **plugin-process isolation**, not shared-gateway
 > or multi-profile isolation: Herald supports profile-scoped use in a shared gateway.
 
-## What's new in 1.2.0
+## Unreleased lifecycle migration
+
+Local launch now requires the provider-aware public lifecycle. Automatic
+in-process completion is retained; legacy per-call policy options fail closed
+where core cannot preserve them. See [routing and policy migration](#routing-and-policy-migration).
+
+## What shipped in 1.2.0
 
 - Compatibility with current Hermes YAML dependencies, without requiring PyYAML
   on hosts that use `ruamel.yaml`.
@@ -66,7 +72,7 @@ This is the most important distinction in Herald:
 |---|---|---|---|---|
 | A conversation with a named specialist | `dispatch_chat` | Final reply; blocks the current agent turn | Reuses a persistent target session; streamed activity resets the stall timer | Target default or a verified target `model_routes` alias |
 | Independent work on another Hermes profile | `dispatch_agent` | `run_id` immediately | Fresh target session; monitored by SSE/polling or explicitly detached | Target default or a verified target `model_routes` alias |
-| A local child agent with a different model | `delegate_subagent` | `task_id` immediately; automatic completion in supported `in_process` mode | Non-durable; explicit conversation, identity and tool inheritance controls | Hermes model-switch resolution; see the experimental host subset below |
+| A local child agent with a different model | `delegate_subagent` | `task_id` immediately; automatic completion in supported `in_process` mode | Non-durable; explicit brief and core safe inheritance | Exact lifecycle provider/model pair; see policy migration below |
 | Classification, extraction, translation, scoring | `llm_call` | Text synchronously | No agent loop and no tools | Hermes provider/model routing |
 | Direct endpoint experiments | `llm_direct` | Text synchronously | No agent loop; separately opt-in | Pre-configured endpoint and allowed model; bypasses host LLM routing |
 
@@ -83,13 +89,11 @@ dispatch_chat(profile="tutor", message="Now adapt that example to cache results"
 dispatch_agent(profile="reviewer", message="Review the current diff. Do not edit.")
 dispatch_agent(profile="researcher", message="Find authoritative sources for the design.")
 
-# In plugins.isolation: in_process, choose a local model and inheritance.
+# In plugins.isolation: in_process, provide a self-contained brief.
 delegate_subagent(
     goal="Classify the test failures by likely root cause",
-    model="gpt-5",
-    inherit_context=True,
-    inherit_soul=True,
-    toolsets=[],
+    provider="<configured-provider>", model="<exact-model>",
+    context="Failures and repository path: ...",
 )
 
 # Skip the agent machinery for a small inference job.
@@ -482,147 +486,96 @@ Auto-delivery is process-bound: restarting the origin loses its active listener.
 
 ---
 
-## Pillar 2 — A model switchboard for local subagents
+## Pillar 2 — Public lifecycle delegation
 
-Hermes core’s `delegate_task` uses normal delegation routing. `delegate_subagent`
-adds **per-call model choice**. The supported workflow, including automatic
-completion delivery and inheritance/reasoning controls, requires
-`plugins.isolation: in_process`. Shared-gateway profile scoping does not change
-this plugin-execution requirement.
+Both execution modes launch through **`ctx.subagent_lifecycle`**. Hermes owns
+child construction, provider credential selection, pool leasing/refresh,
+cancellation, resource cleanup and finalization. Herald never obtains a live
+child, rewrites its credentials or rebinds a core method.
 
-### Experimental isolated host: explicit polled lifecycle
-
-**Minimum tested prerequisite:** Hermes transport-fix [PR #133762](https://github.com/NousResearch/hermes-agent/pull/133762), exact
-candidate **`c2a785b4e3a59ba49dc564e23e5bffab89dd9cce`** (or a later upstream
-revision retaining that fix and lifecycle contract). This is a PR candidate,
-not a claimed released-version requirement. Herald adapts to Hermes's existing
-`ctx.subagent_lifecycle`; no Hermes core patch is included here.
-
-The CI lane pins the later tested revision
-**`c72f29e0a3608e2276e311c1c9a891aedf2acb17`**. Neither revision supplies Herald's
-automatic host-completion workflow. A passing adapter suite proves only the
-explicitly polled subset; it does not certify full isolated-host support.
-
-When Hermes loads Herald inside `plugins.isolation: host`, registration selects
-a host-specific schema and handler for the same `delegate_subagent` tool:
+**Compatibility change from 1.2.0:** local delegation now requires the public
+provider-aware lifecycle contract (introduced by upstream `ad37bfb17fb`), tested
+at public main **`e6f57427c198cfd96854522b7a9159eb007e13c2`**. This is a
+capability/commit requirement, not an invented numbered host release. Older
+hosts still load Herald's other tools, but delegation fails clearly; there is
+no private-builder fallback. An active Hermes parent turn is required.
 
 ```python
-delegate_subagent(action="launch", goal="Review the diff. Do not edit.",
-                  context="Repo: /srv/app; focus on token handling.",
-                  provider="openai-codex", model="gpt-5")
-# Response includes delivery="poll", opaque task_id, and:
-# next_action={"action": "result", "task_id": "<returned task_id>"}
+delegate_subagent(goal="Review the diff. Do not edit.",
+                  context="Repository: /srv/app; focus on token handling.",
+                  provider="<configured-provider>", model="<exact-model>")
 delegate_subagent(action="status", task_id="<returned task_id>")
 delegate_subagent(action="result", task_id="<returned task_id>")
 delegate_subagent(action="steer", task_id="<returned task_id>", text="Focus on expiry handling")
 delegate_subagent(action="cancel", task_id="<returned task_id>", reason="No longer needed")
 ```
 
-- Omit `action` for launch. `goal` is required for launch; controls require the
-  exact returned Herald `task_id`, and steering requires `text`. Control calls
-  must occur in the **owning active Hermes session**. Hermes rechecks ownership
-  on every action; a caller-supplied session label cannot transfer ownership.
-- Delivery is **poll only**. Follow the returned `next_action` on this same
-  tool, not `check_dispatch`. A not-ready result returns `ready=false`; a ready
-  result retains the terminal summary/error and usage metadata and is repeatable.
-  Do other useful work between polls. No completion message is promised.
-- Herald performs no background RPC/polling after tool return: that path loses
-  the active parent in the current host transport. `ctx.inject_message` is
-  consent-gated user-input scheduling, not native session-safe completion, and
-  is neither enabled nor used by this adapter.
-- `model` and `provider` pass unchanged to the lifecycle API. Pin both for an
-  exact provider/model pair; this is **not** the lenient `/model` pipeline.
-  Omitted provider uses delegation config first, then the parent; omitted model
-  uses Hermes's delegation route. Do not assume omission always follows the
-  live parent's model/provider.
-- Tools use Hermes's normal safe inherited parent policy (including its MCP
-  inheritance rules). Only omitted or `inherit_toolsets=true` is supported.
-  **All explicit toolset lists, including `[]`, and `inherit_toolsets=false`
-  fail before launch.** The current lifecycle API turns an empty list into
-  inheritance, can append MCP tools to explicit lists, and does not ensure
-  Herald's exact-subset contract. Herald never substitutes inherited tools for
-  a requested model-only/restricted child.
-- `inherit_context`, `inherit_soul`, per-call `reasoning_effort`,
-  `stall_timeout_seconds`, `interrupt_after_seconds`, or other timeout fields
-  are rejected when supplied, even if false/null/default-valued. No option is
-  silently ignored. Provide explicit `context`; normal Hermes delegation
-  reasoning/timeout and child identity defaults apply. Use `in_process` for
-  Herald's legacy per-call policies. Role overrides, per-tool blocking and
-  working-directory overrides are also unsupported. Hermes determines the
-  actual child role from its delegation depth policy; Herald does not promise
-  a non-delegating leaf when the host permits further delegation.
-- Cancellation requests cooperative interruption, not confirmed termination.
-  Steering queues text only while supported by the child; check `accepted`.
-- Herald stores at most **128 tasks per registration**, in memory only. At
-  capacity, new launches fail without evicting prior tasks or creating a child.
-  Capability-bearing core handles are private, never returned or logged by the
-  adapter. No handles/results are persisted to Herald's dispatch ledger/cache.
-  Host unload/restart loses these IDs; children may still be running in Hermes.
-  Retrieve results and cancel unfinished work before restarting. Hermes's
-  terminal retention is **one hour**; retrieve promptly. Neither host nor parent
-  restart recovery is supported. Use `dispatch_agent` for durable target work.
+### Delivery and ownership
 
-### Supported in-process mode
+- **`in_process`:** returns `delivery="callback"` and a `task_id` immediately;
+  one context-bound observer submits the final summary/error to the native
+  completion queue for the **original durable spawning session**. `/new` must
+  not retarget it to a replacement conversation. Keep that session and process
+  alive. Sessions unable to accept detached results fail before launch.
+- **`host`:** returns `delivery="poll"`; no automatic completion or background
+  RPC is attempted after tool return. Follow `next_action` on this same tool,
+  not `check_dispatch`. This remains a polling-only subset, not full isolated
+  host support for remote callbacks or approvals.
+- Both modes provide status/result/cancel/steer in the owning active parent
+  session. A forged session label cannot bypass the core ownership check.
+  `ready=false` means not finished. Terminal results are immutable and repeatable.
+  Cancellation is cooperative: `accepted` does not mean the child has stopped.
+- Capability-bearing handles never appear in tool responses, logs or ledger
+  rows. IDs are memory-only, bounded to **128 tasks per registration**; capacity
+  refusal does not evict existing work. Core retains terminal results for one
+  hour. Retrieve/cancel promptly before unload or restart; neither handles nor
+  child threads survive process exit.
+- In-process provenance records remain available in Herald's state/ledger, but
+  are not reconnectable handles. If state writing or observer startup fails
+  after acceptance, the receipt still reports the launched child and supplies
+  a poll action; Herald never launches a replacement or invites a blind retry.
 
-```python
-delegate_subagent(
-    goal="Review auth.py for security issues. Do not edit.",
-    model="gpt-5",
-    context="Repository: /srv/app; focus on token handling.",
-    inherit_context=True,
-    inherit_soul=True,
-    inherit_toolsets=False,
-    toolsets=["file", "terminal"],
-    stall_timeout_seconds=600,
-    interrupt_after_seconds=1800,
-)
-```
+### Routing and policy migration
 
-### Decide exactly what the child inherits
+`model` and `provider` pass unchanged to core. Pin both for an exact pair. Bare
+aliases no longer use the lenient `/model` switch pipeline. Omitted provider
+uses delegation config before the parent; omitted model follows core delegation
+routing. Credentials are resolved in the active profile by Hermes, never from
+the task brief. Core may refresh/rotate credentials **within the selected
+provider identity**; Herald no longer freezes an arbitrary raw key from a
+model-switch result. Distinct named routes sharing one endpoint retain their
+own provider credential pools, without borrowing the parent's pool. Use a
+named configured provider when account identity matters.
 
-| Input | Default | Behaviour |
-|---|---:|---|
-| `context` | none | Explicit task facts supplied regardless of inheritance mode |
-| `inherit_context` | `false` | Opt-in copy of the latest 20 parent user/assistant text messages, capped at 12,000 characters; excludes system, tools, results, memory, and hidden state |
-| `inherit_soul` | `false` | Loads the active parent profile’s full `SOUL.md` as the child identity |
-| `inherit_toolsets` | `true` | Inherits the parent’s safe child tool subset when `toolsets` is omitted |
-| `toolsets=[]` | omitted | Creates a model-only child |
-| `toolsets=[...]` | omitted | Requests an exact subset, intersected with parent capabilities; inherited MCP toolsets are stripped unless explicitly named |
+The current public API cannot preserve every former per-call option. Herald
+rejects these **before launch in both modes**, even if false/null/default-valued:
 
-The child runs asynchronously in a daemon thread and returns a `task_id` immediately. Streamed text and tool events reset the stall timer. `interrupt_after_seconds` requests cooperative interruption after a wall-clock threshold; it cannot instantly kill a provider or blocking tool call.
+| Requested option | Why it is not silently translated |
+|---|---|
+| `toolsets` (including `[]`), `inherit_toolsets=false` | Empty lists mean inheritance in core; core can append MCP tools. This is not Herald's former exact subset/model-only contract. |
+| `inherit_soul`, `inherit_context` | No public request fields for these policies. Provide explicit task `context` instead. |
+| `reasoning_effort` | Core's delegation/parent reasoning policy applies; no per-launch field. |
+| `stall_timeout_seconds`, `interrupt_after_seconds`, other timeout fields | No supported per-launch timeout/watchdog contract. Core delegation timeout policy now applies; Herald's former default 600-second activity timer is not retained. |
+| role, working directory, per-tool blocking | No equivalent supported policy guarantee for these overrides. Core determines actual role from its depth policy. |
 
-Because the child is in-process, it is not durable across parent-process exit. Use `dispatch_agent` when process isolation or durable target execution matters.
+Only omitted or `inherit_toolsets=true` is supported. **Do not drop a rejected
+restriction merely to get a task launched.** Use another supported workflow or
+wait for the corresponding upstream API. No private child mutation or
+`ctx.inject_message` workaround is used.
 
-The final summary/error is submitted to Hermes's native completion pipeline for
-the **original durable parent session**. It is not retargeted to a replacement
-conversation after `/new`. Keep the commissioning session and process alive;
-automatic delivery is not restart recovery.
+### Remaining upstream session API gap
 
-Model selection reads the active profile's configuration, not a launch-profile
-global snapshot. An unchanged provider/endpoint/key/API-mode bundle inherits the
-parent's live runtime. A changed bundle is pinned for that child, including
-same-provider endpoint or key changes; the child's credential pool and per-turn
-env refresh cannot replace it. Parent and ordinary inherited-child policies are
-unchanged. Never put provider credentials in the task brief.
-
-`delegate_subagent` requires the live parent-agent context exposed by classic interactive CLI and desktop/TUI sessions. Gateway/API plugin-dispatch paths fail closed rather than guessing another session.
-
-> Hermes core's global `delegation.child_timeout_seconds` must be `0` or unset.
-> Herald refuses launch otherwise because core could preempt the per-call policy.
-
-### Per-call reasoning effort
-
-`delegate_subagent` accepts `reasoning_effort` to set the child's thinking budget for this one call, without touching core's `delegation.reasoning_effort` config:
-
-```python
-delegate_subagent(
-    goal="Deep-dive the auth flow for security issues",
-    model="gpt-5",
-    reasoning_effort="high",   # minimal..ultra; 'none' disables thinking
-)
-```
-
-Omitted, the child keeps the normal resolution order (core `delegation.reasoning_effort` when configured, otherwise the parent's level). Herald assigns `child.reasoning_config` after build via the same post-build seam as SOUL inheritance. Downstream host policy can still clamp, drop, or substitute the requested budget (mandatory-reasoning rejection, length recovery, provider limits); do not treat the parameter as a strict every-request guarantee against the host.
+`callback.capture_session_routing` still uses `gateway.session_context` and
+`tools.approval.get_current_session_key` to obtain the task-local source, durable
+session ID, delivery/chat key and UI session ID. Public `ctx.profile_name`
+identifies a profile, not this return address; lifecycle handles identify the
+parent but not its chat/UI delivery route. The inspected host exposes no public
+accessor returning that complete active-session, profile-bound routing snapshot.
+`ctx.session_surface()` and `ctx.session_cwd()` supply neither durable IDs nor
+chat/UI routing. The internal `hermes_cli.plugin_session.session_key()` alone
+also lacks durable parent/UI ownership and is not a documented plugin surface.
+Those callback dependencies remain explicit and nonblocking; replacing them
+requires that upstream accessor, not a guessed session or a new monkeypatch.
 
 ---
 
@@ -883,9 +836,9 @@ The repository workflow is the executable compatibility contract:
 
 | Lane | Exact Hermes revision | Python | Delegation coverage |
 |---|---|---|---|
-| `legacy` | `9fc80ac70f6b97e36556c33bc4895b75558d4136` | 3.11 | Supported `in_process` |
-| `shared-gateway` | `1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5` | 3.14 | Supported `in_process` |
-| `host-candidate` | `c72f29e0a3608e2276e311c1c9a891aedf2acb17` | 3.14 | Experimental poll-only host adapter |
+| `legacy` | `9fc80ac70f6b97e36556c33bc4895b75558d4136` | 3.11 | Other tools; local launch refuses without public lifecycle |
+| `shared-gateway` | `1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5` | 3.14 | Other tools; local launch refuses without provider-aware lifecycle |
+| `public-lifecycle` | `e6f57427c198cfd96854522b7a9159eb007e13c2` | 3.14 | Native callbacks and host poll-only adapter |
 
 The manifest's `requires_hermes: ">=0.21.0"` is the general installation floor,
 not a claim that every intermediate host revision or optional isolation mode is
@@ -897,14 +850,10 @@ check and the workflow's test selection:
 ```bash
 scripts/ci-python scripts/check_release_contract.py
 
-# legacy/shared-gateway: omit only the real host-transport test file.
-# host-candidate: select every test file, including real host subprocesses.
-export HERALD_CI_ISOLATION=in_process  # use host for the host-candidate lane
+# Select every file. Lifecycle integration tests skip explicitly on old hosts;
+# fail-closed compatibility tests still run there.
 tests=()
 for test in "$PWD"/tests/test_*.py; do
-  if [[ "$HERALD_CI_ISOLATION" == in_process && "${test##*/}" == test_host_subagent_lifecycle.py ]]; then
-    continue
-  fi
   tests+=("$test")
 done
 HERMES_PYTHON="$PWD/scripts/ci-python" \
@@ -930,11 +879,11 @@ subprocess and synthetic child execution only, with no paid inference.
 
 The suite covers YAML compatibility, scoped route and credential pinning,
 spawning-session ownership, host lifecycle launch/return/poll, foreign-session rejection,
-pre-launch policy refusal, capacity/error privacy, and unchanged in-process
-registration, alongside streaming chat, model routes, approval relay, ledger
-and release contracts. The CI matrix pins the exact host snapshots;
-isolated-host tests require the transport candidate described above and are
-not evidence of host-isolation support on the legacy or shared-gateway pins.
+pre-launch policy refusal, capacity/error privacy, registered native lifecycle
+callbacks, and simultaneous profile-context isolation, alongside streaming chat,
+model routes, approval relay, ledger and release contracts. The CI matrix pins
+exact host snapshots; skipped integration tests on older pins are not evidence
+of local lifecycle or host-isolation support there.
 
 ### Troubleshooting completion delivery
 
@@ -943,8 +892,8 @@ not evidence of host-isolation support on the legacy or shared-gateway pins.
   local children. Do not use `check_dispatch` for local `task_id` values.
 - **Experimental host child:** no completion notification is expected. Use
   `delegate_subagent(action="result", task_id=...)` in the owning active session.
-  If automatic completion or exact tool restrictions are required, use the
-  supported in-process mode rather than dropping requirements.
+  Use in-process mode for automatic completion. Exact per-call tool restrictions
+  are unsupported in both modes; never drop them to force a launch.
 - **Remote dispatch:** query the original `{profile, run_id}` with
   `check_dispatch`, and use `dispatch_status` to recover persisted provenance.
   Reconcile the existing run before redispatching; callback delivery is not a

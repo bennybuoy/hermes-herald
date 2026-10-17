@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+lifecycle_api = pytest.importorskip("agent.subagent_lifecycle")
+if "provider" not in lifecycle_api.SubagentLaunchRequest.__dataclass_fields__:
+    pytest.skip("Host lacks per-launch provider lifecycle support; refusal covered separately", allow_module_level=True)
+
 from agent.subagent_lifecycle import bind_subagent_parent
 from hermes_cli.plugin_host import PluginHost
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest, LoadedPlugin
@@ -15,13 +19,18 @@ from tools.registry import registry
 PLUGIN = Path(os.environ["HERMES_HERALD_PLUGIN_DIR"])
 
 
-@pytest.fixture
-def hosted(tmp_path, monkeypatch):
+@pytest.fixture(params=["host", "in_process"])
+def hosted(tmp_path, monkeypatch, request):
     import tools.delegate_tool as delegate
     import agent.subagent_lifecycle as lifecycle
     import tools.delegate_tool_registry as child_registry
 
+    initial_threads = set(threading.enumerate())
     built, routes, controls = [], [], []
+    import queue
+    from tools.process_registry import process_registry
+    notifications = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", notifications)
     release = threading.Event()
     done = threading.Event()
     outcome = {"status": "completed", "summary": "synthetic final result", "api_calls": 0,
@@ -60,23 +69,38 @@ def hosted(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(home / "managed-empty"))
     manager = PluginManager(scope_key=str(home))
-    host = PluginHost(manager)
+    host = PluginHost(manager) if request.param == "host" else None
     manifest = PluginManifest(name="hermes-herald", source="user", path=str(PLUGIN))
     manager._plugins[manifest.name] = LoadedPlugin(manifest=manifest, enabled=True)
     ctx = PluginContext(manifest, manager)
     try:
-        host.load(manifest, ctx, module_name="hermes_plugins.herald_lifecycle", entrypoint=False)
-        assert host.alive and host.pid != os.getpid()
+        if host is not None:
+            host.load(manifest, ctx, module_name="hermes_plugins.herald_lifecycle", entrypoint=False)
+            assert host.alive and host.pid != os.getpid()
+        else:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("hermes_herald.lifecycle_entry", PLUGIN / "__init__.py")
+            module = importlib.util.module_from_spec(spec)
+            module.__package__ = "hermes_herald"
+            spec.loader.exec_module(module)
+            module.register(ctx)
         parent = SimpleNamespace(session_id="owner", enabled_toolsets=["file"])
         yield SimpleNamespace(manager=manager, ctx=ctx, parent=parent, built=built,
                               routes=routes, controls=controls, release=release, done=done,
-                              outcome=outcome)
+                              outcome=outcome, mode=request.param, notifications=notifications)
     finally:
         release.set()
+        # Drain observer threads before the next fixture replaces the shared
+        # completion queue; otherwise prior children pollute the next case.
+        for thread in set(threading.enumerate()) - initial_threads:
+            if thread.name.startswith("delegate-subagent-"):
+                thread.join(10)
+                assert not thread.is_alive()
         manager.unload()
-        process = host._proc
-        host.shutdown()
-        assert process is None or process.poll() == 0
+        if host is not None:
+            process = host._proc
+            host.shutdown()
+            assert process is None or process.poll() == 0
 
 
 def call(h, args, parent=None, session_id=None):
@@ -93,7 +117,7 @@ def test_launch_returns_then_same_parent_can_poll_and_retrieve(hosted):
     launch = call(h, {"goal": "synthetic task", "context": "explicit brief",
                       "model": "exact-model", "provider": "synthetic"})
     assert launch["status"] == "dispatched", launch
-    assert launch["delivery"] == "poll"
+    assert launch["delivery"] == ("poll" if h.mode == "host" else "callback")
     task = launch["task_id"]
     assert task.startswith("herald-host-")
     assert launch["next_action"] == {"action": "result", "task_id": task}
@@ -159,7 +183,7 @@ def test_unsupported_options_fail_before_child_construction(hosted, options):
     result = call(hosted, {"goal": "must not launch", **options})
     assert result["status"] == "error", result
     assert next(iter(options)) in result["error"]
-    assert "in_process" in result["error"]
+    assert "public lifecycle" in result["error"]
     assert hosted.built == []
 
 
@@ -177,8 +201,8 @@ def test_controls_and_default_delegation_route(hosted):
 
 def test_registered_host_schema_is_polled_not_legacy(hosted):
     schema = registry.get_entry("delegate_subagent", scope=hosted.manager.scope_key).schema
-    assert "poll" in schema["description"]
-    assert "auto-delivered" not in schema["description"]
+    assert "poll" in schema["description"] if hosted.mode == "host" else "callback" in schema["description"]
+    assert ("auto-delivered" in schema["description"]) is (hosted.mode == "in_process")
     props = schema["parameters"]["properties"]
     assert props["action"]["enum"] == ["launch", "status", "result", "cancel", "steer"]
     assert "provider" in props
@@ -216,3 +240,32 @@ def test_launch_rejects_mismatched_or_absent_active_parent(hosted):
                             scope=h.manager.scope_key, session_id="owner")
     assert json.loads(raw)["status"] == "error"
     assert h.built == []
+
+
+def test_cancellation_reaches_immutable_terminal_result(hosted):
+    import time
+    h = hosted
+    h.outcome.update(status="interrupted", summary=None, error="controlled cancellation")
+    launch = call(h, {"goal": "cancel bounded child"})
+    assert launch["status"] == "dispatched"
+    task = launch["task_id"]
+    cancelled = call(h, {"action": "cancel", "task_id": task})
+    assert cancelled["accepted"] is True
+    assert cancelled["state"] == "CANCEL_REQUESTED"
+    assert call(h, {"action": "result", "task_id": task})["ready"] is False
+    h.release.set()
+    deadline = time.monotonic() + 3
+    while True:
+        result = call(h, {"action": "result", "task_id": task})
+        if result["ready"] or time.monotonic() >= deadline:
+            break
+        threading.Event().wait(0.01)
+    assert result["terminal_state"] == "CANCELLED"
+    assert call(h, {"action": "result", "task_id": task}) == result
+    assert call(h, {"action": "cancel", "task_id": task})["already_terminal"]
+    if h.mode == "in_process":
+        event = h.notifications.get(timeout=3)
+        assert event["status"] == "failed"
+        assert event["error"] == "controlled cancellation"
+        assert event["parent_session_id"] == "owner"
+    assert h.notifications.empty()

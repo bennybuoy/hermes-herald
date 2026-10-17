@@ -164,36 +164,26 @@ def test_local_completion_pins_spawning_session(spawning_session, monkeypatch, o
     parent = SimpleNamespace(session_id=spawned.session_id, model="synthetic-model")
     tokens = set_session_vars(source="gateway", session_id=spawned.session_id, session_key=spawned.session_key)
     monkeypatch.setattr(callback, "_get_current_session_key", lambda: spawned.session_key)
-    monkeypatch.setattr(tools, "_resolve_model_creds", lambda *a: {
-        "model": "synthetic-model", "provider": None, "base_url": None,
-        "api_key": None, "api_mode": None,
-    })
-    import tools.delegate_tool as delegation
+    from hermes_herald.native_lifecycle import NativeLifecycleAdapter
     import tools.process_registry as registry
     completion_queue = queue.Queue()
     monkeypatch.setattr(registry, "process_registry", SimpleNamespace(completion_queue=completion_queue))
-    monkeypatch.setattr(delegation, "_load_config", lambda: {})
-    monkeypatch.setattr(delegation, "_get_child_timeout", lambda: None)
-    monkeypatch.setattr(delegation, "_run_single_child", lambda **kw: {})
-    child = SimpleNamespace(session_id="synthetic-child-session")
 
-    def build_child(**kwargs):
-        # Real child construction changes HERMES_SESSION_ID in the calling
-        # ContextVar. Simulate that documented side effect without inference.
+    def launch(request):
+        # A host constructor may change session ContextVars. The adapter must
+        # capture routing before launch and contain those construction effects.
         import gateway.session_context as context
-        context._SESSION_ID.set(child.session_id)
-        return child
+        context._SESSION_ID.set("synthetic-child-session")
+        return {"model": "synthetic-model", "provider": "synthetic"}
 
-    monkeypatch.setattr(delegation, "_build_child_agent", build_child)
-
-    def run_child(**kwargs):
+    def result(handle):
         if outcome == "exception":
-            raise RuntimeError("synthetic child failure")
-        if outcome == "returned-failure":
-            return {"status": "failed", "error": "synthetic child failure"}
-        return {"status": "completed", "summary": "synthetic result"}
+            raise RuntimeError("synthetic host failure")
+        return {"ready": True, "terminal_state": "SUCCEEDED" if outcome == "success" else "FAILED",
+                "summary": "synthetic result", "error_message": "synthetic child failure"}
 
-    monkeypatch.setattr(tools, "_run_child_with_timeout_policy", run_child)
+    service = SimpleNamespace(launch=launch, wait=lambda *a, **kw: {"completed": True}, result=result)
+    adapter = NativeLifecycleAdapter(SimpleNamespace(subagent_lifecycle=service))
     workers = []
     real_thread = threading.Thread
 
@@ -206,7 +196,7 @@ def test_local_completion_pins_spawning_session(spawning_session, monkeypatch, o
 
     monkeypatch.setattr(threading, "Thread", make_thread)
     try:
-        response = json.loads(tools.handle_delegate_subagent({"goal": "synthetic goal"}, parent_agent=parent))
+        response = json.loads(adapter({"goal": "synthetic goal"}, session_id=spawned.session_id))
         monkeypatch.setattr(threading, "Thread", real_thread)
         assert response["status"] == "dispatched"
         assert len(workers) == 1
