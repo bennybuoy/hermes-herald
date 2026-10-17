@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import yaml
+from yaml_compat import safe_load
 
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
@@ -31,7 +31,7 @@ def _load_plugin_entry():
 
 
 def _load_manifest():
-    return yaml.safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return safe_load(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
 def test_plugin_registers_all_tools_and_bundled_skill():

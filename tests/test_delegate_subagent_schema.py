@@ -194,6 +194,7 @@ def test_subagent_routing_uses_task_local_capture_not_stale_environment(monkeypa
         "capture_session_routing",
         lambda parent_agent=None: {
             "session_id": "context-session",
+            "parent_session_id": "parent",
             "session_key": "context-key",
             "origin_ui_session_id": "ui-session-9",
         },
@@ -203,6 +204,7 @@ def test_subagent_routing_uses_task_local_capture_not_stale_environment(monkeypa
 
     assert routing == {
         "session_id": "context-session",
+        "parent_session_id": "parent",
         "session_key": "context-key",
         "origin_ui_session_id": "ui-session-9",
     }

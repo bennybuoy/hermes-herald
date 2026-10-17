@@ -96,6 +96,19 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                     "(e.g. 'vincent', 'y10', 'qc-engagement')."
                 ),
             },
+            "idempotency_key": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "description": (
+                    "Optional explicit identity for this work (visible ASCII, no spaces). "
+                    "Supply before the first call, or keep the generated key returned on "
+                    "success/ambiguous failure. Deliberate retries MUST reuse the exact key "
+                    "and all original arguments in the owning session. Omitting a key "
+                    "always means NEW work, even for identical messages. Ambiguous replay "
+                    "requires advertised durable target support and unexpired retention."
+                ),
+            },
             "message": {
                 "type": "string",
                 "description": (
@@ -922,7 +935,13 @@ ALL_SCHEMAS = [
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _post_json(url: str, api_key: str, body: dict, timeout: float = 30.0) -> dict:
+class _HTTPStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _post_json(url: str, api_key: str, body: dict, timeout: float = 30.0, *, idempotency_key: str = "") -> dict:
     """POST JSON to the API server. Returns the parsed JSON response."""
     data = json.dumps(body).encode("utf-8")
     req = Request(
@@ -934,6 +953,8 @@ def _post_json(url: str, api_key: str, body: dict, timeout: float = 30.0) -> dic
         },
         method="POST",
     )
+    if idempotency_key:
+        req.add_header("Idempotency-Key", idempotency_key)
     try:
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -943,8 +964,8 @@ def _post_json(url: str, api_key: str, body: dict, timeout: float = 30.0) -> dic
             err_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
-        raise RuntimeError(
-            f"HTTP {e.code} from {url}: {err_body or e.reason}"
+        raise _HTTPStatusError(
+            e.code, f"HTTP {e.code} from {url}: {err_body or e.reason}"
         ) from e
     except URLError as e:
         raise RuntimeError(f"Cannot reach {url}: {e.reason}") from e
@@ -973,7 +994,7 @@ def _post_streaming_chat(
         method="POST",
     )
     try:
-        with urlopen(req, timeout=max(1.0, min(stall_timeout_seconds, 60.0))) as resp:
+        with urlopen(req, timeout=stall_timeout_seconds) as resp:
             result_session_id = resp.headers.get("X-Hermes-Session-Id", session_id)
             read_available = getattr(resp, "read1", None) or resp.read
             buffer = ""
@@ -1076,6 +1097,8 @@ def _post_streaming_chat(
             f"HTTP {e.code} from {url}: {err_body or e.reason}"
         ) from e
     except URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise e.reason from e
         raise RuntimeError(f"Cannot reach {url}: {e.reason}") from e
 
 
@@ -1943,7 +1966,35 @@ def _async_delivery_supported() -> bool:
         return False
 
 def handle_dispatch_agent(args: dict, **kwargs) -> str:
+    import sqlite3
+    from http.client import HTTPException
+
+    from .dispatch_identity import DispatchIdentity, IdentityError
+
+    try:
+        identity = DispatchIdentity(args)
+    except IdentityError as exc:
+        return json.dumps({"status": "error", "error": str(exc), "error_code": exc.code})
+    try:
+        response = json.loads(_handle_dispatch_agent(args, _identity=identity, **kwargs))
+    except IdentityError as exc:
+        response = dict(identity.accepted_response or {"status": "error"})
+        response.update({"error": str(exc), "error_code": exc.code})
+    except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error, HTTPException) as exc:
+        response = identity.accepted_response or {"status": "error"}
+        response["error"] = f"Dispatch persistence/transport failed; reconcile before retrying: {exc}"
+    try:
+        return json.dumps(identity.finish(response))
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        response["idempotency_key"] = identity.key
+        response["warning"] = f"Identity completion could not be saved; reconcile before retrying: {exc}"
+        return json.dumps(response)
+
+
+def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
     """Dispatch an async task to another Hermes profile."""
+    from .dispatch_identity import IdentityError
+
     profile = args.get("profile", "").strip()
     message = args.get("message", "")
     instructions = args.get("instructions")
@@ -1988,15 +2039,6 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             f"Detached trace '{trace_id or '(new)'}' reached its maximum hop "
             f"budget ({max_hops}); no remote run was started."
         )
-    if delivery == "callback" and not _async_delivery_supported():
-        return _tool_error(
-            "dispatch_agent is asynchronous, but this session cannot receive "
-            "detached results (for example, a stateless HTTP or one-shot "
-            "session). No remote run was started. Use dispatch_chat for a "
-            "synchronous result, or delivery='none' for an explicitly "
-            "unmonitored fire-and-forget run."
-        )
-
     pcfg, err = _resolve_profile(profile, operation="dispatch")
     if err:
         return _tool_error(err)
@@ -2008,8 +2050,29 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             f"Dispatch ledger is unavailable; no remote run was started. ({exc})"
         )
 
-    edge_id = uuid.uuid4().hex
-    trace_id = trace_id.strip() or uuid.uuid4().hex
+    from .callback import capture_session_routing
+
+    routing = capture_session_routing(kwargs.get("parent_agent"))
+    cached = _identity.prepare(pcfg, routing)
+    if cached is not None:
+        return json.dumps(cached)
+    # Recover accepted work before asking whether this process can monitor new work.
+    if delivery == "callback" and not _async_delivery_supported():
+        if _identity.row["body_json"]:
+            return _tool_error(
+                "This session cannot receive detached results and prior acceptance is unknown. "
+                "No new POST was sent. Preserve the original key and arguments; "
+                "reconcile existing work before retrying from a callback-capable session."
+            )
+        return _tool_error(
+            "dispatch_agent is asynchronous, but this session cannot receive "
+            "detached results (for example, a stateless HTTP or one-shot "
+            "session). No remote run was started. Use dispatch_chat for a "
+            "synchronous result, or delivery='none' for an explicitly "
+            "unmonitored fire-and-forget run."
+        )
+    edge_id = _identity.row["edge_id"]
+    trace_id = _identity.row["trace_id"]
     parent_edge_id = parent_edge_id.strip()
 
     # Build request body — omit null/empty fields. An explicit tool argument
@@ -2057,12 +2120,9 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
         body["model_options"] = reasoning_model_options
 
     try:
-        result = _post_json(
-            f"{pcfg['url']}/v1/runs",
-            pcfg["api_key"],
-            body,
-            timeout=30.0,
-        )
+        result = _identity.submit(pcfg, body, _post_json, _get_json)
+    except IdentityError:
+        raise
     except RuntimeError as e:
         # Distinguish auth errors from connection errors
         msg = str(e)
@@ -2095,9 +2155,6 @@ def handle_dispatch_agent(args: dict, **kwargs) -> str:
             if reasoning_effort.get("enabled") is False
             else str(reasoning_effort.get("effort", ""))
         )
-    from .callback import capture_session_routing
-
-    routing = capture_session_routing(kwargs.get("parent_agent"))
     origin_session_id = (
         routing.get("session_key") or routing.get("session_id") or ""
     )
@@ -2500,7 +2557,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 create_body,
                 timeout=10.0,
             )
-        except RuntimeError as e:
+        except (RuntimeError, TimeoutError) as e:
             msg = str(e)
             if "Cannot reach" in msg:
                 return _tool_error(
@@ -2573,7 +2630,7 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             stall_timeout_seconds=effective_timeout,
             progress_callback=_relay_progress,
         )
-    except RuntimeError as e:
+    except (RuntimeError, TimeoutError) as e:
         msg = str(e)
         if "401" in msg or "403" in msg:
             return _tool_error(
@@ -2592,7 +2649,17 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 f"Cannot reach {profile} API server at {pcfg['url']}. "
                 f"Is the gateway running for that profile? ({msg})"
             )
-        return _tool_error(f"dispatch_chat to {profile} failed: {msg}")
+        return json.dumps({
+            "status": "error",
+            "error_code": "chat_timeout" if isinstance(e, TimeoutError) else "chat_failed",
+            "error": (
+                f"dispatch_chat to {profile} failed: {msg}. "
+                "The remote turn may still be running. Do not automatically resend "
+                "this message; inspect the target session first."
+            ),
+            "profile": profile,
+            "session_id": session_id,
+        })
 
     # Extract the reply
     reply = result.get("reply", "")
@@ -3303,9 +3370,10 @@ def _resolve_model_creds(model_name: str, parent_agent) -> dict:
 
     Uses the same switch_model pipeline as /model. Returns a dict with
     model, provider, base_url, api_key, api_mode — all resolved from
-    the model name. When the resolved provider matches the parent's,
-    provider/base_url/api_key/api_mode are None so _build_child_agent
-    inherits from the parent.
+    the model name in the active profile. An unchanged provider/endpoint/key/
+    API-mode bundle leaves transport overrides unset so _build_child_agent
+    inherits the parent's live runtime. Any route change pins the resolved
+    bundle, including changes within the same provider.
     """
     name = (model_name or "").strip()
     if not name:
@@ -3319,20 +3387,13 @@ def _resolve_model_creds(model_name: str, parent_agent) -> dict:
     parent_base_url = getattr(parent_agent, "base_url", "") or ""
     parent_api_key = getattr(parent_agent, "api_key", "") or ""
 
-    user_providers = {}
-    custom_providers = None
-    try:
-        from cli import CLI_CONFIG
-        user_providers = CLI_CONFIG.get("providers") or {}
-        custom_providers = CLI_CONFIG.get("custom_providers")
-    except Exception:
-        try:
-            from hermes_cli.config import load_config
-            _full = load_config()
-            user_providers = _full.get("providers") or {}
-            custom_providers = _full.get("custom_providers")
-        except Exception:
-            pass
+    parent_api_mode = getattr(parent_agent, "api_mode", "") or ""
+
+    # CLI_CONFIG is the launch profile's import-time snapshot, not the served profile.
+    from hermes_cli.config import load_config
+    profile_config = load_config()
+    user_providers = profile_config.get("providers") or {}
+    custom_providers = profile_config.get("custom_providers")
 
     result = switch_model(
         raw_input=name,
@@ -3358,8 +3419,14 @@ def _resolve_model_creds(model_name: str, parent_agent) -> dict:
         "api_key": None,
         "api_mode": None,
     }
-    # Only override credentials when the provider actually differs
-    if result.target_provider and result.target_provider != parent_provider:
+    resolved_route = (
+        result.target_provider or "", result.base_url or "",
+        result.api_key or "", result.api_mode or "",
+    )
+    parent_route = (parent_provider, parent_base_url, parent_api_key, parent_api_mode)
+    # Pin provider as well: core must not inherit an ACP transport or routing
+    # filters that could bypass a changed endpoint, credential or wire protocol.
+    if result.target_provider and resolved_route != parent_route:
         creds["provider"] = result.target_provider
         creds["base_url"] = result.base_url or None
         creds["api_key"] = result.api_key or None
@@ -3650,6 +3717,7 @@ def _capture_subagent_routing(parent_agent) -> dict:
     routing = capture_session_routing(parent_agent)
     return {
         "session_id": str(routing.get("session_id") or ""),
+        "parent_session_id": str(routing.get("parent_session_id") or ""),
         "session_key": str(routing.get("session_key") or ""),
         "origin_ui_session_id": str(routing.get("origin_ui_session_id") or ""),
     }
@@ -3735,6 +3803,14 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
     except ValueError as e:
         return _tool_error(str(e))
 
+    # Child construction changes the session ContextVar; snapshot the
+    # commissioning session before that, not just before starting the thread.
+    routing = _capture_subagent_routing(parent_agent)
+    session_id = routing["session_id"]
+    parent_session_id = routing["parent_session_id"]
+    session_key = routing["session_key"]
+    origin_ui_session_id = routing["origin_ui_session_id"]
+
     # Build the child agent with the resolved model + credentials
     try:
         child = _build_child_agent(
@@ -3752,6 +3828,15 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
             override_api_mode=creds["api_mode"],
             role="leaf",
         )
+        # _resolve_model_creds pins provider only for a changed runtime bundle.
+        # Core's provider/endpoint pool match ignores the accepted key: its
+        # startup lease (or later rotation) would overwrite that pinned bundle.
+        if creds["provider"]:
+            child._credential_pool = None
+            # Default-endpoint children also adopt .env changes at each turn.
+            # Keep this explicit bundle pinned without changing the parent or
+            # the ordinary inherited-route refresh policy.
+            child._try_refresh_env_client_credentials = lambda: False
         # Core subagents deliberately skip context files and persona by
         # default. Opting in here uses Hermes's native identity-only seam:
         # SOUL.md is loaded from the active profile, while project context,
@@ -3773,12 +3858,6 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
         )
         effective_model = f"{effective_model} (reasoning: {effort_label})"
     start_time = time.time()
-
-    # Capture task-local routing identifiers BEFORE spawning the thread.
-    routing = _capture_subagent_routing(parent_agent)
-    session_id = routing["session_id"]
-    session_key = routing["session_key"]
-    origin_ui_session_id = routing["origin_ui_session_id"]
 
     # Record in state file for provenance (task 5)
     with _state_lock:
@@ -3858,6 +3937,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                     "dispatched_at": start_time,
                     "completed_at": time.time(),
                     "session_id": session_id,
+                    "parent_session_id": parent_session_id,
                     "session_key": session_key,
                     "origin_ui_session_id": origin_ui_session_id,
                 }
@@ -3895,6 +3975,7 @@ def handle_delegate_subagent(args: dict, **kwargs) -> str:
                     "dispatched_at": start_time,
                     "completed_at": time.time(),
                     "session_id": session_id,
+                    "parent_session_id": parent_session_id,
                     "session_key": session_key,
                     "origin_ui_session_id": origin_ui_session_id,
                 }

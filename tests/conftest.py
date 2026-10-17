@@ -5,6 +5,10 @@ import types
 import tempfile
 import importlib.util
 
+# The canonical runner uses one process per test file. Do not let those
+# processes race on an inherited shared state file, even under a synthetic HOME.
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="herald-tests-")
+
 # Add plugin dir and Hermes source to sys.path
 PLUGIN_DIR = os.environ.get(
     "HERMES_HERALD_PLUGIN_DIR",
@@ -32,8 +36,7 @@ for name in ("config", "ledger", "tools", "callback"):
     sys.modules[f"hermes_herald.{name}"] = mod
     spec.loader.exec_module(mod)
 
-# Ensure config exists
-os.environ.setdefault("HERMES_HOME", tempfile.mkdtemp())
+# Ensure config exists in this test process's isolated Hermes home.
 _cfg_path = os.path.join(os.environ["HERMES_HOME"], "config.yaml")
 if not os.path.exists(_cfg_path):
     _state_path = os.path.join(os.environ["HERMES_HOME"], "hermes-herald-runs.json")

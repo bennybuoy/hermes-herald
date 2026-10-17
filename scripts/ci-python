@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# The canonical host runner clears env; restore only this disposable CI context.
+set -euo pipefail
+plugin=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export HERMES_HERALD_PLUGIN_DIR="$plugin"
+export HERMES_SOURCE_DIR="$plugin/hermes-agent"
+export HERMES_RUNTIME_PYTHON="$HOME/.ci-venv/bin/python"
+export HERMES_HOME="$HOME/hermes"
+export HERMES_RUNTIME_DIR="$HOME/runtime"
+export HERMES_DISABLE_LAZY_INSTALLS=1
+export PYTHONDONTWRITEBYTECODE=1
+# The plugin's tools.py must not shadow the host's tools package for -c/-m
+# probes or isolated host workers launched from the plugin checkout.
+export PYTHONSAFEPATH=1
+export PYTHONPATH="$HERMES_SOURCE_DIR"
+mkdir -p "$HERMES_HOME"
+exec "$HERMES_RUNTIME_PYTHON" "$@"

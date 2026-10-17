@@ -191,6 +191,9 @@ def capture_session_routing(parent_agent=None) -> dict:
         )
     return {
         "session_id": session_id,
+        # The chat key/UI tab can survive /new. The host needs the durable
+        # spawning session to enforce that boundary, independently of routing.
+        "parent_session_id": parent_session_id or session_id,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
     }
@@ -456,12 +459,14 @@ def _build_delegation_event(
         "status": deleg_status,
         "summary": summary,
         "error": error,
-        "api_calls": usage.get("total_tokens", 0) if usage else 0,
+        # Remote run usage reports tokens, not the number of inference calls.
+        "api_calls": "?",
         "duration_seconds": duration_seconds if duration_seconds is not None else "?",
         "dispatched_at": time.time(),
         "completed_at": time.time(),
         "session_key": session_key,
         "session_id": session_id,
+        "parent_session_id": str(route.get("parent_session_id") or session_id or ""),
         "origin_ui_session_id": str(route.get("origin_ui_session_id") or ""),
     }
     if resolved_model:
@@ -1215,7 +1220,7 @@ def _deliver_approval_required(
         "status": "approval_required",
         "summary": summary,
         "error": None,
-        "api_calls": 0,
+        "api_calls": "?",
         "duration_seconds": "?",
         "dispatched_at": time.time(),
         "completed_at": None,
