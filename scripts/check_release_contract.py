@@ -2,18 +2,27 @@
 """Fail fast when public installation metadata drifts from the plugin identity."""
 from pathlib import Path
 
-import yaml
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from yaml_compat import safe_load
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    manifest = safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     init_source = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    skill = (ROOT / "skills" / "agent-dispatch" / "SKILL.md").read_text(encoding="utf-8")
+    skill_metadata = safe_load(skill.split("---", 2)[1])
 
     assert manifest["name"] == "hermes-herald"
+    version = manifest["version"]
+    assert skill_metadata["version"] == version, "Bundled skill version differs from manifest"
+    assert f"badge/version-{version}-" in readme, "README version badge differs from manifest"
+    assert f'alt="Version {version}"' in readme, "README version label differs from manifest"
     assert "hermes plugins install bennybuoy/hermes-herald --enable" in readme
     assert "hermes plugins enable hermes-herald" in readme
     assert "Upgrading from Agent Dispatch 1.x" in readme
@@ -32,7 +41,7 @@ def main() -> None:
     assert heading in readme, f"README missing {heading!r}"
 
     print(
-        f"release contract: OK (hermes-herald, {len(advertised)} tools, "
+        f"release contract: OK (hermes-herald {version}, {len(advertised)} tools, "
         "opt-in documented)"
     )
 

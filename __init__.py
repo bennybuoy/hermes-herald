@@ -41,8 +41,10 @@ Config (config.yaml):
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
+from .host_lifecycle import HostLifecycleAdapter, HOST_DELEGATE_SUBAGENT_SCHEMA
 from .tools import (
     ALL_SCHEMAS,
     handle_dispatch_agent,
@@ -82,7 +84,16 @@ def register(ctx) -> None:
     def _host_llm_handler(args: dict, **kwargs) -> str:
         return handle_llm_call(args, _llm=ctx.llm, **kwargs)
 
+    # Hermes sets this marker only inside its isolated plugin subprocess.
+    # Select at registration so the default in_process surface stays unchanged.
+    host_delegate = None
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        host_delegate = HostLifecycleAdapter(ctx)
+
     for name, schema, handler, emoji in _TOOLS:
+        if name == "delegate_subagent" and host_delegate is not None:
+            schema = HOST_DELEGATE_SUBAGENT_SCHEMA
+            handler = host_delegate
         ctx.register_tool(
             name=name,
             toolset="hermes_herald",

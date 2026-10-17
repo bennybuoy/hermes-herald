@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from agent.secret_scope import get_secret
 from hermes_constants import get_hermes_home
+from .yaml_compat import safe_load
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +45,8 @@ def _load_config() -> dict:
 
     config_path = hermes_home / "config.yaml"
     try:
-        import yaml
         with open(config_path) as f:
-            full_config = yaml.safe_load(f) or {}
+            full_config = safe_load(f) or {}
     except Exception as e:
         logger.warning("hermes-herald: cannot load %s: %s", config_path, e)
         _config_cache[home_key] = {}

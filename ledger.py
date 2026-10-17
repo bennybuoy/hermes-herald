@@ -45,6 +45,22 @@ def _connect() -> sqlite3.Connection:
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS dispatch_identities (
+            idempotency_key TEXT PRIMARY KEY,
+            request_json TEXT NOT NULL,
+            owner_json TEXT NOT NULL,
+            route_json TEXT NOT NULL,
+            edge_id TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            body_json TEXT,
+            created_at REAL NOT NULL,
+            replay_until REAL NOT NULL DEFAULT 0,
+            lease_until REAL NOT NULL,
+            attempt_token TEXT NOT NULL,
+            response_json TEXT,
+            blocked_code TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS dispatches (
             edge_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,

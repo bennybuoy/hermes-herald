@@ -224,6 +224,7 @@ class TestSessionRouting:
 
         assert route == {
             "session_id": "context-session",
+            "parent_session_id": "durable-agent-session",
             "session_key": "durable-agent-session",
             "origin_ui_session_id": "ui-session-7",
         }

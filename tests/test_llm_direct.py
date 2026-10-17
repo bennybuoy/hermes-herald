@@ -259,7 +259,8 @@ def test_dispatch_agent_sends_model_options_reasoning(monkeypatch):
     monkeypatch.setattr(
         "gateway.session_context.get_session_env", lambda key, default="": default)
 
-    def fake_post_json(url, api_key, body, timeout=30.0):
+    def fake_post_json(url, api_key, body, timeout=30.0, *, idempotency_key=""):
+        assert idempotency_key
         captured["url"] = url
         captured["body"] = body
         return {"run_id": "run_x"}
@@ -293,7 +294,8 @@ def test_dispatch_agent_omitted_reasoning_sends_no_model_options(monkeypatch):
     monkeypatch.setattr(
         "gateway.session_context.get_session_env", lambda key, default="": default)
 
-    def fake_post_json(url, api_key, body, timeout=30.0):
+    def fake_post_json(url, api_key, body, timeout=30.0, *, idempotency_key=""):
+        assert idempotency_key
         captured["body"] = body
         return {"run_id": "run_y"}
 
@@ -331,7 +333,8 @@ def test_dispatch_agent_sends_provider_on_body(monkeypatch):
     monkeypatch.setattr(
         "gateway.session_context.get_session_env", lambda key, default="": default)
 
-    def fake_post_json(url, api_key, body, timeout=30.0):
+    def fake_post_json(url, api_key, body, timeout=30.0, *, idempotency_key=""):
+        assert idempotency_key
         captured["body"] = body
         return {"run_id": "run_p"}
 
