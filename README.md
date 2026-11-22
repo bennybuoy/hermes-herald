@@ -4,7 +4,7 @@
 
 <p>
   <a href="https://github.com/NousResearch/hermes-agent"><img src="https://img.shields.io/badge/Hermes%20Agent-compatible-8B5CF6" alt="Hermes Agent"></a>
-  <img src="https://img.shields.io/badge/version-1.2.0-22C55E" alt="Version 1.2.0">
+  <img src="https://img.shields.io/badge/version-1.3.0-22C55E" alt="Version 1.3.0">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License">
   <img src="https://img.shields.io/badge/tools-12-orange" alt="12 Tools">
 </p>
@@ -29,11 +29,25 @@ These are independent. You can use Herald only for `llm_call`, only for model-se
 > to the supported workflow. This is **plugin-process isolation**, not shared-gateway
 > or multi-profile isolation: Herald supports profile-scoped use in a shared gateway.
 
-## Unreleased lifecycle migration
+## What changed in 1.3.0
 
-Local launch now requires the provider-aware public lifecycle. Automatic
-in-process completion is retained; legacy per-call policy options fail closed
-where core cannot preserve them. See [routing and policy migration](#routing-and-policy-migration).
+- Local `delegate_subagent` launches in both `in_process` and `host` modes now
+  use Hermes's public provider-aware `ctx.subagent_lifecycle` facade. All
+  private `tools.delegate_tool` imports (`_build_child_agent`,
+  `_get_child_timeout`, `_load_config`) and private child credential/method
+  writes have been removed, resolving compatibility with Hermes `v0.23.3+`
+  (`NousResearch/hermes-agent#156150`) and plugin catalog rule 9.
+- Automatic in-process completion delivery is retained; legacy per-call policy
+  options fail closed where core cannot preserve them. See
+  [routing and policy migration](#routing-and-policy-migration).
+- Replaced additional private core imports with Hermes's published public
+  plugin APIs: `gateway.session_context.get_session_env` for callback session
+  routing, `agent.subagent_lifecycle.get_active_subagent_parent` for parent
+  agent/model resolution, and `hermes_constants.profile_name_for_home` for
+  profile naming.
+- Updated compatibility verification and tests for Hermes's `persistence`
+  storage interface and latest upstream revision
+  `c7a3fe245d6bf610f73ff555d57e4ed632f8ded8`.
 
 ## What shipped in 1.2.0
 
@@ -495,8 +509,8 @@ child, rewrites its credentials or rebinds a core method.
 
 **Compatibility change from 1.2.0:** local delegation now requires the public
 provider-aware lifecycle contract (introduced by upstream `ad37bfb17fb`), tested
-at public main **`e6f57427c198cfd96854522b7a9159eb007e13c2`**. This is a
-capability/commit requirement, not an invented numbered host release. Older
+at public main **`c7a3fe245d6bf610f73ff555d57e4ed632f8ded8`** (Hermes `v0.23.3+`).
+This is a capability/commit requirement, not an invented numbered host release. Older
 hosts still load Herald's other tools, but delegation fails clearly; there is
 no private-builder fallback. An active Hermes parent turn is required.
 
@@ -563,19 +577,26 @@ restriction merely to get a task launched.** Use another supported workflow or
 wait for the corresponding upstream API. No private child mutation or
 `ctx.inject_message` workaround is used.
 
-### Remaining upstream session API gap
+### Remaining upstream plugin API gaps
 
-`callback.capture_session_routing` still uses `gateway.session_context` and
-`tools.approval.get_current_session_key` to obtain the task-local source, durable
-session ID, delivery/chat key and UI session ID. Public `ctx.profile_name`
-identifies a profile, not this return address; lifecycle handles identify the
-parent but not its chat/UI delivery route. The inspected host exposes no public
-accessor returning that complete active-session, profile-bound routing snapshot.
-`ctx.session_surface()` and `ctx.session_cwd()` supply neither durable IDs nor
-chat/UI routing. The internal `hermes_cli.plugin_session.session_key()` alone
-also lacks durable parent/UI ownership and is not a documented plugin surface.
-Those callback dependencies remain explicit and nonblocking; replacing them
-requires that upstream accessor, not a guessed session or a new monkeypatch.
+`callback.capture_session_routing` now uses Hermes's published
+`gateway.session_context.get_session_env` API (without importing
+`tools.approval`), `_resolve_parent_agent` uses the published
+`agent.subagent_lifecycle.get_active_subagent_parent`, and profile naming uses
+the published `hermes_constants` module. Four core seams still lack published
+equivalents in `plugin_api.json` and remain explicit, non-override imports:
+
+- `tools.process_registry.process_registry` (`completion_queue`) for native
+  async completion delivery and approval-notice retirement;
+- `gateway.session_context.async_delivery_supported` to fail closed on
+  stateless/worker sessions before launching async work;
+- `tools.approval_prompt.request_elicitation_consent` for human-owned denial
+  confirmation in `approve_dispatch`;
+- `hermes_cli.inventory` (`ConfigContext`, `build_models_payload`,
+  `load_picker_context`) for explicit-only local model route discovery.
+
+Replacing these requires corresponding upstream public APIs, not a guessed
+session or a monkeypatch.
 
 ---
 
@@ -838,7 +859,7 @@ The repository workflow is the executable compatibility contract:
 |---|---|---|---|
 | `legacy` | `9fc80ac70f6b97e36556c33bc4895b75558d4136` | 3.11 | Other tools; local launch refuses without public lifecycle |
 | `shared-gateway` | `1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5` | 3.14 | Other tools; local launch refuses without provider-aware lifecycle |
-| `public-lifecycle` | `e6f57427c198cfd96854522b7a9159eb007e13c2` | 3.14 | Native callbacks and host poll-only adapter |
+| `public-lifecycle` | `c7a3fe245d6bf610f73ff555d57e4ed632f8ded8` | 3.14 | Native callbacks and host poll-only adapter |
 
 The manifest's `requires_hermes: ">=0.21.0"` is the general installation floor,
 not a claim that every intermediate host revision or optional isolation mode is

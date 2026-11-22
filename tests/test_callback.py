@@ -229,6 +229,18 @@ class TestSessionRouting:
             "origin_ui_session_id": "ui-session-7",
         }
 
+    def test_current_session_key_reads_public_session_context(self, monkeypatch):
+        import gateway.session_context as session_context
+
+        monkeypatch.setattr(
+            session_context,
+            "get_session_env",
+            lambda name, default="": (
+                "public-chat-key" if name == "HERMES_SESSION_KEY" else default
+            ),
+        )
+        assert callback._get_current_session_key() == "public-chat-key"
+
     def test_delegation_event_carries_origin_ui_session(self):
         run_id = "routing-event-1"
         callback._delivery_routes[run_id] = {

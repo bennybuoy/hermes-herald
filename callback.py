@@ -165,12 +165,8 @@ def _get_session_env(name: str, default: str = "") -> str:
 
 
 def _get_current_session_key() -> str:
-    try:
-        from tools.approval import get_current_session_key
-
-        return str(get_current_session_key(default="") or "")
-    except Exception:
-        return ""
+    """Read the active session routing key from Hermes's public session context."""
+    return _get_session_env("HERMES_SESSION_KEY", "")
 
 
 def capture_session_routing(parent_agent=None) -> dict:

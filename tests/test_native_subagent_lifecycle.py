@@ -45,9 +45,18 @@ def test_native_registration_launches_through_public_facade(monkeypatch, tmp_pat
 
     monkeypatch.setattr(delegate, "_build_child_agent", build)
     monkeypatch.setattr(delegate, "_run_single_child", run)
-    monkeypatch.setattr(delegate, "_resolve_delegation_credentials", lambda *a: {
-        "model": "configured", "provider": None, "base_url": None, "api_key": None, "api_mode": None})
-    monkeypatch.setattr(delegate, "_load_config", lambda: {})
+    try:
+        import tools.delegate_tool_config as delegate_config
+    except ImportError:
+        delegate_config = None
+    for mod in (delegate_config, delegate):
+        if mod is None:
+            continue
+        if hasattr(mod, "_resolve_delegation_credentials"):
+            monkeypatch.setattr(mod, "_resolve_delegation_credentials", lambda *a: {
+                "model": "configured", "provider": None, "base_url": None, "api_key": None, "api_mode": None})
+        if hasattr(mod, "_load_config"):
+            monkeypatch.setattr(mod, "_load_config", lambda: {})
     parent = SimpleNamespace(session_id="owner", enabled_toolsets=["file"])
     try:
         module.register(ctx)
@@ -94,9 +103,18 @@ def test_concurrent_children_and_observers_keep_profile_and_session_scope(monkey
         return {"status": "completed", "summary": parent.session_id}
     monkeypatch.setattr(delegate, "_build_child_agent", build)
     monkeypatch.setattr(delegate, "_run_single_child", run)
-    monkeypatch.setattr(delegate, "_resolve_delegation_credentials", lambda *a: {
-        "model": "scoped", "provider": None, "base_url": None, "api_key": None, "api_mode": None})
-    monkeypatch.setattr(delegate, "_load_config", lambda: {})
+    try:
+        import tools.delegate_tool_config as delegate_config
+    except ImportError:
+        delegate_config = None
+    for mod in (delegate_config, delegate):
+        if mod is None:
+            continue
+        if hasattr(mod, "_resolve_delegation_credentials"):
+            monkeypatch.setattr(mod, "_resolve_delegation_credentials", lambda *a: {
+                "model": "scoped", "provider": None, "base_url": None, "api_key": None, "api_mode": None})
+        if hasattr(mod, "_load_config"):
+            monkeypatch.setattr(mod, "_load_config", lambda: {})
     parents = [SimpleNamespace(session_id=f"owner-{name}", enabled_toolsets=[]) for name in ("a", "b")]
     managers = []
     expected = []

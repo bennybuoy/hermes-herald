@@ -20,7 +20,6 @@ class TestLocalModelRouteDiscovery:
         )
 
     def test_local_inventory_uses_core_explicit_only_contract(self, monkeypatch):
-        import agent.auxiliary_client as auxiliary_client
         import hermes_cli.inventory as inventory
 
         context = SimpleNamespace(
@@ -41,16 +40,6 @@ class TestLocalModelRouteDiscovery:
             excluded_providers=[],
         )
         monkeypatch.setattr(inventory, "load_picker_context", lambda: context)
-        monkeypatch.setattr(
-            auxiliary_client, "_read_main_provider", lambda: "ollama-cloud"
-        )
-        monkeypatch.setattr(auxiliary_client, "_read_main_model", lambda: "glm-5.2")
-        monkeypatch.setattr(
-            auxiliary_client,
-            "_read_main_base_url",
-            lambda: "http://ollama-cloud.example/v1",
-        )
-        monkeypatch.setattr(auxiliary_client, "_read_main_api_key", lambda: "test-key")
         import hermes_cli.model_switch as model_switch
 
         monkeypatch.setattr(
@@ -62,8 +51,9 @@ class TestLocalModelRouteDiscovery:
         )
         captured = {}
 
-        def explicit_payload(*args, **kwargs):
+        def explicit_payload(cfg_ctx, *args, **kwargs):
             captured.update(kwargs)
+            captured["ctx"] = cfg_ctx
             return {
                 "providers": [
                     {"slug": "ollama-cloud", "models": ["glm-5.2"]},
@@ -93,6 +83,23 @@ class TestLocalModelRouteDiscovery:
         assert "do not pass a bare model name" in result["contract"]
         assert captured["explicit_only"] is True
         assert captured["include_unconfigured"] is False
+
+        # Live bound parent overrides persisted disk defaults without reading
+        # private auxiliary_client helpers.
+        live_parent = SimpleNamespace(
+            provider="backup",
+            model="backup-model",
+            base_url="http://backup.example/v1",
+        )
+        live_result = json.loads(
+            tools.handle_list_profile_models({}, parent_agent=live_parent)
+        )
+        assert live_result["configured_default"] == {
+            "provider": "backup",
+            "model": "backup-model",
+        }
+        assert captured["ctx"].current_provider == "backup"
+        assert captured["ctx"].current_base_url == "http://backup.example/v1"
 
     def test_named_profile_preserves_remote_authenticated_alias_contract(
         self, monkeypatch

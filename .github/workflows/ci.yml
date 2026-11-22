@@ -28,9 +28,9 @@ jobs:
             ref: 1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5
             python: "3.14"
             isolation: in_process
-          # Public provider-aware lifecycle; both native and host adapters exercised.
+          # Public provider-aware lifecycle (Hermes v0.23.3+); both native and host adapters exercised.
           - host: public-lifecycle
-            ref: e6f57427c198cfd96854522b7a9159eb007e13c2
+            ref: c7a3fe245d6bf610f73ff555d57e4ed632f8ded8
             python: "3.14"
             isolation: host
     name: Hermes ${{ matrix.host }} (${{ matrix.isolation }})
@@ -92,13 +92,18 @@ jobs:
           import agent.subagent_lifecycle as lifecycle
           import hermes_cli.plugin_host as host
           import tools.delegate_tool as delegate
+          import tools.delegate_tool_config as delegate_config
           source = Path(os.environ["HERMES_SOURCE_DIR"]).resolve()
-          for module in (lifecycle, host, delegate):
+          for module in (lifecycle, host, delegate, delegate_config):
               path = Path(module.__file__).resolve()
               assert path.is_relative_to(source), (path, source)
               print(path)
           assert callable(delegate._credential_overrides)
           '
+
+      - name: Validate plugin admission contract
+        if: matrix.host == 'public-lifecycle'
+        run: scripts/ci-python -m hermes_cli.main plugins validate .
 
       - name: Release contract
         run: scripts/ci-python scripts/check_release_contract.py

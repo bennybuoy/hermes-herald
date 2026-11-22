@@ -54,6 +54,21 @@ def test_config_uses_active_home(tmp_path, monkeypatch, override):
         assert config.get_active_profile_name() == ("served" if override else "launch")
 
 
+def test_profile_name_inferred_from_public_hermes_constants(tmp_path, monkeypatch):
+    launch = tmp_path / "launch"
+    named = launch / "profiles" / "reviewer"
+    unrelated = tmp_path / "custom-home"
+    for path in (launch, named, unrelated):
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "config.yaml").write_text("hermes_herald: {}\n")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    assert config.get_active_profile_name() == "default"
+    with home_scope(named):
+        assert config.get_active_profile_name() == "reviewer"
+    with home_scope(unrelated):
+        assert config.get_active_profile_name() == "custom"
+
+
 def test_config_cache_is_home_keyed_and_resettable(tmp_path, monkeypatch):
     a = write_home(tmp_path / "a", "a")
     b = write_home(tmp_path / "b", "b")

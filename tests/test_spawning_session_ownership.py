@@ -21,7 +21,14 @@ from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.session import SessionSource, SessionStore
 from gateway.session_context import clear_session_vars, set_session_vars, scoped_current_session_id
 from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-from hermes_state import AsyncSessionDB
+
+
+def _get_session_row(store, session_id):
+    persistence = getattr(store, "persistence", None)
+    if persistence is not None:
+        row = persistence.sessions.get(session_id)
+        return {"end_reason": row.end_reason, "ended_at": row.ended_at} if row is not None else None
+    return store._db.get_session(session_id)
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +52,13 @@ def spawning_session(tmp_path, monkeypatch):
     )
     host = GatewayNotificationsMixin()
     host.session_store = store
-    host._session_db = AsyncSessionDB(store._db)
+    persistence = getattr(store, "persistence", None)
+    if persistence is not None:
+        host.persistence = persistence
+    else:
+        from hermes_state import AsyncSessionDB
+
+        host._session_db = AsyncSessionDB(store._db)
     # Only transport readiness is stubbed; host session classification and the
     # durable claim API use the real disposable database.
     host._completion_delivery_ready = AsyncMock(return_value=True)
@@ -59,7 +72,10 @@ def spawning_session(tmp_path, monkeypatch):
     try:
         yield store, entry, host
     finally:
-        store._db.close()
+        if hasattr(store, "close_all_db_handles"):
+            store.close_all_db_handles()
+        elif getattr(store, "_db", None) is not None:
+            store._db.close()
         reset_hermes_home_override(token)
 
 
@@ -67,8 +83,8 @@ def assert_host_ownership(event, store, spawned, host, replaced):
     current = store._entries[spawned.session_key]
     if replaced:
         assert current.session_id != spawned.session_id
-        assert store._db.get_session(spawned.session_id)["end_reason"] == "session_reset"
-        assert not store._db.get_session(current.session_id)["ended_at"]
+        assert _get_session_row(store, spawned.session_id)["end_reason"] == "session_reset"
+        assert not _get_session_row(store, current.session_id)["ended_at"]
     else:
         assert current.session_id == spawned.session_id
     claim = asyncio.run(host._preflight_completion_delivery(event))

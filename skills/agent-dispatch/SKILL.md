@@ -1,7 +1,7 @@
 ---
 name: agent-dispatch
 description: Configure, operate, troubleshoot, and choose between Hermes Herald's cross-profile dispatch, persistent chat, model-selectable subagents, bare LLM calls, run management, and approval relay tools.
-version: 1.2.0
+version: 1.3.0
 author: Ben
 license: MIT
 metadata:
@@ -27,9 +27,11 @@ Herald supports separate profile routes, credentials, state and ledgers inside
 the shared gateway; that does not provide an OS/filesystem sandbox. Do not change
 a user's isolation setting or restart their gateway without authorization.
 
-This unreleased migration retains YAML compatibility and durable spawning-session
-ownership. Core now owns provider-scoped credential resolution and rotation;
-see the explicit policy changes under `delegate_subagent`.
+Release 1.3.0 retains YAML compatibility and durable spawning-session
+ownership while completing the public `ctx.subagent_lifecycle` migration and
+removing private `tools.delegate_tool` imports for Hermes `v0.23.3+`. Core now
+owns provider-scoped credential resolution and rotation; see the explicit policy
+changes under `delegate_subagent`.
 
 ## When to Use
 
@@ -278,7 +280,7 @@ from tokens.
 
 Both modes use public `ctx.subagent_lifecycle`, never private child construction.
 Requires the provider-aware lifecycle contract introduced by `ad37bfb17fb`,
-tested at public main `e6f57427c198cfd96854522b7a9159eb007e13c2`. Missing
+tested at public main `c7a3fe245d6bf610f73ff555d57e4ed632f8ded8` (Hermes `v0.23.3+`). Missing
 facade/contract fails clearly, with no legacy fallback. Other tools can still
 load on older hosts. No numbered minimum host release is implied by this pin.
 
@@ -322,10 +324,10 @@ delegate_subagent(action="cancel", task_id="<returned task_id>", reason="Stop ..
   is not restart recovery. Use `dispatch_agent` for durable target execution.
 - If an accepted launch reports a persistence/observation warning, retrieve the
   existing task with `next_action`; do not blindly launch a duplicate.
-- Callback routing still needs an upstream public accessor for the task-local
-  durable session, chat/delivery key, UI session and source under the active
-  profile. `ctx.profile_name` and the lifecycle handle do not supply that whole
-  address; existing callback lookup dependencies remain nonblocking and explicit.
+- Callback routing uses Hermes's published `gateway.session_context.get_session_env`
+  API; completion delivery, stateless-channel checks, approval elicitation, and
+  explicit-only local model inventory remain explicit non-override imports until
+  corresponding upstream public APIs are added.
 
 ## `llm_call`
 
@@ -484,7 +486,7 @@ Use the canonical Hermes runner and isolated environment described in the
 repository's README and CI workflow, never a live profile's state. CI pins
 legacy `9fc80ac70f6b97e36556c33bc4895b75558d4136` (Python 3.11), shared-gateway
 `1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5` (Python 3.14), and experimental
-public-lifecycle `e6f57427c198cfd96854522b7a9159eb007e13c2` (Python 3.14).
+public-lifecycle `c7a3fe245d6bf610f73ff555d57e4ed632f8ded8` (Python 3.14).
 The manifest's general Hermes floor is not optional-host certification.
 
 With the public-lifecycle checkout at `hermes-agent/` and its isolated environment

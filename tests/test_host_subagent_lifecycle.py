@@ -53,11 +53,20 @@ def hosted(tmp_path, monkeypatch, request):
         done.set()
         return dict(outcome)
 
-    monkeypatch.setattr(delegate, "_resolve_delegation_credentials", credentials)
+    try:
+        import tools.delegate_tool_config as delegate_config
+    except ImportError:
+        delegate_config = None
+    for mod in (delegate_config, delegate):
+        if mod is None:
+            continue
+        if hasattr(mod, "_resolve_delegation_credentials"):
+            monkeypatch.setattr(mod, "_resolve_delegation_credentials", credentials)
+        if hasattr(mod, "_load_config"):
+            monkeypatch.setattr(mod, "_load_config", lambda: {"model": "configured-model"})
     monkeypatch.setattr(delegate, "_credential_overrides", lambda *a: {})
     monkeypatch.setattr(delegate, "_build_child_agent", build)
     monkeypatch.setattr(delegate, "_run_single_child", run)
-    monkeypatch.setattr(delegate, "_load_config", lambda: {"model": "configured-model"})
     monkeypatch.setattr(lifecycle, "request_hard_interrupt",
                         lambda *a, **kw: controls.append(("cancel", kw)) or True)
     monkeypatch.setattr(child_registry, "steer_subagent",
@@ -181,9 +190,17 @@ def test_foreign_parent_rejected_even_with_forged_session_kwarg(hosted, action):
 ])
 def test_unsupported_options_fail_before_child_construction(hosted, options):
     result = call(hosted, {"goal": "must not launch", **options})
-    assert result["status"] == "error", result
-    assert next(iter(options)) in result["error"]
-    assert "public lifecycle" in result["error"]
+    key = next(iter(options))
+    assert isinstance(result.get("error"), str), result
+    assert key in result["error"], result
+    if key == "inherit_toolsets" or result.get("status") == "error":
+        assert result["status"] == "error", result
+        assert "public lifecycle" in result["error"], result
+    else:
+        # Newer Hermes enforces additionalProperties=False in tools.arg_validation
+        # before invoking the plugin handler at all.
+        assert "not a parameter of delegate_subagent" in result["error"], result
+        assert "NOT invoked" in result["error"], result
     assert hosted.built == []
 
 

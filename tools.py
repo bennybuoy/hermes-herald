@@ -1916,7 +1916,8 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
 
     from .callback import capture_session_routing
 
-    routing = capture_session_routing(kwargs.get("parent_agent"))
+    parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
+    routing = capture_session_routing(parent_agent)
     cached = _identity.prepare(pcfg, routing)
     if cached is not None:
         return json.dumps(cached)
@@ -2089,7 +2090,7 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
                 message_preview=message[:120],
                 requested_model=requested_model,
                 resolved_model=resolved_model,
-                parent_agent=kwargs.get("parent_agent"),
+                parent_agent=parent_agent,
             )
         except Exception as exc:
             logger.error("Could not start SSE listener for %s: %s", run_id, exc)
@@ -2869,7 +2870,7 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
         try:
             from .callback import capture_session_routing
 
-            current_route = capture_session_routing(kwargs.get("parent_agent"))
+            current_route = capture_session_routing(_resolve_parent_agent(kwargs.get("parent_agent")))
         except Exception:
             current_route = {}
         expected_ui = str(approval_context.get("origin_ui_session_id") or "")
@@ -3162,67 +3163,28 @@ def _remote_reasoning_model_options(reasoning_effort) -> Optional[Dict[str, Any]
 
 
 def _resolve_parent_agent(parent_agent=None, session_id: str = ""):
-    """Resolve the live commissioning agent without guessing across sessions.
+    """Resolve the live commissioning agent via Hermes's public turn binding.
 
-    Hermes injects ``parent_agent`` for direct callers in some contexts and
-    exposes it through the classic CLI plugin manager. The desktop/TUI tool
-    path currently supplies only its exact ``HERMES_UI_SESSION_ID``; resolve
-    that ID through the TUI's own session registry. Never scan or fall back to
-    another session, because model credentials and delivery ownership belong
+    Hermes binds the active agent on every turn through
+    ``agent.subagent_lifecycle.bind_subagent_parent`` (CLI, TUI, Desktop,
+    gateway, and API runs). Never scan process-global session tables or fall
+    back across sessions, because model provenance and delivery ownership belong
     to the commissioning agent.
     """
     if parent_agent is not None:
         return parent_agent
-
     try:
-        from hermes_cli.plugins import get_plugin_manager
+        from agent.subagent_lifecycle import get_active_subagent_parent
 
-        plugin_manager = get_plugin_manager()
-        cli = getattr(plugin_manager, "_cli_ref", None)
-        cli_agent = getattr(cli, "agent", None) if cli else None
-        if cli_agent is not None:
-            return cli_agent
-    except Exception:
-        pass
-
-    try:
-        from gateway.session_context import get_session_env
-        from tui_gateway import server as tui_server
-
-        ui_session_id = str(
-            get_session_env("HERMES_UI_SESSION_ID", "") or ""
-        ).strip()
-        durable_session_id = str(session_id or "").strip()
-        sessions_lock = getattr(tui_server, "_sessions_lock", None)
-
-        def _resolve_from_sessions(sessions):
-            if ui_session_id:
-                session = sessions.get(ui_session_id)
-                if isinstance(session, dict) and session.get("agent") is not None:
-                    return session.get("agent")
-            if not durable_session_id:
-                return None
-            matches = []
-            for session in sessions.values():
-                if not isinstance(session, dict):
-                    continue
-                agent = session.get("agent")
-                if agent is None:
-                    continue
-                if (
-                    str(session.get("session_key") or "") == durable_session_id
-                    or str(getattr(agent, "session_id", "") or "")
-                    == durable_session_id
-                ):
-                    matches.append(agent)
-            return matches[0] if len(matches) == 1 else None
-
-        if sessions_lock is None:
-            return _resolve_from_sessions(getattr(tui_server, "_sessions", {}))
-        with sessions_lock:
-            return _resolve_from_sessions(getattr(tui_server, "_sessions", {}))
+        active = get_active_subagent_parent()
     except Exception:
         return None
+    if active is None:
+        return None
+    durable_session_id = str(session_id or "").strip()
+    if durable_session_id and str(getattr(active, "session_id", "") or "") != durable_session_id:
+        return None
+    return active
 
 
 def handle_delegate_subagent(args: dict, **kwargs) -> str:
@@ -3778,12 +3740,11 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
     needle = query.lower()
     if not profile:
         try:
-            from agent import auxiliary_client as auxiliary
-
+            parent = _resolve_parent_agent(kwargs.get("parent_agent"))
             inventory = _configured_local_model_inventory(
-                current_provider=(auxiliary._read_main_provider() or "").strip(),
-                current_model=(auxiliary._read_main_model() or "").strip(),
-                current_base_url=(auxiliary._read_main_base_url() or "").strip(),
+                current_provider=str(getattr(parent, "provider", "") or "").strip(),
+                current_model=str(getattr(parent, "model", "") or "").strip(),
+                current_base_url=str(getattr(parent, "base_url", "") or "").strip(),
             )
         except Exception as e:
             return _tool_error(

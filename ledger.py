@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -124,7 +125,7 @@ def _connect() -> sqlite3.Connection:
 
 def preflight() -> None:
     """Create/validate the ledger before starting a remote side effect."""
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         connection.execute("SELECT 1 FROM dispatches LIMIT 1").fetchone()
 
 
@@ -157,7 +158,7 @@ def record_dispatch(
     """Insert one credential-free directed dispatch edge."""
     now = dispatched_at or _now()
     completed_at = completed_at or (now if status in _TERMINAL_STATUSES else "")
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         connection.execute(
             """
             INSERT INTO dispatches (
@@ -184,7 +185,7 @@ def record_dispatch(
 
 def known_run_ids(origin_profile: str) -> set[str]:
     """Return run IDs already represented for one origin."""
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         rows = connection.execute(
             "SELECT DISTINCT run_id FROM dispatches WHERE origin_profile = ?",
             (origin_profile,),
@@ -194,7 +195,7 @@ def known_run_ids(origin_profile: str) -> set[str]:
 
 def run_id_for_edge(edge_id: str) -> Optional[str]:
     """Return the run bound to one globally unique edge, if present."""
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         row = connection.execute(
             "SELECT run_id FROM dispatches WHERE edge_id = ?",
             (edge_id,),
@@ -235,7 +236,7 @@ def update_dispatch(
         assignments.append("resolved_model = ?")
         values.append(resolved_model)
     values.extend([run_id, origin_profile])
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         connection.execute(
             f"UPDATE dispatches SET {', '.join(assignments)} "
             "WHERE run_id = ? AND origin_profile = ?",
@@ -307,7 +308,7 @@ def list_dispatches(
             values.append(value)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     values.append(limit)
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         rows = connection.execute(
             "SELECT * FROM dispatches" + where +
             " ORDER BY dispatched_at DESC, edge_id DESC LIMIT ?",
@@ -318,7 +319,7 @@ def list_dispatches(
 
 def observed_edges() -> list[dict]:
     """Aggregate durable call counts into a directed observed graph."""
-    with _connect() as connection:
+    with closing(_connect()) as connection, connection:
         rows = connection.execute(
             """
             SELECT origin_profile, target_profile, COUNT(*) AS calls

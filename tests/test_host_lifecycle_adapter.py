@@ -84,6 +84,28 @@ def test_malformed_or_irrelevant_options_never_launch(args):
     assert service.launched == []
 
 
+@pytest.mark.parametrize("adapter_kind", ["host", "native"])
+@pytest.mark.parametrize("options", [
+    {"toolsets": []}, {"allowed_toolsets": ["file"]},
+    {"inherit_toolsets": False}, {"inherit_toolsets": "false"},
+    {"stall_timeout_seconds": 60}, {"interrupt_after_seconds": 60},
+    {"timeout_seconds": 60}, {"hard_timeout_seconds": 60},
+    {"inherit_context": True}, {"inherit_soul": True},
+    {"reasoning_effort": "low"}, {"role": "orchestrator"},
+    {"working_directory": "/ignored"}, {"blocked_tools": ["terminal"]},
+    {"unexpected_option": 1},
+])
+def test_unsupported_options_rejected_directly_by_adapters(adapter_kind, options):
+    from hermes_herald.native_lifecycle import NativeLifecycleAdapter
+    service = Lifecycle()
+    cls = HostLifecycleAdapter if adapter_kind == "host" else NativeLifecycleAdapter
+    result = invoke(cls(SimpleNamespace(subagent_lifecycle=service)), {"goal": "must not launch", **options})
+    assert result["status"] == "error", result
+    assert next(iter(options)) in result["error"]
+    assert "public lifecycle" in result["error"]
+    assert service.launched == []
+
+
 def test_missing_facade_names_public_requirement_without_legacy_advice():
     adapter = HostLifecycleAdapter(SimpleNamespace())
     error = invoke(adapter, {"goal": "x"})

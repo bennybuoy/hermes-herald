@@ -104,9 +104,29 @@ def get_active_profile_name() -> str:
     if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
     try:
-        from hermes_cli.profiles import get_active_profile_name as _active_profile
+        import hermes_constants as _hc
 
-        return str(_active_profile() or "default")
+        home = _resolve_hermes_home().resolve()
+        resolver = getattr(_hc, "profile_name_for_home", None)
+        if callable(resolver):
+            resolved = resolver(home)
+            return str(resolved) if resolved else "custom"
+        default_root_fn = getattr(_hc, "get_default_hermes_root", None)
+        default_root = (
+            default_root_fn().resolve()
+            if callable(default_root_fn)
+            else (Path.home() / ".hermes").resolve()
+        )
+        if home == default_root:
+            return "default"
+        profiles_root = (default_root / "profiles").resolve()
+        try:
+            parts = home.relative_to(profiles_root).parts
+            if len(parts) == 1 and re.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", parts[0]):
+                return parts[0]
+        except ValueError:
+            pass
+        return "custom"
     except Exception:
         return "default"
 
