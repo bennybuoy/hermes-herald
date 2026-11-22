@@ -103,7 +103,13 @@ jobs:
 
       - name: Validate plugin admission contract
         if: matrix.host == 'public-lifecycle'
-        run: scripts/ci-python -m hermes_cli.main plugins validate .
+        run: |
+          stage="${RUNNER_TEMP}/plugin-validate"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          git archive HEAD | tar -x -C "$stage"
+          trap 'rm -rf "$stage"' EXIT
+          scripts/ci-python -m hermes_cli.main plugins validate "$stage"
 
       - name: Release contract
         run: scripts/ci-python scripts/check_release_contract.py
