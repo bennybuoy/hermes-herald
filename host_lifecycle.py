@@ -25,7 +25,10 @@ HOST_DELEGATE_SUBAGENT_SCHEMA = {
         "options and per-call reasoning/timeouts are unsupported and rejected before "
         "launch in both execution modes. Provide self-contained goal/context. "
         "Model/provider are exact lifecycle routing values, not the lenient /model "
-        "switch pipeline. Omitted provider uses delegation config before the parent. "
+        "switch pipeline. Call list_profile_models() without a profile to see "
+        "configured local providers. Always pass BOTH provider and model when "
+        "overriding across providers (including OpenRouter or unregistered models); "
+        "omitted provider uses delegation config before the parent. "
         "Task handles last only for this plugin host lifetime (128 retained tasks); "
         "Hermes terminal results have one-hour retention. Retrieve promptly. "
         "Cancellation is cooperative; accepted does not mean stopped. Steering queues "
@@ -42,9 +45,9 @@ HOST_DELEGATE_SUBAGENT_SCHEMA = {
             "context": {"type": "string", "maxLength": 32000,
                         "description": "Explicit background brief, launch only; no parent history copy."},
             "model": {"type": "string", "minLength": 1,
-                      "description": "Exact model slug, launch only. Omission uses Hermes delegation routing."},
+                      "description": "Exact model slug (catalog or unregistered), launch only. Pair with provider= when crossing providers or using OpenRouter. Omission uses Hermes delegation routing."},
             "provider": {"type": "string", "minLength": 1, "maxLength": 64,
-                         "description": "Exact provider slug, launch only. Pin with model for an exact pair."},
+                         "description": "Exact configured provider slug from list_profile_models(), launch only. Pin with model for an exact cross-provider/OpenRouter pair."},
             "inherit_toolsets": {"type": "boolean", "enum": [True], "default": True,
                                  "description": "Only true is supported: Hermes's safe inherited tool policy."},
             "task_id": {"type": "string", "description": "Opaque Herald ID returned by launch; controls only."},
@@ -123,6 +126,62 @@ class HostLifecycleAdapter:
         if action != "launch" and not isinstance(args.get("task_id"), str):
             raise ValueError("task_id is required for control actions.")
 
+    @staticmethod
+    def _safe_lifecycle_error(action, exc):
+        """Return an audited canned error message without echoing raw exception text.
+
+        RPC exceptions may contain serialized capability-bearing handles, so
+        raw exception text is never printed, logged, or returned. On launch, no
+        handle exists yet; classify common ValueError routing/auth failures into
+        actionable canned messages.
+        """
+        default = (
+            "Hermes lifecycle call failed. Retry from the owning active session; "
+            "requires the public ctx.subagent_lifecycle facade with per-launch provider support. "
+            "Upgrade Hermes and check delegation routing/policy. No legacy fallback."
+        )
+        if action != "launch" or not isinstance(exc, ValueError):
+            return default
+        msg = str(exc).lower()
+        if "unknown request fields" in msg and "provider" in msg:
+            return default
+        if any(
+            token in msg
+            for token in (
+                "cannot resolve delegation provider",
+                "has no api key",
+                "no api key",
+                "missing credentials",
+                "without a base_url",
+                "missing_api_key",
+                "not authenticated",
+                "no usable model provider",
+            )
+        ):
+            return (
+                "Requested delegation provider is not configured or has no usable "
+                "credentials on this profile. Call list_profile_models() to inspect "
+                "configured providers, or omit provider to use default delegation routing."
+            )
+        if "disabled" in msg:
+            return (
+                "Requested delegation provider is disabled in this profile's "
+                "configuration. Call list_profile_models() to choose an enabled provider."
+            )
+        if "not found on path" in msg:
+            return (
+                "Requested delegation provider requires an external CLI command "
+                "that was not found on PATH."
+            )
+        if "no active hermes parent session" in msg or "parent_session_id does not match" in msg:
+            return (
+                "No matching active Hermes parent session is available; "
+                "retry from the owning active session."
+            )
+        if "unknown toolsets" in msg or "broaden parent permissions" in msg:
+            return "Requested subagent toolsets were rejected by Hermes policy; no child was launched."
+        return default
+
     def __call__(self, args, **kwargs):
         try:
             action = self._validate(args)
@@ -133,13 +192,11 @@ class HostLifecycleAdapter:
             return json.dumps({"status": "error", "error": str(exc), "delivery": "poll"})
         try:
             payload = self._perform(action, args, session)
-        except Exception:
+        except Exception as exc:
             # RPC exceptions may contain serialized capability-bearing arguments.
             # Never print, log, or echo them; leave the task available for retry.
             return json.dumps({"status": "error", "delivery": "poll",
-                               "error": "Hermes lifecycle call failed. Retry from the owning active session; "
-                                        "requires the public ctx.subagent_lifecycle facade with per-launch provider support. "
-                                        "Upgrade Hermes and check delegation routing/policy. No legacy fallback."})
+                               "error": self._safe_lifecycle_error(action, exc)})
         return json.dumps(payload)
 
     def _perform(self, action, args, session):

@@ -74,9 +74,10 @@ def get_profile_config(profile: str) -> Optional[Dict[str, Any]]:
     """Return the endpoint config for a named profile.
 
     Returns ``None`` if the profile is not configured. The returned dict
-    has keys: ``url``, ``api_key``, and optionally ``model``. The model value
-    is an exact target ``model_routes`` alias accepted by ``dispatch_agent``
-    and ``dispatch_chat``; it is not an arbitrary model name.
+    has keys: ``url``, ``api_key``, and optionally ``model`` and ``provider``.
+    ``model`` may be an exact target ``model_routes`` alias, or (when paired
+    with ``provider``) a direct catalog or unregistered model ID supported by
+    that authenticated target provider.
     """
     cfg = _load_config()
     profiles = cfg.get("profiles", {})

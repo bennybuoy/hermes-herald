@@ -425,6 +425,8 @@ def _build_delegation_event(
     model: str = "",
     requested_model: str = "",
     resolved_model: str = "",
+    model_resolution: str = "",
+    served_runtime: Optional[dict] = None,
     duration_seconds: Optional[float] = None,
 ) -> dict:
     """Build an async_delegation event that mimics delegate_task completions.
@@ -443,6 +445,24 @@ def _build_delegation_event(
         deleg_status = status
         summary = output or None
 
+    runtime_clean: Optional[dict] = None
+    served_model = ""
+    served_provider = ""
+    if isinstance(served_runtime, dict):
+        served_model = str(served_runtime.get("model") or "").strip()
+        served_provider = str(served_runtime.get("provider") or "").strip()
+        if served_model or served_provider:
+            runtime_clean = {
+                "provider": served_provider,
+                "model": served_model,
+                **({"route_source": str(served_runtime["route_source"]).strip()}
+                   if isinstance(served_runtime.get("route_source"), str)
+                   and served_runtime["route_source"].strip() else {}),
+            }
+
+    effective_model = served_model or model or resolved_model
+    effective_resolved = served_model or resolved_model
+
     # Record terminal provenance in the state file
     try:
         from .tools import _update_run_status
@@ -452,9 +472,9 @@ def _build_delegation_event(
             output_preview=output[:500] if output else "",
             duration_seconds=duration_seconds,
             usage=usage if usage else None,
-            model=model,
+            model=effective_model,
             requested_model=requested_model,
-            resolved_model=resolved_model,
+            resolved_model=effective_resolved,
         )
     except Exception:
         pass  # state file is best-effort; don't crash the SSE thread
@@ -468,9 +488,9 @@ def _build_delegation_event(
         "context": None,
         "toolsets": None,
         "role": "leaf",
-        "model": model or "?",
+        "model": effective_model or "?",
         "requested_model": requested_model,
-        "resolved_model": resolved_model,
+        "resolved_model": effective_resolved,
         "status": deleg_status,
         "summary": summary,
         "error": error,
@@ -484,8 +504,15 @@ def _build_delegation_event(
         "parent_session_id": str(route.get("parent_session_id") or session_id or ""),
         "origin_ui_session_id": str(route.get("origin_ui_session_id") or ""),
     }
-    if resolved_model:
-        event["model_resolution"] = "target_model_routes"
+    effective_resolution = model_resolution or ("target_model_routes" if resolved_model else "")
+    if effective_resolution:
+        event["model_resolution"] = effective_resolution
+    if runtime_clean is not None:
+        event["served_runtime"] = runtime_clean
+        if served_provider:
+            event["served_provider"] = served_provider
+        if served_model:
+            event["served_model"] = served_model
     return event
 
 
@@ -499,6 +526,7 @@ def _listen_sse(
     session_key: str,
     requested_model: str = "",
     resolved_model: str = "",
+    model_resolution: str = "",
 ) -> None:
     """Background thread: subscribe to SSE event stream for a run.
 
@@ -526,7 +554,7 @@ def _listen_sse(
         outcome, deleg_evt = _read_sse_stream(
             run_id, profile, sse_url, api_key, message_preview,
             session_id, session_key, requested_model, resolved_model,
-            start_time,
+            start_time, model_resolution=model_resolution,
         )
 
         if outcome == "terminal":
@@ -547,12 +575,13 @@ def _listen_sse(
             poll_evt = _check_run_status(
                 run_id, profile, url, api_key, message_preview,
                 session_id, session_key, requested_model, resolved_model,
+                model_resolution=model_resolution,
             )
             if poll_evt is None:
                 poll_evt = _poll_run_status(
                     run_id, profile, url, api_key, message_preview,
                     session_id, session_key, requested_model, resolved_model,
-                    start_time,
+                    start_time, model_resolution=model_resolution,
                 )
             _cleanup_listener(run_id)
             if poll_evt is not None:
@@ -582,6 +611,7 @@ def _listen_sse(
         poll_evt = _check_run_status(
             run_id, profile, url, api_key, message_preview,
             session_id, session_key, requested_model, resolved_model,
+            model_resolution=model_resolution,
         )
         if poll_evt is not None:
             # Run already reached a terminal state while we were disconnected.
@@ -610,7 +640,7 @@ def _listen_sse(
             fallback_evt = _poll_run_status(
                 run_id, profile, url, api_key, message_preview,
                 session_id, session_key, requested_model, resolved_model,
-                start_time,
+                start_time, model_resolution=model_resolution,
             )
             _cleanup_listener(run_id)
             if fallback_evt is not None:
@@ -628,6 +658,7 @@ def _check_run_status(
     session_key: str,
     requested_model: str,
     resolved_model: str,
+    model_resolution: str = "",
 ) -> Optional[dict]:
     """One-shot GET /v1/runs/{run_id} to check whether a run is already terminal.
 
@@ -656,6 +687,7 @@ def _check_run_status(
 
     status = status_data.get("status", "")
     elapsed = status_data.get("duration_seconds", 0)
+    served_runtime = status_data.get("runtime") if isinstance(status_data, dict) else None
 
     if status in ("completed", "succeeded"):
         return _build_delegation_event(
@@ -663,6 +695,7 @@ def _check_run_status(
             message_preview, session_id, session_key,
             status="completed", model=resolved_model,
             requested_model=requested_model, resolved_model=resolved_model,
+            model_resolution=model_resolution, served_runtime=served_runtime,
             duration_seconds=elapsed,
         )
     if status in ("failed", "error"):
@@ -671,6 +704,7 @@ def _check_run_status(
             status="failed", error=status_data.get("error", "unknown error"),
             model=resolved_model,
             requested_model=requested_model, resolved_model=resolved_model,
+            model_resolution=model_resolution, served_runtime=served_runtime,
             duration_seconds=elapsed,
         )
     if status == "cancelled":
@@ -679,6 +713,7 @@ def _check_run_status(
             status="cancelled", error="run was cancelled",
             model=resolved_model,
             requested_model=requested_model, resolved_model=resolved_model,
+            model_resolution=model_resolution, served_runtime=served_runtime,
             duration_seconds=elapsed,
         )
     if status == "unknown":
@@ -697,6 +732,7 @@ def _check_run_status(
             ),
             model=resolved_model,
             requested_model=requested_model, resolved_model=resolved_model,
+            model_resolution=model_resolution, served_runtime=served_runtime,
             duration_seconds=elapsed,
         )
     return None  # still running or waiting_for_approval
@@ -731,6 +767,7 @@ def _poll_run_status(
     resolved_model: str,
     start_time: float,
     poll_start: float = 0.0,
+    model_resolution: str = "",
 ) -> Optional[dict]:
     """Poll a run after SSE loss without resubscribing to its event queue.
 
@@ -804,13 +841,15 @@ def _poll_run_status(
             last_updated_at = updated_at
             last_activity = time.time()
 
+        served_runtime = status_data.get("runtime") if isinstance(status_data, dict) else None
         if status == "completed":
             return _build_delegation_event(
                 run_id, profile, str(status_data.get("output") or ""),
                 status_data.get("usage") or {}, message_preview,
                 session_id, session_key, status="completed",
                 model=resolved_model, requested_model=requested_model,
-                resolved_model=resolved_model, duration_seconds=elapsed,
+                resolved_model=resolved_model, model_resolution=model_resolution,
+                served_runtime=served_runtime, duration_seconds=elapsed,
             )
         if status in {"failed", "cancelled"}:
             return _build_delegation_event(
@@ -818,7 +857,8 @@ def _poll_run_status(
                 status=status,
                 error=str(status_data.get("error") or f"run was {status}"),
                 model=resolved_model, requested_model=requested_model,
-                resolved_model=resolved_model, duration_seconds=elapsed,
+                resolved_model=resolved_model, model_resolution=model_resolution,
+                served_runtime=served_runtime, duration_seconds=elapsed,
             )
         if status == "unknown":
             _clear_pending_approval_mem(run_id)
@@ -835,7 +875,8 @@ def _poll_run_status(
                     or _UNKNOWN_RUN_ERROR.format(run_id=run_id)
                 ),
                 model=resolved_model, requested_model=requested_model,
-                resolved_model=resolved_model, duration_seconds=elapsed,
+                resolved_model=resolved_model, model_resolution=model_resolution,
+                served_runtime=served_runtime, duration_seconds=elapsed,
             )
         if status == "waiting_for_approval" and not _is_awaiting_approval(run_id):
             return _build_delegation_event(
@@ -873,6 +914,7 @@ def _read_sse_stream(
     requested_model: str,
     resolved_model: str,
     start_time: float,
+    model_resolution: str = "",
 ) -> tuple:
     """Open one SSE connection and process events until terminal, stall, or disconnect.
 
@@ -1063,6 +1105,7 @@ def _read_sse_stream(
                             except Exception:
                                 pass
                             elapsed = time.time() - start_time
+                            served_runtime = evt.get("runtime") if isinstance(evt, dict) else None
                             if event_type == "run.completed":
                                 output = evt.get("output", "")
                                 usage = evt.get("usage", {})
@@ -1073,6 +1116,8 @@ def _read_sse_stream(
                                     model=resolved_model,
                                     requested_model=requested_model,
                                     resolved_model=resolved_model,
+                                    model_resolution=model_resolution,
+                                    served_runtime=served_runtime,
                                     duration_seconds=elapsed,
                                 )
                             elif event_type == "run.failed":
@@ -1085,6 +1130,8 @@ def _read_sse_stream(
                                     model=resolved_model,
                                     requested_model=requested_model,
                                     resolved_model=resolved_model,
+                                    model_resolution=model_resolution,
+                                    served_runtime=served_runtime,
                                     duration_seconds=elapsed,
                                 )
                             else:  # run.cancelled
@@ -1096,6 +1143,8 @@ def _read_sse_stream(
                                     model=resolved_model,
                                     requested_model=requested_model,
                                     resolved_model=resolved_model,
+                                    model_resolution=model_resolution,
+                                    served_runtime=served_runtime,
                                     duration_seconds=elapsed,
                                 )
                             return ("terminal", deleg_evt)
@@ -1349,6 +1398,7 @@ def start_listener(
     resolved_model: str = "",
     parent_agent=None,
     session_id: str = "",
+    model_resolution: str = "",
 ) -> None:
     """Start an SSE listener thread for a dispatched run.
 
@@ -1383,6 +1433,7 @@ def start_listener(
                     session_key,
                     requested_model,
                     resolved_model,
+                    model_resolution,
                 ),
                 name=f"dispatch-sse-{run_id[:12]}",
                 daemon=True,

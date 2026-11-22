@@ -24,7 +24,10 @@ NATIVE_DELEGATE_SUBAGENT_SCHEMA["description"] = (
     "Children use core delegation routing, safe inherited tools, reasoning and timeout "
     "policy. Per-call tool restrictions/model-only, reasoning/timeouts, SOUL and parent "
     "history inheritance are unsupported and rejected before launch. Supply explicit "
-    "goal/context. Omitted provider uses delegation config before parent routing. "
+    "goal/context. Call list_profile_models() without a profile for configured "
+    "local providers; pass BOTH provider and model when overriding across "
+    "providers (including OpenRouter or unregistered models). Omitted provider "
+    "uses delegation config before parent routing. "
     "Task handles last for this registration lifetime (128 retained tasks); core "
     "terminal results have one-hour retention."
 )

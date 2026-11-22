@@ -112,33 +112,43 @@ class TestLocalModelRouteDiscovery:
                 "api_key": "remote-secret",
             }, None),
         )
-        request = {}
+        requests = []
 
         def remote_models(url, api_key, timeout):
-            request.update(url=url, api_key=api_key, timeout=timeout)
-            return {
-                "data": [
-                    {"id": "glm-5.2", "root": "glm-5.2"},
-                    {
-                        "id": "review-fast",
-                        "root": "glm-5.2",
-                        "parent": "glm-5.2",
-                        "provider": "nous",
-                    },
-                ]
-            }
+            requests.append({"url": url, "api_key": api_key, "timeout": timeout})
+            if url.endswith("/v1/models"):
+                return {
+                    "data": [
+                        {"id": "glm-5.2", "root": "glm-5.2"},
+                        {
+                            "id": "review-fast",
+                            "root": "glm-5.2",
+                            "parent": "glm-5.2",
+                            "provider": "nous",
+                        },
+                    ]
+                }
+            raise RuntimeError("HTTP 404 from /api/model/options")
 
         monkeypatch.setattr(tools, "_get_json", remote_models)
 
         raw = tools.handle_list_profile_models({"profile": "reviewer"})
         result = json.loads(raw)
 
-        assert request == {
-            "url": "https://reviewer.example/v1/models",
-            "api_key": "remote-secret",
-            "timeout": 10.0,
-        }
+        assert requests == [
+            {
+                "url": "https://reviewer.example/v1/models",
+                "api_key": "remote-secret",
+                "timeout": 10.0,
+            },
+            {
+                "url": "https://reviewer.example/api/model/options?include_unconfigured=false",
+                "api_key": "remote-secret",
+                "timeout": 10.0,
+            },
+        ]
         assert result["profile"] == "reviewer"
+        assert result["options_available"] is False
         assert result["advertised_primary"] == {
             "model": "glm-5.2",
             "dispatchable_as_override": False,

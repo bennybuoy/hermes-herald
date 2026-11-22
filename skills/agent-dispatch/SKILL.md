@@ -63,7 +63,7 @@ Do not use Herald for non-Hermes A2A peers. Use Hermes's A2A tooling for Agent C
 | Audit calls or inspect topology | `dispatch_status` | Queries SQLite; full task text is opt-in |
 | Cancel a target run | `cancel_dispatch` | Cooperative; also retires the local listener after target stop succeeds |
 | Check target reachability | `ping_profile` | Liveness, not model-route authorization |
-| Discover safe model routes | `list_profile_models` | Omit `profile` for local `llm_call`; name a profile for remote dispatch |
+| Discover safe model routes | `list_profile_models` | Omit `profile` for local `llm_call`/`delegate_subagent` providers & routes; name a profile for remote aliases, authenticated providers, and multi-route disambiguation |
 | Deny a relayed protected command | `approve_dispatch` | Deny-only in v1; requires the fresh Herald approval ID and human confirmation |
 
 ## Installation and Configuration
@@ -100,7 +100,8 @@ hermes_herald:
       url: http://127.0.0.1:8642/p/reviewer
       api_key: ${REVIEWER_API_KEY}
       capabilities: [dispatch, chat]
-      # Optional exact model_routes alias for both dispatch tools:
+      # Optional exact model_routes alias, or provider + model pair, for both dispatch tools:
+      # provider: openrouter
       # model: reviewer-fast
   # Optional; defaults to <active HERMES_HOME>/hermes-herald-runs.json
   # state_file: /custom/private/path/hermes-herald-runs.json
@@ -140,13 +141,14 @@ platforms:
           model: gpt-5.6-sol
 ```
 
-`list_profile_models(profile="reviewer")` authenticates to the configured base URL plus `/v1/models`: URL-selected profile identity plus the listener's aliases only. Herald does not list the target's full provider catalog. Verify that exact listing; a short listing means check aliases on the listener owner and restart that gateway when safe. Pin `provider` on each alias. Origin `hermes_herald.profiles.reviewer.model` may name one of those aliases as a default; it cannot invent new ones. Listener-wide aliases are not per-profile allowlists. See the [shared-gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/multi-profile-gateways).
+`list_profile_models(profile="reviewer")` authenticates to both `/v1/models` (URL-selected profile identity plus the listener's `model_routes` aliases) and, when supported by the target, `/api/model/options?include_unconfigured=false` (the target profile's own authenticated providers, advertised models, and `multi_route_models` where the same model exists on more than one provider, such as direct vs OpenRouter).
 
-Copy an exact alias from `pass_as_model` into `model`. If the listing advertises
-a provider, pass that provider; it must match a pinned alias. If provider metadata
-is absent, verify the listener's alias with its operator rather than inventing a
-route. Both dispatch tools accept `reasoning_effort` for the target request; the
-target's policy can ignore, clamp or drop it.
+On remote targets you can override the default in two ways:
+
+1. **Exact `model_routes` alias:** copy one string from `pass_as_model` into `model=` (and copy its `provider` into `provider=` when pinned). Works even on older servers without `/api/model/options`.
+2. **Direct `provider` + `model` pair:** when `options_available` is true, pass BOTH `provider=` (copied from `configured_providers[].provider`) and `model=` (either an `available_routes` entry or an unregistered/new/custom model ID such as an OpenRouter `org/model` or `:nitro` slug served by that authenticated provider).
+
+Bare unaliased `model=` without `provider=` fails closed with disambiguation hints so `/v1/chat/completions` never silently falls back to default and multi-route models never hit the wrong subscription. Both dispatch tools accept `reasoning_effort` for the target request; the target's policy can ignore, clamp or drop it. See the [shared-gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/multi-profile-gateways).
 
 For remote targets, use a trusted private network or authenticated TLS. Herald does not add TLS.
 
@@ -159,7 +161,7 @@ ping_profile(profile="reviewer")
 list_profile_models(profile="reviewer")
 ```
 
-`ping_profile` establishes reachability. `list_profile_models` authenticates to the target and returns exact `model_routes` aliases that may be supplied to `dispatch_agent` or `dispatch_chat`.
+`ping_profile` establishes reachability. `list_profile_models` authenticates to the target and returns both exact `model_routes` aliases (`pass_as_model`) and, when available, the target's authenticated providers (`configured_providers`, `available_routes`, `multi_route_models`) for direct `provider=` + `model=` dispatch.
 
 ### 2. Write a self-contained brief
 
@@ -182,8 +184,8 @@ A target's final summary is a self-report. Read back files, fetch URLs, inspect 
 
 `dispatch_agent` POSTs a new run to a configured target and returns a `run_id` immediately. The target run has its own session, model, skills, memory, and tools.
 
-- An explicit `model` must be an exact target `model_routes` alias advertised by authenticated `GET /v1/models`.
-- A profile-level `model` is the default for both `dispatch_agent` and `dispatch_chat`.
+- An explicit `model` must be either an exact target `model_routes` alias advertised by authenticated `GET /v1/models`, OR paired with an explicit authenticated `provider=` verified via `GET /api/model/options` (including unregistered/new/custom or OpenRouter `org/model` slugs). Bare unaliased models fail closed with disambiguation hints.
+- Profile-level `model` (and optional `provider`) is the default for both `dispatch_agent` and `dispatch_chat`.
 - If neither is present, Herald omits the model field and preserves the target's normal default.
 - Auto-delivery requires a commissioning session that supports detached results and a live origin process.
 - `delivery="none"` requires neither: no listener or callback is created. Preserve incoming `trace_id`/`max_hops`, set `parent_edge_id`, and pass incoming `hop_count` as `parent_hop` when forwarding detached graph work.
@@ -267,7 +269,7 @@ Use `dispatch_chat` for synchronous dialogue where later messages depend on prio
 - The target streams assistant deltas and tool lifecycle events; activity resets the stall timer and is surfaced to the parent UI when it exposes a progress callback.
 - `stall_timeout_seconds` overrides `hermes_herald.chat_timeout`. It is an inactivity threshold, not a flat wall-clock cap; productive calls may run longer.
 - `instructions` is sent as a system message for the current request; resend it when later turns still require it.
-- An explicit or profile-level `model` must be an exact target `model_routes` alias verified through authenticated `/v1/models`. Omission preserves the target default.
+- An explicit or profile-level `model` must be either an exact target `model_routes` alias verified through authenticated `/v1/models`, or paired with an explicit authenticated `provider=` verified via `/api/model/options` (including unregistered/OpenRouter models). Omission preserves the target default.
 - Persistent chat returns one final reply and blocks the current origin agent turn; it does not create a separately pollable Herald run.
 - If a saved target session returns 404, retry deliberately with `new_session=true`.
 - On `chat_timeout`, keep the returned `profile` and `session_id`: the remote turn may still be running. Inspect that target session before sending more work; never automatically resend the chat. Socket waits respect the configured inactivity window without a separate 60-second cap.
@@ -345,19 +347,24 @@ Use `llm_call` when you need only inference, not an agent loop:
   embedded credentials, and private/loopback/metadata targets.
 - Use either `system_prompt` or a system-role message, not both.
 - Call `list_profile_models()` before choosing a route. Its local mode returns
-  the calling profile's configured default plus every provider explicitly
-  configured by the user as exact provider/model slugs. Virtual MoA routes,
-  ambient or auto-discovered credentials, and fallback-only routes are not
-  routing authority.
+  the calling profile's `configured_default`, `configured_providers` (noting
+  partial catalogs like OpenRouter and custom endpoints), `available_routes`,
+  `multi_route_models` (models reachable via more than one provider), and any
+  enabled `llm_direct_endpoints`. Virtual MoA routes, ambient or auto-discovered
+  credentials, and fallback-only routes are not routing authority.
 - With no routing arguments, Hermes uses the host's active configured route.
 - Prefer that configured default. Do not choose another provider merely because
   it advertises the same model; override only when the task or user explicitly
   calls for that endpoint.
-- `model` and `provider` are optional only as a pair: supply both by copying one
-  exact `available_routes` entry, or omit both.
-- Herald checks that pair against configured discovery and passes it unchanged
-  to Hermes's public `ctx.llm.complete()` facade. Hermes owns credentials,
-  transport, provider resolution, timeout behavior, and fallback policy.
+- `model` and `provider` are optional only as a pair: supply both using a
+  configured provider from `configured_providers` (either an `available_routes`
+  model or an unregistered/new/custom model ID such as an OpenRouter `org/model`
+  slug served by that provider), or omit both.
+- Herald verifies that the provider is configured on this profile and passes the
+  pair unchanged to Hermes's public `ctx.llm.complete()` facade (flagging
+  `unregistered_model: true` when the model is outside the static catalog).
+  Hermes owns credentials, transport, provider resolution, timeout behavior, and
+  fallback policy.
 - Explicit selection also requires the host's
   `plugins.entries.hermes-herald.llm` trust policy to permit provider and model
   overrides. Missing trust configuration fails closed.
@@ -477,15 +484,14 @@ automatic completion only after the user accepts that trust setting. Exact
 per-call tool restrictions remain unsupported in both modes; do not weaken the
 task silently.
 
-### Persistent chat rejects a model alias, or the listing is missing a model
+### Target rejects a model, or the listing is missing a model / has multiple routes
 
-Call `list_profile_models(profile=...)` and use one of the exact advertised route aliases. The target's primary identity or an arbitrary provider/model slug is not sufficient unless it is also declared as a route alias. Omit `model` to use the target default.
+Call `list_profile_models(profile=...)` (optionally with `query=<model-substring>`).
 
-If the listing is shorter than expected, check the **listener owner's**
-`platforms.api_server.extra.model_routes`, restart that gateway when safe, and
-list again. On the tested shared gateway this is the default profile; on a
-standalone gateway it is the target. Origin `hermes_herald.profiles` does not
-define the catalog.
+- If the model exists on more than one provider (for example direct `anthropic` and `openrouter`), check `multi_route_models` and pass BOTH `provider=` and `model=` explicitly.
+- If a model is new or unregistered (for example a newly released OpenRouter `org/model` slug or custom endpoint model), pass BOTH `provider=` (from `configured_providers`) and the exact upstream `model=` ID — no `model_routes` alias is needed on targets that expose `/api/model/options`.
+- Never pass `advertised_primary.model` or a bare unaliased `model=` without `provider=`. Omit both to use the target default.
+- If `options_available` is `false` (older target API server) and `pass_as_model` is shorter than expected, configure aliases on the **listener owner's** `platforms.api_server.extra.model_routes`, restart that gateway when safe, and list again. Origin `hermes_herald.profiles` does not define the target's catalog.
 
 ### Approval notice does not arrive
 

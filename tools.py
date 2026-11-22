@@ -46,6 +46,7 @@ from urllib.request import (
 from urllib.error import HTTPError, URLError
 
 from . import config as cfg
+from . import model_catalog
 from .multimodal import (
     LLM_IMAGES_PARAM_SCHEMA,
     LLM_MESSAGE_CONTENT_SCHEMA,
@@ -89,9 +90,13 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
         "dispatch_status and check_dispatch to recover and poll known runs. "
         "Multiple dispatches can be issued in one turn for parallel execution. "
         "For synchronous multi-turn conversations with session persistence, "
-        "use dispatch_chat instead. Before passing model=, call "
-        "list_profile_models(profile=<target>) and copy one string from "
-        "pass_as_model; guessed or provider-prefixed slugs fail closed."
+        "use dispatch_chat instead. Before passing model= or provider=, call "
+        "list_profile_models(profile=<target>) to inspect the target's "
+        "model_routes aliases (pass_as_model) and authenticated providers "
+        "(configured_providers / available_routes). Pass either an exact "
+        "pass_as_model alias, or an explicit provider= + model= pair "
+        "(including unregistered or OpenRouter slugs) for an authenticated "
+        "target provider; bare unaliased model names fail closed."
     ),
     "parameters": {
         "type": "object",
@@ -186,12 +191,15 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Exact alias copied from list_profile_models("
-                    "profile=<this profile>).pass_as_model. Call that tool "
-                    "first when overriding the target default. Do not invent "
-                    "slugs, do not add a provider prefix, and do not pass "
-                    "advertised_primary.model. Omit this field to use the "
-                    "target's default runtime."
+                    "Optional target model_routes alias from "
+                    "list_profile_models(profile=<this profile>).pass_as_model, "
+                    "OR an upstream/unregistered model ID paired with provider= "
+                    "(e.g. provider='openrouter', "
+                    "model='anthropic/claude-sonnet-4.6'). Call "
+                    "list_profile_models(profile=<this profile>) first. Do not "
+                    "pass advertised_primary.model, and do not pass a bare "
+                    "unaliased model without provider=. Omit this field to use "
+                    "the target's default runtime."
                 ),
             },
             "provider": {
@@ -199,10 +207,13 @@ DISPATCH_AGENT_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Optional target provider slug copied from "
                     "list_profile_models(profile=<this profile>) "
-                    "dispatchable_models[].provider. Required to pin a "
-                    "subscription when the same model exists on more than one "
-                    "provider and the alias is unpinned. If the alias already "
-                    "pins a provider, this must match it."
+                    "configured_providers[].provider or "
+                    "dispatchable_models[].provider (e.g. 'anthropic', "
+                    "'openrouter', 'openai-codex'). Required when calling a "
+                    "catalog or unregistered model directly without a "
+                    "model_routes alias, or to disambiguate a model available "
+                    "on more than one provider. If an alias already pins a "
+                    "provider, this must match it."
                 ),
             },
             "reasoning_effort": {
@@ -328,8 +339,10 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
         "arrives, while a streaming /v1/chat/completions connection observes "
         "assistant and tool activity and preserves history through the target "
         "session ID. Subsequent calls to the same profile continue that "
-        "conversation. Use model to select an exact target model_routes alias; "
-        "omit it to use the target default. Optional instructions apply only "
+        "conversation. Use model to select an exact target model_routes alias, "
+        "or pass both provider and model to target an authenticated provider "
+        "directly (including unregistered or OpenRouter models); omit both to "
+        "use the target default. Optional instructions apply only "
         "to this turn. Use this when the next decision depends on the target's "
         "reply. For independent or parallel work, use dispatch_agent instead."
     ),
@@ -372,11 +385,15 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Exact alias copied from list_profile_models("
-                    "profile=<this profile>).pass_as_model. Call that tool "
-                    "first when overriding the target default. Do not invent "
-                    "slugs or add a provider prefix. Omit to use the target "
-                    "profile's default runtime."
+                    "Optional target model_routes alias from "
+                    "list_profile_models(profile=<this profile>).pass_as_model, "
+                    "OR an upstream/unregistered model ID paired with provider= "
+                    "(e.g. provider='openrouter', "
+                    "model='anthropic/claude-sonnet-4.6'). Call "
+                    "list_profile_models(profile=<this profile>) first. Do not "
+                    "pass advertised_primary.model or a bare unaliased model "
+                    "without provider=. Omit to use the target profile's "
+                    "default runtime."
                 ),
             },
             "provider": {
@@ -384,7 +401,10 @@ DISPATCH_CHAT_SCHEMA: Dict[str, Any] = {
                 "description": (
                     "Optional target provider slug copied from "
                     "list_profile_models(profile=<this profile>) "
-                    "dispatchable_models[].provider. Pin this when the same "
+                    "configured_providers[].provider or "
+                    "dispatchable_models[].provider. Required when targeting a "
+                    "catalog or unregistered model directly without a "
+                    "model_routes alias, and to pin the exact route when a "
                     "model exists on more than one provider."
                 ),
             },
@@ -517,10 +537,10 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
         "schemas, or subagent overhead. Send text or multimodal (image + text) "
         "messages and get text back. "
         "Call list_profile_models without a profile first to see this calling "
-        "profile's configured routes, then copy one exact provider/model pair. "
-        "Omit both routing fields to use the host's active configured route. "
-        "Hermes's public plugin LLM service owns authentication, transport, "
-        "routing policy, and provider execution.\n\n"
+        "profile's configured providers and routes, then pass an explicit "
+        "provider/model pair. Omit both routing fields to use the host's active "
+        "configured route. Hermes's public plugin LLM service owns "
+        "authentication, transport, routing policy, and provider execution.\n\n"
         "Use this for: classification, translation, summarization, scoring, "
         "extraction, vision/OCR on scanned pages or screenshots, or any task "
         "where you just need the model's response without tool-calling or "
@@ -530,9 +550,11 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
         "'images' array (attached to the last user message) or as OpenAI-style "
         "content parts on user messages. Limits: max 10 images, 10 MiB each, "
         "20 MiB total raw bytes.\n\n"
-        "An explicit provider/model pair must exactly match one configured "
-        "available_routes entry. The host may reject overrides under its "
-        "plugin trust policy.\n\n"
+        "An explicit provider/model pair must use a configured provider from "
+        "list_profile_models(); both listed catalog models and "
+        "unregistered/new/custom models on that provider (such as OpenRouter "
+        "org/model slugs) are passed through, subject to the host's plugin "
+        "trust policy.\n\n"
         "For a full agent with tools and terminal access, use "
         "delegate_subagent or dispatch_agent instead."
     ),
@@ -575,24 +597,27 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional exact model ID from an available_routes entry. "
-                    "For an override, provider and model must be supplied together "
-                    "and match the same advertised entry. Examples: "
-                    "'gpt-5.6-sol' on 'openai-codex', "
-                    "'claude-sonnet-4-6' on 'anthropic'. Omit both routing "
-                    "fields to use the host's active route."
+                    "Optional model ID on a configured provider (from "
+                    "available_routes, or an unregistered/new/custom model ID "
+                    "such as an OpenRouter org/model slug served by that "
+                    "provider). For an override, provider and model must be "
+                    "supplied together. Examples: 'gpt-5.6-sol' on "
+                    "'openai-codex', 'anthropic/claude-sonnet-4.6' on "
+                    "'openrouter'. Omit both routing fields to use the host's "
+                    "active route."
                 ),
             },
             "provider": {
                 "type": "string",
                 "description": (
-                    "Optional provider override (e.g. 'openrouter', "
-                    "'openai-codex', 'anthropic', 'ollama-cloud'). Use the "
-                    "exact provider ID: Hermes's ambiguous 'openai' alias "
-                    "resolves to OpenRouter and is refused here. For an override, "
-                    "provider and model must be supplied together and match one "
-                    "available_routes entry. Omit both routing fields to use "
-                    "the host's active route."
+                    "Optional configured provider slug from "
+                    "list_profile_models() configured_providers[].provider "
+                    "(e.g. 'openrouter', 'openai-codex', 'anthropic', "
+                    "'ollama-cloud'). Use the exact provider ID: Hermes's "
+                    "ambiguous 'openai' alias resolves to OpenRouter and is "
+                    "refused here. For an override, provider and model must be "
+                    "supplied together. Omit both routing fields to use the "
+                    "host's active route."
                 ),
             },
             "temperature": {
@@ -650,18 +675,22 @@ PING_PROFILE_SCHEMA: Dict[str, Any] = {
 LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
     "name": "list_profile_models",
     "description": (
-        "Discover exact fail-closed model routes before inference or dispatch. "
-        "Omit profile to list this calling profile's llm_call provider/model "
-        "pairs. Supply profile to list the target's dispatch aliases — the "
-        "only strings allowed in dispatch_agent/dispatch_chat model=. Those "
-        "aliases come from the target's platforms.api_server.extra.model_routes, "
-        "not from origin hermes_herald.profiles; a short list means add aliases "
-        "on the target and restart its gateway. Copy one value from "
-        "pass_as_model; advertised_primary.model is the default when you omit "
-        "model, not a valid override. Optional query filters aliases by "
-        "substring when the same model exists under several names. Ambient "
-        "credentials and unconfigured fallback providers are excluded from "
-        "local results."
+        "Discover configured providers, exact model routes, and multi-route "
+        "ambiguities before inference or dispatch. Omit profile to list this "
+        "calling profile's configured_providers, available_routes, "
+        "multi_route_models (models reachable via more than one provider such "
+        "as direct vs OpenRouter), and any enabled llm_direct endpoints for "
+        "llm_call and delegate_subagent. Supply profile to inspect a remote "
+        "target's model_routes aliases (pass_as_model from /v1/models) AND "
+        "authenticated provider catalog (configured_providers, "
+        "available_routes, multi_route_models from /api/model/options when "
+        "supported). On remote targets, pass either an exact pass_as_model "
+        "alias into model= OR an explicit provider= + model= pair (including "
+        "unregistered or OpenRouter slugs) for an authenticated provider; "
+        "advertised_primary.model is only the default API identity. Optional "
+        "query filters aliases and provider routes by substring (matching "
+        "bare names across vendor prefixes and version dots/hyphens). Ambient "
+        "credentials and unconfigured fallback providers are excluded."
     ),
     "parameters": {
         "type": "object",
@@ -670,16 +699,17 @@ LIST_PROFILE_MODELS_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Optional target name from hermes_herald.profiles. Omit for "
-                    "the calling profile's exact local llm_call routes."
+                    "the calling profile's configured local providers and "
+                    "routes (for llm_call and delegate_subagent)."
                 ),
             },
             "query": {
                 "type": "string",
                 "description": (
-                    "Optional substring filter on alias or resolved_model "
-                    "(case-insensitive). Use when several aliases exist for "
-                    "similar models. Matches are listed separately; pass_as_model "
-                    "always contains the full exact-alias list."
+                    "Optional substring filter on provider, alias, model ID, or "
+                    "bare model family (case-insensitive, matching across "
+                    "vendor prefixes and 4.6/4-6 separators). Matches are "
+                    "listed separately while full lists remain intact."
                 ),
             },
         },
@@ -1472,16 +1502,28 @@ def _clear_pending_approval(run_id: str) -> None:
 
 
 def _annotate_run_status_model(status: dict, run_id: str) -> None:
-    """Label target run-status model metadata without treating it as proof.
+    """Label target run-status model metadata and surface authoritative runtime provenance.
 
-    Hermes currently stores the submitted ``body.model`` in run status. That
-    value is a request echo even when no route matched, so expose it under an
-    explicit name and attach locally verified route provenance when available.
+    Hermes stores the submitted ``body.model`` in top-level ``status["model"]``
+    (a request echo, not proof of execution) and newer servers also expose
+    ``status["runtime"]`` with the resolved ``provider``, ``model``, and
+    ``route_source`` built in ``_create_agent``.
     """
     reported_model = status.pop("model", None)
     if reported_model:
         status["api_reported_model"] = reported_model
         status["api_reported_model_is_runtime_evidence"] = False
+
+    runtime = status.get("runtime")
+    if isinstance(runtime, dict):
+        served_provider = str(runtime.get("provider") or "").strip()
+        served_model = str(runtime.get("model") or "").strip()
+        if served_provider or served_model:
+            status["served_runtime"] = dict(runtime)
+            if served_provider:
+                status["served_provider"] = served_provider
+            if served_model:
+                status["served_model"] = served_model
 
     with _state_lock:
         state = _load_state()
@@ -1705,15 +1747,67 @@ def _parse_optional_provider(raw) -> tuple[str, Optional[str]]:
     return provider, None
 
 
+def _resolve_dispatch_model_and_provider(
+    profile: str,
+    pcfg: dict,
+    model_override: Any,
+    requested_provider: str,
+    *,
+    refuse_suffix: str,
+) -> tuple[str, str, Optional[str]]:
+    """Resolve effective ``(requested_model, effective_requested_provider, error)``.
+
+    Profile-config defaults inherit symmetrically so neither field leaks across
+    an explicit override of the other:
+    - explicit ``model=`` never inherits ``pcfg["provider"]``;
+    - explicit ``provider=`` never inherits ``pcfg["model"]`` when
+      ``pcfg["provider"]`` is set to a different provider (case-insensitive),
+      while still inheriting ``pcfg["model"]`` when ``pcfg`` has no provider
+      (unpinned alias) or matches the explicit provider;
+    - omitting both inherits both configured defaults.
+    """
+    if model_override is not None and not isinstance(model_override, str):
+        return "", "", (
+            "'model' must be a string when provided in the tool call or "
+            f"hermes_herald profile config. {refuse_suffix}"
+        )
+    explicit_model = model_override.strip() if isinstance(model_override, str) else ""
+
+    configured_provider = ""
+    if not explicit_model:
+        configured_provider, cfg_provider_error = _parse_optional_provider(
+            pcfg.get("provider"),
+        )
+        if cfg_provider_error:
+            return "", "", (
+                f"Invalid hermes_herald profile provider config for {profile}: "
+                f"{cfg_provider_error} {refuse_suffix}"
+            )
+
+    if explicit_model:
+        return explicit_model, requested_provider, None
+
+    effective_provider = requested_provider or configured_provider
+    if (
+        requested_provider
+        and configured_provider
+        and requested_provider.lower() != configured_provider.lower()
+    ):
+        return "", effective_provider, None
+
+    configured_model = pcfg.get("model")
+    if configured_model is not None and not isinstance(configured_model, str):
+        return "", "", (
+            "'model' must be a string when provided in the tool call or "
+            f"hermes_herald profile config. {refuse_suffix}"
+        )
+    requested_model = configured_model.strip() if isinstance(configured_model, str) else ""
+    return requested_model, effective_provider, None
+
+
 def _entry_route_provider(entry: dict) -> str:
     """Credential-free provider pin from a /v1/models row, if advertised."""
-    for key in ("provider", "owned_by"):
-        raw = entry.get(key)
-        if isinstance(raw, str):
-            value = raw.strip()
-            if value and value.lower() not in {"hermes", "hermes-agent"}:
-                return value
-    return ""
+    return model_catalog.entry_route_provider(entry)
 
 
 def _verify_run_model_route(
@@ -1722,114 +1816,13 @@ def _verify_run_model_route(
     requested_model: str,
     requested_provider: str = "",
 ) -> tuple[dict, Optional[str]]:
-    """Verify an explicit /v1/runs model as a target model_routes alias.
-
-    Hermes treats the request ``model`` field as an exact lookup key in the
-    target API server's ``platforms.api_server.extra.model_routes`` mapping.
-    Unknown values are accepted by the API but run on the target default, so
-    this plugin must discover and verify the route before starting a task.
-
-    ``GET /v1/models`` identifies route aliases with a non-empty ``parent``
-    and exposes their configured target model in ``root``.  The endpoint's
-    primary entry has ``parent: null`` and is only an API identity/default; it
-    is not evidence that an explicit request caused model routing.
-    """
-    models_url = f"{pcfg['url']}/v1/models"
-    try:
-        response = _get_json(models_url, pcfg["api_key"], timeout=10.0)
-    except RuntimeError as e:
-        msg = str(e)
-        if "401" in msg or "403" in msg:
-            return {}, (
-                f"Cannot verify model route '{requested_model}' for {profile}: "
-                f"authentication to {models_url} failed. Check the profile "
-                f"api_key. No task was started. ({msg})"
-            )
-        if "Cannot reach" in msg:
-            return {}, (
-                f"Cannot verify model route '{requested_model}' for {profile}: "
-                f"the target API server is unreachable. No task was started. "
-                f"({msg})"
-            )
-        return {}, (
-            f"Cannot verify model route '{requested_model}' for {profile}. "
-            f"No task was started. ({msg})"
-        )
-    except Exception as e:
-        return {}, (
-            f"Cannot verify model route '{requested_model}' for {profile}: "
-            f"invalid response from {models_url}. No task was started. "
-            f"({type(e).__name__})"
-        )
-
-    entries = response.get("data") if isinstance(response, dict) else None
-    if not isinstance(entries, list):
-        return {}, (
-            f"Cannot verify model route '{requested_model}' for {profile}: "
-            f"the target does not expose a compatible authenticated "
-            f"/v1/models route listing. Upgrade/configure the target API "
-            f"server or omit model to use its default. No task was started."
-        )
-
-    route_entries = [
-        entry for entry in entries
-        if isinstance(entry, dict)
-        and isinstance(entry.get("id"), str)
-        and isinstance(entry.get("parent"), str)
-        and entry["parent"].strip()
-    ]
-    matched = next(
-        (entry for entry in route_entries if entry["id"] == requested_model),
-        None,
-    )
-    if matched is not None:
-        resolved_model = matched.get("root")
-        if isinstance(resolved_model, str) and resolved_model.strip():
-            pinned_provider = _entry_route_provider(matched)
-            if (
-                requested_provider
-                and pinned_provider
-                and requested_provider != pinned_provider
-            ):
-                return {}, (
-                    f"Model route '{requested_model}' on {profile} is pinned to "
-                    f"provider '{pinned_provider}'. Remove provider= or pass "
-                    f"provider='{pinned_provider}'. No task was started."
-                )
-            return {
-                "requested_model": requested_model,
-                "resolved_model": resolved_model.strip(),
-                "resolution_source": "target_model_routes",
-                "provider": requested_provider or pinned_provider,
-                "provider_pinned": bool(pinned_provider),
-            }, None
-        return {}, (
-            f"Cannot verify model route '{requested_model}' for {profile}: "
-            f"the target advertised the alias without a resolved root model. "
-            f"No task was started."
-        )
-
-    advertised_primary = any(
-        isinstance(entry, dict)
-        and entry.get("id") == requested_model
-        and not entry.get("parent")
-        for entry in entries
-    )
-    available = sorted(entry["id"] for entry in route_entries)
-    available_text = ", ".join(available) if available else "(none)"
-    if advertised_primary:
-        reason = (
-            "it is only the target's advertised default/API identity, not a "
-            "configured model_routes alias"
-        )
-    else:
-        reason = "it is not an exact configured model_routes alias"
-    return {}, (
-        f"Model override '{requested_model}' is not supported for {profile}: "
-        f"{reason}. pass_as_model: {available_text}. Call "
-        f"list_profile_models(profile={profile!r}) and copy one exact alias "
-        f"from pass_as_model into model=. Do not add a provider prefix. "
-        f"Omit model to use the target default. No task was started."
+    """Verify a remote dispatch model/provider request via ``model_catalog``."""
+    return model_catalog.verify_remote_model_route(
+        profile,
+        pcfg,
+        requested_model,
+        requested_provider,
+        get_json=_get_json,
     )
 
 
@@ -2007,30 +2000,33 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
     body: Dict[str, Any] = {"input": transmitted_message}
     if instructions:
         body["instructions"] = instructions
-    configured_model = pcfg.get("model")
-    requested_model = model_override or configured_model or ""
-    if requested_model and not isinstance(requested_model, str):
-        return _tool_error(
-            "'model' must be a string when provided in the tool call or "
-            "hermes_herald profile config. No task was started."
+    requested_model, effective_requested_provider, model_cfg_error = (
+        _resolve_dispatch_model_and_provider(
+            profile,
+            pcfg,
+            model_override,
+            requested_provider,
+            refuse_suffix="No task was started.",
         )
-    requested_model = requested_model.strip()
-    route_resolution: Dict[str, str] = {}
-    if requested_model:
+    )
+    if model_cfg_error:
+        return _tool_error(model_cfg_error)
+    route_resolution: Dict[str, Any] = {}
+    if requested_model or effective_requested_provider:
         route_resolution, route_error = _verify_run_model_route(
-            profile, pcfg, requested_model, requested_provider,
+            profile, pcfg, requested_model, effective_requested_provider,
         )
         if route_error:
             return _tool_error(route_error)
-        # Send the exact verified alias. Sending the resolved root would miss
-        # Hermes' exact alias lookup and silently select the target default.
-        body["model"] = requested_model
-        transmit_provider = requested_provider or route_resolution.get("provider") or ""
+        # Send the exact verified alias or direct provider model ID.
+        transmit_model = str(route_resolution.get("requested_model") or requested_model or "")
+        if transmit_model:
+            body["model"] = transmit_model
+        transmit_provider = str(
+            route_resolution.get("provider") or effective_requested_provider or ""
+        )
         if transmit_provider:
             body["provider"] = transmit_provider
-    elif requested_provider:
-        # Pin provider for the target default model when no alias is sent.
-        body["provider"] = requested_provider
     reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
     if reasoning_model_options is not None:
         body["model_options"] = reasoning_model_options
@@ -2063,7 +2059,11 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
     # Persist bounded live-recovery state and the durable audit edge. Capture
     # the origin before starting a background listener because ContextVars do
     # not necessarily survive arbitrary callback threads.
-    resolved_model = route_resolution.get("resolved_model", "")
+    resolved_model = str(route_resolution.get("resolved_model") or "")
+    model_resolution = str(route_resolution.get("resolution_source") or "")
+    resolved_provider = str(
+        route_resolution.get("provider") or effective_requested_provider or ""
+    )
     reasoning_label = ""
     if reasoning_effort is not None:
         reasoning_label = (
@@ -2083,7 +2083,7 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
             model=resolved_model,
             requested_model=requested_model,
             resolved_model=resolved_model,
-            model_resolution=route_resolution.get("resolution_source", ""),
+            model_resolution=model_resolution,
             reasoning=reasoning_label,
             edge_id=edge_id,
             trace_id=trace_id,
@@ -2113,7 +2113,7 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
             origin_session_id=origin_session_id,
             requested_model=requested_model,
             resolved_model=resolved_model,
-            model_resolution=route_resolution.get("resolution_source", ""),
+            model_resolution=model_resolution,
             reasoning=reasoning_label,
         )
     except Exception as exc:
@@ -2142,6 +2142,7 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
                 "requested_model": requested_model,
                 "resolved_model": resolved_model,
                 "parent_agent": parent_agent,
+                "model_resolution": model_resolution,
             }
             if caller_session_id:
                 listener_kwargs["session_id"] = caller_session_id
@@ -2182,8 +2183,14 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
         response.update({
             "requested_model": requested_model,
             "resolved_model": resolved_model,
-            "model_resolution": "target_model_routes",
+            "model_resolution": model_resolution or "target_model_routes",
         })
+    elif resolved_provider and model_resolution:
+        response["model_resolution"] = model_resolution
+    if resolved_provider:
+        response["provider"] = resolved_provider
+    if route_resolution.get("unregistered_model"):
+        response["unregistered_model"] = True
     if recovery_warning:
         response["warning"] = recovery_warning
     return json.dumps(response)
@@ -2453,16 +2460,25 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             f"Dispatch ledger is unavailable; no message was sent. ({exc})"
         )
 
-    configured_model = pcfg.get("model")
-    requested_model = model_override or configured_model or ""
-    model_provenance = {
+    requested_model, effective_requested_provider, model_cfg_error = (
+        _resolve_dispatch_model_and_provider(
+            profile,
+            pcfg,
+            model_override,
+            requested_provider,
+            refuse_suffix="No message was sent.",
+        )
+    )
+    if model_cfg_error:
+        return _tool_error(model_cfg_error)
+    model_provenance: Dict[str, Any] = {
         "requested_model": "",
         "resolved_model": "",
         "resolution_source": "target_default",
     }
-    if requested_model:
+    if requested_model or effective_requested_provider:
         model_provenance, model_error = _verify_run_model_route(
-            profile, pcfg, requested_model, requested_provider,
+            profile, pcfg, requested_model, effective_requested_provider,
         )
         if model_error:
             return _tool_error(model_error)
@@ -2522,13 +2538,16 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
     if instructions:
         chat_messages.append({"role": "system", "content": instructions})
     chat_messages.append({"role": "user", "content": message})
+    transmit_model = str(model_provenance.get("requested_model") or requested_model or "")
     chat_body: Dict[str, Any] = {
-        "model": requested_model or "hermes-agent",
+        "model": transmit_model or "hermes-agent",
         "messages": chat_messages,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    transmit_provider = requested_provider or model_provenance.get("provider") or ""
+    transmit_provider = str(
+        model_provenance.get("provider") or effective_requested_provider or ""
+    )
     if transmit_provider:
         chat_body["provider"] = transmit_provider
     reasoning_model_options = _remote_reasoning_model_options(reasoning_effort)
@@ -2607,6 +2626,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             else str(reasoning_effort.get("effort", ""))
         )
 
+    prov_requested = str(model_provenance.get("requested_model") or "")
+    prov_resolved = str(model_provenance.get("resolved_model") or "")
+    prov_source = str(model_provenance.get("resolution_source") or "target_default")
     # Record bounded recovery state plus the durable full-text call ledger.
     chat_record_id = f"chat-{uuid.uuid4().hex}"
     edge_id = uuid.uuid4().hex
@@ -2620,10 +2642,10 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
                 "dispatched_at": _utc_now_iso(),
                 "message_preview": message[:120],
                 "session_id": result_session_id,
-                "model": result.get("model") or model_provenance["resolved_model"],
-                "requested_model": model_provenance["requested_model"],
-                "resolved_model": model_provenance["resolved_model"],
-                "model_resolution": model_provenance["resolution_source"],
+                "model": result.get("model") or prov_resolved,
+                "requested_model": prov_requested,
+                "resolved_model": prov_resolved,
+                "model_resolution": prov_source,
                 "reasoning": reasoning_label,
                 "status": "completed",
                 "completed_at": _utc_now_iso(),
@@ -2658,9 +2680,9 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
             output_preview=reply,
             duration_seconds=time.monotonic() - chat_started,
             usage=usage,
-            requested_model=model_provenance["requested_model"],
-            resolved_model=model_provenance["resolved_model"],
-            model_resolution=model_provenance["resolution_source"],
+            requested_model=prov_requested,
+            resolved_model=prov_resolved,
+            model_resolution=prov_source,
             reasoning=reasoning_label,
         )
     except Exception as exc:
@@ -2681,10 +2703,14 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         "edge_id": edge_id,
         "reply": reply,
         "usage": usage,
-        "requested_model": model_provenance["requested_model"],
-        "resolved_model": model_provenance["resolved_model"],
-        "model_resolution": model_provenance["resolution_source"],
+        "requested_model": prov_requested,
+        "resolved_model": prov_resolved,
+        "model_resolution": prov_source,
     }
+    if transmit_provider:
+        response["provider"] = transmit_provider
+    if model_provenance.get("unregistered_model"):
+        response["unregistered_model"] = True
     if recovery_warning:
         response["warning"] = recovery_warning
     return json.dumps(response)
@@ -3387,76 +3413,18 @@ def _configured_local_model_inventory(
     current_provider: str = "",
     current_model: str = "",
     current_base_url: str = "",
+    probe_custom_providers: bool = True,
 ) -> dict:
     """Return provider/model slugs explicitly configured for this profile.
 
-    The host inventory's ``explicit_only`` contract excludes ambient/auto-
-    discovered credentials while retaining the active provider and user-
-    configured providers. Discovery reports the host's slugs; Hermes owns
-    route resolution and credentials when a selected pair is executed.
+    Kept as a module-level seam delegating to ``model_catalog.load_local_model_inventory``.
     """
-    from hermes_cli.inventory import ConfigContext, build_models_payload, load_picker_context
-
-    configured = load_picker_context()
-    live_provider = (current_provider or configured.current_provider or "").strip()
-    live_model = (current_model or configured.current_model or "").strip()
-    live_base_url = (current_base_url or configured.current_base_url or "").strip()
-    user_providers = getattr(configured, "user_providers", {}) or {}
-    custom_providers = getattr(configured, "custom_providers", []) or []
-
-
-    context = ConfigContext(
-        current_provider=live_provider,
-        # Do not force the active model into the catalog. It must be genuinely
-        # advertised, not accepted because it is already selected.
-        current_model="",
-        current_base_url=live_base_url,
-        user_providers=user_providers,
-        custom_providers=custom_providers,
-        excluded_providers=getattr(configured, "excluded_providers", []) or [],
+    return model_catalog.load_local_model_inventory(
+        current_provider=current_provider,
+        current_model=current_model,
+        current_base_url=current_base_url,
+        probe_custom_providers=probe_custom_providers,
     )
-    payload = build_models_payload(
-        context,
-        explicit_only=True,
-        include_unconfigured=False,
-        for_picker=False,
-        probe_custom_providers=True,
-        probe_current_custom_provider=True,
-    )
-    providers = []
-    for row in payload.get("providers", []):
-        if not isinstance(row, dict):
-            continue
-        provider = str(row.get("slug") or "").strip()
-        if not provider:
-            continue
-        advertised_models = sorted({
-            str(model).strip()
-            for model in (row.get("models") or [])
-            if isinstance(model, str) and model.strip()
-        })
-        # MoA is a virtual orchestration facade rather than a configured model
-        # endpoint, so it is not a provider/model pair an agent can copy into
-        # llm_call.
-        if provider.lower() == "moa":
-            continue
-        if advertised_models:
-            providers.append({"provider": provider, "models": advertised_models})
-    providers.sort(key=lambda row: row["provider"])
-
-    configured_default = {"provider": live_provider, "model": live_model}
-    default_is_executable = any(
-        row["provider"].lower() == live_provider.lower()
-        and live_model in row["models"]
-        for row in providers
-    )
-
-    return {
-        "configured_default": configured_default if default_is_executable else None,
-        "providers": providers,
-        "user_providers": user_providers,
-        "custom_providers": custom_providers,
-    }
 
 
 def handle_llm_call(args: dict, **kwargs) -> str:
@@ -3532,30 +3500,33 @@ def handle_llm_call(args: dict, **kwargs) -> str:
 
     if bool(provider_override) != bool(model_override):
         return _tool_error(
-            "Pass both 'provider' and 'model' from one list_profile_models "
-            "available_routes entry, or omit both to use configured_default."
+            "Pass both 'provider' and 'model' (using a configured provider from "
+            "list_profile_models), or omit both to use configured_default."
         )
 
+    route_check: Dict[str, Any] = {}
     if provider_override and model_override:
         try:
-            inventory = _configured_local_model_inventory()
+            parent = _resolve_parent_agent(kwargs.get("parent_agent"))
+            inventory = _configured_local_model_inventory(
+                current_provider=str(getattr(parent, "provider", "") or "").strip(),
+                current_model=str(getattr(parent, "model", "") or "").strip(),
+                current_base_url=str(getattr(parent, "base_url", "") or "").strip(),
+                probe_custom_providers=False,
+            )
         except Exception as error:
             return _tool_error(
                 f"Cannot verify configured model routes: {type(error).__name__}: {error}"
             )
-        advertised = {
-            (str(row.get("provider") or ""), str(model))
-            for row in inventory.get("providers", [])
-            if isinstance(row, dict)
-            for model in row.get("models", [])
-            if isinstance(model, str)
-        }
-        if (provider_override, model_override) not in advertised:
-            return _tool_error(
-                f"Route provider='{provider_override}', model='{model_override}' is "
-                "not configured for this profile. Call list_profile_models without "
-                "a profile and copy one exact available_routes pair."
-            )
+        route_check, route_error = model_catalog.verify_local_llm_route(
+            inventory,
+            provider_override,
+            model_override,
+        )
+        if route_error:
+            return _tool_error(route_error)
+        provider_override = route_check["provider"]
+        model_override = route_check["model"]
 
     host_llm = kwargs.get("_llm")
     if host_llm is None or not callable(getattr(host_llm, "complete", None)):
@@ -3611,14 +3582,17 @@ def handle_llm_call(args: dict, **kwargs) -> str:
         "cost_usd": getattr(host_usage, "cost_usd", None),
     }
 
-    return json.dumps({
+    response_payload: Dict[str, Any] = {
         "text": text,
         "provider": str(getattr(result, "provider", "") or ""),
         "requested_provider": provider_override or "",
         "requested_model": model_override or "",
         "model": str(getattr(result, "model", "") or ""),
         "usage": usage,
-    })
+    }
+    if route_check.get("unregistered_model"):
+        response_payload["unregistered_model"] = True
+    return json.dumps(response_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -3903,7 +3877,7 @@ def handle_ping_profile(args: dict, **kwargs) -> str:
 
 
 def handle_list_profile_models(args: dict, **kwargs) -> str:
-    """Return exact local llm_call routes or remote dispatch aliases."""
+    """Return local configured routes or remote dispatch aliases and provider catalog."""
     profile = args.get("profile", "").strip()
     query = args.get("query", "")
     query = query.strip() if isinstance(query, str) else ""
@@ -3921,101 +3895,111 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
                 f"Cannot list local llm_call routes: {type(e).__name__}: {e}"
             )
 
+        providers = [
+            row for row in (inventory.get("providers") or [])
+            if isinstance(row, dict)
+        ]
         routes = sorted(
             (
                 {"provider": row["provider"], "model": model}
-                for row in inventory["providers"]
-                for model in row["models"]
+                for row in providers
+                for model in (row.get("models") or ())
             ),
             key=lambda route: (route["provider"], route["model"]),
         )
+        multi_route = model_catalog.build_multi_route_models(providers)
+        direct_endpoints = model_catalog.summarize_llm_direct_endpoints()
         matches = [
             route for route in routes
-            if not needle
-            or needle in route["provider"].lower()
-            or needle in route["model"].lower()
+            if model_catalog.query_matches_model(
+                needle,
+                provider=route["provider"],
+                model=route["model"],
+            )
         ]
-        payload = {
+        provider_matches = [
+            row for row in providers
+            if model_catalog.query_matches_model(
+                needle,
+                provider=str(row.get("provider") or ""),
+            )
+            or any(
+                model_catalog.query_matches_model(
+                    needle,
+                    provider=str(row.get("provider") or ""),
+                    model=model,
+                )
+                for model in (row.get("models") or ())
+            )
+        ]
+        configured_default = inventory.get("configured_default")
+        payload: Dict[str, Any] = {
             "scope": "local",
-            "configured_default": inventory["configured_default"],
+            "configured_default": configured_default,
+            "configured_default_in_catalog": bool(
+                inventory.get(
+                    "configured_default_in_catalog",
+                    configured_default is not None,
+                )
+            ),
+            "configured_providers": providers,
             "available_routes": routes,
             "route_count": len(routes),
+            "multi_route_models": multi_route,
             "contract": (
-                "Prefer configured_default when it is present. Only when the task explicitly needs "
-                "an override, pass one exact available_routes provider/model pair "
-                "to llm_call. Unlisted pairs are rejected before the host call; "
+                "Prefer configured_default when it is present. For llm_call or "
+                "delegate_subagent overrides, always pass BOTH provider= and model= "
+                "using a configured provider from configured_providers (copying an "
+                "available_routes pair, or passing an unregistered/new/custom model ID "
+                "such as an OpenRouter org/model slug served by that configured provider). "
+                "Unconfigured and virtual providers fail closed before the host call; "
                 "Hermes trust and provider-routing policy remain authoritative. "
-                "When the same model appears on several providers, copy the "
-                "exact pair — do not pass a bare model name."
+                "When the same model appears on several providers (see multi_route_models), "
+                "explicitly pin provider= — do not pass a bare model name."
             ),
         }
+        if direct_endpoints:
+            payload["llm_direct_endpoints"] = direct_endpoints
         if query:
             payload["query"] = query
             payload["matches"] = matches
             payload["match_count"] = len(matches)
+            payload["provider_matches"] = provider_matches
         return json.dumps(payload)
 
     pcfg, err = _resolve_profile(profile)
     if err:
         return _tool_error(err)
 
-    models_url = f"{pcfg['url']}/v1/models"
-    try:
-        response = _get_json(models_url, pcfg["api_key"], timeout=10.0)
-    except RuntimeError as e:
-        return _tool_error(
-            f"Cannot list dispatchable models for {profile}: {e}"
-        )
-    except Exception as e:
-        return _tool_error(
-            f"Cannot list dispatchable models for {profile}: "
-            f"invalid response from {models_url} ({type(e).__name__})"
-        )
-
-    entries = response.get("data") if isinstance(response, dict) else None
-    if not isinstance(entries, list):
-        return _tool_error(
-            f"Cannot list dispatchable models for {profile}: the target does "
-            f"not expose a compatible authenticated /v1/models route listing."
-        )
-
-    primary = next(
-        (
-            entry for entry in entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("id"), str)
-            and not entry.get("parent")
-        ),
-        None,
+    catalog, catalog_err = model_catalog.fetch_remote_model_catalog(
+        profile, pcfg, _get_json,
     )
-    dispatchable = sorted(
-        (
-            {
-                "alias": entry["id"].strip(),
-                "pass_as": entry["id"].strip(),
-                "resolved_model": entry["root"].strip(),
-                "provider": _entry_route_provider(entry),
-                "provider_pinned": bool(_entry_route_provider(entry)),
-            }
-            for entry in entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("id"), str)
-            and entry["id"].strip()
-            and isinstance(entry.get("root"), str)
-            and entry["root"].strip()
-            and isinstance(entry.get("parent"), str)
-            and entry["parent"].strip()
-        ),
-        key=lambda item: item["alias"],
-    )
-    default_model = primary["id"].strip() if primary else ""
+    if catalog_err:
+        return _tool_error(catalog_err)
+
+    default_model = catalog["primary_id"]
+    dispatchable = catalog["dispatchable"]
     pass_as_model = [item["pass_as"] for item in dispatchable]
+    available_routes = catalog["available_routes"]
+    configured_providers = catalog["configured_providers"]
+    multi_route = catalog["multi_route_models"]
+
     matches = [
         item for item in dispatchable
-        if not needle
-        or needle in item["alias"].lower()
-        or needle in item["resolved_model"].lower()
-        or needle in (item.get("provider") or "").lower()
+        if model_catalog.query_matches_model(
+            needle,
+            provider=item.get("provider") or "",
+            model=item["resolved_model"],
+            alias=item["alias"],
+        )
+    ]
+    route_matches = [
+        route for route in available_routes
+        if model_catalog.query_matches_model(
+            needle,
+            provider=route["provider"],
+            model=route["model"],
+        )
     ]
     payload = {
         "profile": profile,
@@ -4027,15 +4011,25 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         "pass_as_model": pass_as_model,
         "dispatchable_models": dispatchable,
         "dispatchable_model_count": len(dispatchable),
+        "options_available": catalog["options_available"],
+        "target_default": catalog["target_default"],
+        "configured_providers": configured_providers,
+        "available_routes": available_routes,
+        "route_count": catalog["route_count"],
+        "multi_route_models": multi_route,
         "contract": (
-            "For dispatch_agent and dispatch_chat, copy pass_as into model= "
-            "and, when provider is non-empty, copy provider into provider=. "
-            "If provider is empty the alias is unpinned: pass provider= "
-            "explicitly or the target may pick among configured providers "
-            "(including ones without a subscription). Do not add a provider "
-            "prefix to model=, do not pass resolved_model, and do not pass "
-            "advertised_primary.model as an override. Omit model= to use the "
-            "target default."
+            "For dispatch_agent and dispatch_chat, you have two ways to override the "
+            "target default: (1) copy an exact model_routes alias from pass_as_model "
+            "into model= (and copy its provider into provider= when pinned; if provider "
+            "is empty the alias is unpinned so pass provider= explicitly to pin a route), "
+            "OR (2) when options_available is true, pass BOTH provider= (from "
+            "configured_providers[].provider) and model= (from available_routes, or an "
+            "unregistered/new/custom model ID such as an OpenRouter org/model slug served "
+            "by that authenticated provider). When a model exists on more than one "
+            "provider (see multi_route_models), always pass provider= explicitly. Do not "
+            "pass a bare unaliased model without provider=, and do not pass "
+            "advertised_primary.model as an override. Omit model= and provider= to use "
+            "the target default."
         ),
     }
     if query:
@@ -4043,4 +4037,6 @@ def handle_list_profile_models(args: dict, **kwargs) -> str:
         payload["matches"] = matches
         payload["match_count"] = len(matches)
         payload["match_pass_as"] = [item["pass_as"] for item in matches]
+        payload["route_matches"] = route_matches
+        payload["route_match_count"] = len(route_matches)
     return json.dumps(payload)

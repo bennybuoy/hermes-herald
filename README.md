@@ -84,8 +84,8 @@ This is the most important distinction in Herald:
 
 | What you need | Use | Returns | Context and lifetime | Model choice |
 |---|---|---|---|---|
-| A conversation with a named specialist | `dispatch_chat` | Final reply; blocks the current agent turn | Reuses a persistent target session; streamed activity resets the stall timer | Target default or a verified target `model_routes` alias |
-| Independent work on another Hermes profile | `dispatch_agent` | `run_id` immediately | Fresh target session; monitored by SSE/polling or explicitly detached | Target default or a verified target `model_routes` alias |
+| A conversation with a named specialist | `dispatch_chat` | Final reply; blocks the current agent turn | Reuses a persistent target session; streamed activity resets the stall timer | Target default, verified `model_routes` alias, or explicit authenticated `provider` + `model` (including unregistered/OpenRouter models) |
+| Independent work on another Hermes profile | `dispatch_agent` | `run_id` immediately | Fresh target session; monitored by SSE/polling or explicitly detached | Target default, verified `model_routes` alias, or explicit authenticated `provider` + `model` (including unregistered/OpenRouter models) |
 | A local child agent with a different model | `delegate_subagent` | `task_id` immediately; automatic completion in supported `in_process` mode | Non-durable; explicit brief and core safe inheritance | Exact lifecycle provider/model pair; see policy migration below |
 | Classification, extraction, translation, scoring | `llm_call` | Text synchronously | No agent loop and no tools | Hermes provider/model routing |
 | Direct endpoint experiments | `llm_direct` | Text synchronously | No agent loop; separately opt-in | Pre-configured endpoint and allowed model; bypasses host LLM routing |
@@ -174,7 +174,7 @@ key. `/p/tutor/` authenticates with **tutor's `API_SERVER_KEY`**, never the defa
 listener's key. A named profile must be served by the multiplexer and must not
 enable its own `api_server`; unknown/unserved prefixes fail closed.
 
-Herald does **not** invent the target's model catalog. `list_profile_models(profile="tutor")` authenticates to the configured base URL plus `/v1/models`, which advertises the profile identity plus configured aliases — not every model its providers can run, and not anything in origin `hermes_herald.profiles`.
+Herald does **not** invent the target's model catalog. `list_profile_models(profile="tutor")` authenticates to `/v1/models` (profile identity plus configured `model_routes` aliases) and, when supported by the target, `/api/model/options?include_unconfigured=false` (the target profile's authenticated providers, advertised models, and `multi_route_models` where the same model exists on more than one provider, such as direct vs OpenRouter). Direct `provider` + `model` dispatch works against any authenticated provider — including unregistered/new/custom models — without needing a `model_routes` alias for every model.
 
 **Alias ownership depends on topology.** At the tested shared-gateway revision
 `1f2b9e08644c6de4a5b5c50d0e4676a19c5577c5`, `model_routes` belongs to the
@@ -229,7 +229,8 @@ hermes_herald:
       api_key: ${TUTOR_API_KEY}
       # Required explicit outbound grants. Missing/malformed means no calls.
       capabilities: [dispatch, chat]
-      # Optional exact target model_routes alias used by both dispatch tools.
+      # Optional default model_routes alias (or provider + model pair) for both dispatch tools.
+      # provider: openrouter
       # model: tutor-fast
 
   # Activity-stall timeout for dispatch_chat, not a flat wall-clock deadline.
@@ -656,10 +657,13 @@ Prefer `configured_default`. Do not select another provider merely because it
 advertises the same model; override the route only when the task or user
 explicitly calls for that endpoint.
 
-Herald checks that the exact pair appears in the configured inventory, then
-passes it unchanged to `ctx.llm.complete()`. Hermes applies the plugin trust
-allowlists and owns the actual provider resolution. Unknown pairs fail before
-the host call; policy or provider failures are returned noisily without a
+Herald verifies that the requested provider is configured on this profile, then
+passes the `(provider, model)` pair unchanged to `ctx.llm.complete()` — allowing
+both catalog models and unregistered/new/custom models (such as OpenRouter
+`org/model` slugs) on configured providers, with `unregistered_model: true`
+flagged in the response. Hermes applies the plugin trust allowlists and owns the
+actual provider resolution. Unconfigured or virtual providers fail before the
+host call; policy or provider failures are returned noisily without a
 Herald-side retry. Results expose the requested pair alongside the provider and
 model reported by the host facade.
 
@@ -709,7 +713,7 @@ llm_direct(
 | `cancel_dispatch` | Request cooperative target cancellation and suppress late local delivery |
 | `approve_dispatch` | Deny the exact visible protected-command notice through human confirmation |
 | `ping_profile` | Check target API reachability |
-| `list_profile_models` | Discover configured local `llm_call` routes, or exact remote `model_routes` aliases accepted by both dispatch modes |
+| `list_profile_models` | Discover local configured providers, routes, multi-route ambiguities, and `llm_direct` endpoints — or a remote target's `model_routes` aliases and authenticated provider catalog |
 
 ---
 
@@ -751,30 +755,21 @@ Self-routing requires both a matching route entry and `allow_self: true`. Async 
 
 ## Model routing
 
-Both `dispatch_agent` and `dispatch_chat` support target-controlled model choice.
+Both `dispatch_agent` and `dispatch_chat` support target-controlled model choice via two complementary paths:
 
-**Where aliases come from.** They live under `platforms.api_server.extra.model_routes` on the **API-listener owner**: the default gateway for shared `/p/<profile>` URLs at the tested revision, or the target itself for standalone gateways. The origin Herald route (`hermes_herald.profiles.<name>`) is only `url`, `api_key`, `capabilities`, and an optional default `model` that must already be advertised by that endpoint. Herald never writes `model_routes`.
+1. **Named `model_routes` aliases** (`platforms.api_server.extra.model_routes` on the API-listener owner, advertised by `GET /v1/models`). Copy one alias from `pass_as_model` into `model=` (and copy its `provider` when pinned). Works across all supported Hermes API server versions.
+2. **Direct authenticated `provider` + `model` routing** (discovered from `GET /api/model/options?include_unconfigured=false` on targets that expose it). Pass BOTH `provider=` (from `configured_providers[].provider`) and `model=` (either an `available_routes` model or an unregistered/new/custom model ID such as an OpenRouter `org/model` or `:nitro` slug).
 
-**What `/v1/models` lists.** The URL-selected profile identity (not a valid override) plus the listener's aliases. Provider catalogs, fallbacks, and ambient credentials are excluded on purpose. If a model is missing from `list_profile_models(profile=...)`, check the listener owner's aliases and restart that gateway when safe. Do not assume that a secondary profile's YAML supplies a separate alias catalog.
+**Multi-route disambiguation.** When the same model exists on more than one provider (for example `claude-sonnet-4-6` on `anthropic` and `anthropic/claude-sonnet-4.6` on `openrouter`), `list_profile_models` highlights it in `multi_route_models`. Always pass `provider=` explicitly alongside `model=`; bare unaliased `model=` requests fail closed with actionable disambiguation hints so `/v1/chat/completions` never silently falls back to the target default and `/v1/runs` never routes to the wrong subscription.
 
-When `model` is supplied explicitly or configured on the Herald profile route, Herald:
+When `model` or `provider` is supplied explicitly or configured on the Herald profile route (`hermes_herald.profiles.<name>`), Herald:
 
-1. authenticates to the target’s `GET /v1/models`;
-2. requires an exact `model_routes` alias with a resolved target model;
-3. refuses unknown, unverifiable, or primary-identity-only names before sending work;
-4. records requested and resolved model provenance in the ledger.
+1. authenticates to the target’s `GET /v1/models` (and `GET /api/model/options?include_unconfigured=false` when verifying direct provider routes or building disambiguation hints);
+2. accepts either an exact `model_routes` alias or an explicit `provider` + `model` pair on an authenticated target provider;
+3. refuses unauthenticated/virtual providers, `advertised_primary.model`, conflicting alias/provider pairs, and bare unaliased models before sending work;
+4. records requested/resolved model provenance in the ledger and surfaces authoritative target `runtime` (`served_provider`, `served_model`) from `check_dispatch` and SSE completion callbacks when reported by the target.
 
-Copy one alias from `pass_as_model` (or an entry's `pass_as`) into `model=`.
-Copy the advertised `provider` when present; an explicit provider must match a
-pinned alias. If the listing omits it, verify the listener's alias configuration
-with its operator rather than guessing a provider. An unpinned alias can let the
-target choose a route with no subscription. Both dispatch tools also accept
-per-call `reasoning_effort`; the target may clamp, ignore or drop that request
-under its own reasoning policy.
-
-Omit `model` to preserve the target’s normal default. Call `list_profile_models(profile=...)` before selecting an alias.
-
-This is intentionally stricter than calling the native API directly: a typo must not silently fall back to a different model.
+Both dispatch tools also accept per-call `reasoning_effort`; the target may clamp, ignore or drop that request under its own reasoning policy. Omit `model` and `provider` to preserve the target’s normal default. Call `list_profile_models(profile=...)` before overriding.
 
 ---
 

@@ -61,6 +61,7 @@ class DispatchIdentity:
         })
         route = _encode({
             "url": pcfg["url"], "model": pcfg.get("model"),
+            **({"provider": pcfg.get("provider")} if pcfg.get("provider") else {}),
             # The target scopes reservations to profile + bearer key. A rotated
             # credential must not silently enter a new server namespace.
             "credential_sha256": hashlib.sha256(pcfg["api_key"].encode()).hexdigest(),
