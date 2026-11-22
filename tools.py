@@ -46,6 +46,13 @@ from urllib.request import (
 from urllib.error import HTTPError, URLError
 
 from . import config as cfg
+from .multimodal import (
+    LLM_IMAGES_PARAM_SCHEMA,
+    LLM_MESSAGE_CONTENT_SCHEMA,
+    extract_text_from_choice_message,
+    normalize_llm_messages,
+    redact_data_urls,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -507,15 +514,22 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
     "name": "llm_call",
     "description": (
         "Make a bare LLM inference call without the full agent loop, tool "
-        "schemas, or subagent overhead. Send messages and get text back. "
+        "schemas, or subagent overhead. Send text or multimodal (image + text) "
+        "messages and get text back. "
         "Call list_profile_models without a profile first to see this calling "
         "profile's configured routes, then copy one exact provider/model pair. "
         "Omit both routing fields to use the host's active configured route. "
         "Hermes's public plugin LLM service owns authentication, transport, "
         "routing policy, and provider execution.\n\n"
         "Use this for: classification, translation, summarization, scoring, "
-        "extraction, or any task where you just need the model's response "
-        "without tool-calling or agentic context.\n\n"
+        "extraction, vision/OCR on scanned pages or screenshots, or any task "
+        "where you just need the model's response without tool-calling or "
+        "agentic context.\n\n"
+        "Images: pass local image file paths (PNG/JPEG/GIF/WebP), base64 "
+        "data:image/... URLs, or public https:// URLs either via the top-level "
+        "'images' array (attached to the last user message) or as OpenAI-style "
+        "content parts on user messages. Limits: max 10 images, 10 MiB each, "
+        "20 MiB total raw bytes.\n\n"
         "An explicit provider/model pair must exactly match one configured "
         "available_routes entry. The host may reject overrides under its "
         "plugin trust policy.\n\n"
@@ -536,21 +550,20 @@ LLM_CALL_SCHEMA: Dict[str, Any] = {
                             "enum": ["system", "user", "assistant"],
                             "description": "Message role.",
                         },
-                        "content": {
-                            "type": "string",
-                            "description": "Message content.",
-                        },
+                        "content": LLM_MESSAGE_CONTENT_SCHEMA,
                     },
                     "required": ["role", "content"],
                 },
                 "description": (
                     "Chat messages to send. Each is {role, content}. "
-                    "Use role='user' for your prompt, role='assistant' "
-                    "for prior turns, role='system' for instructions. "
+                    "Use role='user' for your prompt (string or multimodal "
+                    "parts array), role='assistant' for prior turns, "
+                    "role='system' for instructions. "
                     "If you pass a system message here, do NOT also "
                     "pass system_prompt — use one or the other."
                 ),
             },
+            "images": LLM_IMAGES_PARAM_SCHEMA,
             "system_prompt": {
                 "type": "string",
                 "description": (
@@ -679,11 +692,14 @@ LLM_DIRECT_SCHEMA: Dict[str, Any] = {
     "description": (
         "Call a pre-configured OpenAI-compatible endpoint directly with FULL "
         "parameter control — model, temperature, top_p, max_tokens, seed, stop "
-        "sequences, reasoning effort, and an extra_body passthrough for "
-        "vendor-specific fields. For LLM research and benchmarking where the "
-        "host-managed llm_call route is too constrained. Endpoints are named "
-        "in hermes_herald.llm_direct config (opt-in); credentials never ride "
-        "the tool call. Returns text, usage, and the provider-reported model."
+        "sequences, reasoning effort, multimodal image inputs, and an "
+        "extra_body passthrough for vendor-specific fields. For LLM research "
+        "and benchmarking where the host-managed llm_call route is too "
+        "constrained. Endpoints are named in hermes_herald.llm_direct config "
+        "(opt-in); credentials never ride the tool call. Supports local image "
+        "paths (PNG/JPEG/GIF/WebP), data:image/... URLs, and public https:// "
+        "URLs (max 10 images, 10 MiB each, 20 MiB total raw bytes). Returns "
+        "text, usage, and the provider-reported model."
     ),
     "parameters": {
         "type": "object",
@@ -705,12 +721,16 @@ LLM_DIRECT_SCHEMA: Dict[str, Any] = {
                             "type": "string",
                             "enum": ["system", "user", "assistant"],
                         },
-                        "content": {"type": "string"},
+                        "content": LLM_MESSAGE_CONTENT_SCHEMA,
                     },
                     "required": ["role", "content"],
                 },
-                "description": "Chat messages: [{role, content}].",
+                "description": (
+                    "Chat messages: [{role, content}]. User content may be a "
+                    "string or an array of OpenAI-style text/image_url parts."
+                ),
             },
+            "images": LLM_IMAGES_PARAM_SCHEMA,
             "model": {
                 "type": "string",
                 "description": (
@@ -3278,6 +3298,7 @@ def _configured_local_model_inventory(
 def handle_llm_call(args: dict, **kwargs) -> str:
     """Run one host-owned completion using an advertised configured route."""
     messages = args.get("messages", [])
+    images = args.get("images")
     system_prompt = args.get("system_prompt")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -3285,18 +3306,10 @@ def handle_llm_call(args: dict, **kwargs) -> str:
     max_tokens = args.get("max_tokens")
     json_mode = args.get("json_mode", False)
 
-    if not isinstance(messages, list) or not messages:
-        return _tool_error("'messages' is required (list of {role, content} objects).")
-
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            return _tool_error(f"messages[{index}] must be an object with role and content.")
-        if message.get("role") not in {"system", "user", "assistant"}:
-            return _tool_error(
-                f"messages[{index}].role must be system, user, or assistant."
-            )
-        if not isinstance(message.get("content"), str):
-            return _tool_error(f"messages[{index}].content must be a string.")
+    try:
+        normalized_messages = normalize_llm_messages(messages, images=images)
+    except ValueError as error:
+        return _tool_error(str(error))
 
     if system_prompt is not None and not isinstance(system_prompt, str):
         return _tool_error("'system_prompt' must be a string when provided.")
@@ -3309,7 +3322,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
     if not isinstance(json_mode, bool):
         return _tool_error("'json_mode' must be a boolean when provided.")
     if system_prompt is not None and any(
-        message["role"] == "system" for message in messages
+        message["role"] == "system" for message in normalized_messages
     ):
         return _tool_error(
             "Use either 'system_prompt' or a system-role message, not both."
@@ -3332,7 +3345,7 @@ def handle_llm_call(args: dict, **kwargs) -> str:
     full_messages: list = []
     if system_prompt is not None:
         full_messages.append({"role": "system", "content": system_prompt})
-    full_messages.extend(dict(message) for message in messages)
+    full_messages.extend(normalized_messages)
 
     if json_mode:
         json_instruction = (
@@ -3398,7 +3411,9 @@ def handle_llm_call(args: dict, **kwargs) -> str:
             purpose="hermes-herald.llm_call",
         )
     except Exception as error:
-        return _tool_error(f"LLM call failed: {type(error).__name__}: {error}")
+        return _tool_error(
+            f"LLM call failed: {type(error).__name__}: {redact_data_urls(str(error))}"
+        )
 
     text = getattr(result, "text", "")
     if not isinstance(text, str) or not text.strip():
@@ -3455,18 +3470,11 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
         )
 
     messages = args.get("messages", [])
-    if not isinstance(messages, list) or not messages:
-        return _tool_error("'messages' is required (list of {role, content} objects).")
-    for index, message in enumerate(messages):
-        if (
-            not isinstance(message, dict)
-            or message.get("role") not in {"system", "user", "assistant"}
-            or not isinstance(message.get("content"), str)
-        ):
-            return _tool_error(
-                f"messages[{index}] must be an object with role "
-                "(system/user/assistant) and string content."
-            )
+    images = args.get("images")
+    try:
+        normalized_messages = normalize_llm_messages(messages, images=images)
+    except ValueError as error:
+        return _tool_error(str(error))
 
     endpoint_name = (args.get("endpoint") or cfg.get_default_direct_endpoint() or "").strip()
     if not endpoint_name:
@@ -3503,7 +3511,7 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
     if allow_error:
         return allow_error
 
-    body: Dict[str, Any] = {"model": model, "messages": [dict(m) for m in messages]}
+    body: Dict[str, Any] = {"model": model, "messages": normalized_messages}
 
     temperature = args.get("temperature")
     if temperature is not None:
@@ -3619,18 +3627,16 @@ def handle_llm_direct(args: dict, **kwargs) -> str:
     text = ""
     finish_reason = ""
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message_obj = choices[0].get("message")
-        if isinstance(message_obj, dict) and isinstance(message_obj.get("content"), str):
-            text = message_obj["content"]
+        text = extract_text_from_choice_message(choices[0].get("message"))
         finish_reason = str(choices[0].get("finish_reason") or "")
     if not text.strip():
         err = payload.get("error") if isinstance(payload, dict) else None
         detail = err.get("message") if isinstance(err, dict) else ""
-        return _tool_error(_redact_secrets(
+        return _tool_error(redact_data_urls(_redact_secrets(
             f"Empty completion from endpoint '{endpoint_name}'."
             + (f" Provider error: {detail}" if detail else ""),
             secrets,
-        ))
+        )))
 
     raw_usage = payload.get("usage") if isinstance(payload, dict) else None
     usage = raw_usage if isinstance(raw_usage, dict) else {}

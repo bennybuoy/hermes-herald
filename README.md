@@ -629,9 +629,24 @@ llm_call(
     provider="openai-codex",
     model="gpt-5.6-sol",
 )
+
+# Vision / OCR on local images (keeps messages[].content as a plain string)
+llm_call(
+    messages=[{"role": "user", "content": "Transcribe the handwritten answer."}],
+    images=["/path/to/page1.png"],
+    provider="openai-codex",
+    model="gpt-5.6-sol",
+)
 ```
 
-Use it for tasks where tools and iterative reasoning would be overhead: routing, scoring, rewriting, extraction, translation, compact summarisation, and schema-constrained JSON.
+Use it for tasks where tools and iterative reasoning would be overhead: routing, scoring, rewriting, extraction, translation, vision/OCR on scanned pages or screenshots, compact summarisation, and schema-constrained JSON.
+
+Both `llm_call` and `llm_direct` accept multimodal images in two ways:
+
+- top-level `images=[...]` attached to the last `user` message (keeping `messages[].content` as a plain string); or
+- OpenAI-style `messages[].content` part arrays on `role="user"` messages (`{"type": "text", "text": "..."}` and `{"type": "image_url", "image_url": {"url": "...", "detail": "auto|low|high"}}`).
+
+Each image may be a local file path (read and base64-encoded automatically), a `data:image/...;base64,...` URL, or a public `https://` URL. Supported inline/local formats are PNG, JPEG, GIF, and WebP (verified by magic bytes, not file extension alone), capped at **10 images per call, 10 MiB raw per image, and 20 MiB raw total**. Local paths refuse `..` traversal segments, credential files, and non-regular files; remote URLs refuse plaintext `http://`, embedded credentials, and private/loopback/link-local/metadata hosts or IPs. Base64 payloads are redacted from error messages.
 
 With no routing arguments, `llm_call` uses the host's active configured route.
 Before choosing an override, call `list_profile_models()` and copy one exact

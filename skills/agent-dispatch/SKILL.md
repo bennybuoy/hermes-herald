@@ -333,7 +333,16 @@ delegate_subagent(action="cancel", task_id="<returned task_id>", reason="Stop ..
 
 Use `llm_call` when you need only inference, not an agent loop:
 
-- `messages` must contain at least one `{role, content}` item.
+- `messages` must contain at least one `{role, content}` item. Plain-string
+  `content` works for every role; `role="user"` messages also accept OpenAI-style
+  content arrays (`{type: "text", text}` and `{type: "image_url", image_url: {url, detail?}}`).
+- Optional top-level `images=[...]` attaches local file paths, base64
+  `data:image/...` URLs, or public `https://` URLs to the last `user` message
+  without changing `messages[].content` from a string. Supported inline/local
+  formats are PNG, JPEG, GIF, and WebP (verified via magic bytes; max 10 images,
+  10 MiB raw each, 20 MiB raw total). Local paths block `..` traversal,
+  credential files, and non-regular files; remote URLs block `http://`,
+  embedded credentials, and private/loopback/metadata targets.
 - Use either `system_prompt` or a system-role message, not both.
 - Call `list_profile_models()` before choosing a route. Its local mode returns
   the calling profile's configured default plus every provider explicitly
@@ -401,6 +410,8 @@ llm_direct(messages=[{"role": "user", "content": "Reply with OK"}],
 
 - Endpoint URLs and credentials belong in configuration, never tool arguments.
   API keys must be environment references such as `${LAB_API_KEY}`.
+- Supports the same multimodal `messages[].content` parts and top-level `images`
+  parameter (and image format/size/path/SSRF guards) as `llm_call`.
 - Choose a configured endpoint and a model allowed by that endpoint's policy.
 - Use named parameters for reserved OpenAI fields; `extra_body` accepts only
   vendor-specific additions. Redirects are refused to protect bearer credentials.
