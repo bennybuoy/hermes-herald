@@ -251,9 +251,9 @@ CHECK_DISPATCH_SCHEMA: Dict[str, Any] = {
 COLLECT_DISPATCHES_SCHEMA: Dict[str, Any] = {
     "name": "collect_dispatches",
     "description": (
-        "Check multiple dispatched tasks at once. Returns completed results "
-        "and a list of still-running run_ids. Call this after dispatching "
-        "multiple parallel tasks to gather whatever's done."
+        "Check multiple dispatched tasks at once. Returns completed results, "
+        "still-running runs, unresolved (unknown) runs, and failed runs. Call "
+        "this after dispatching multiple parallel tasks to gather whatever's done."
     ),
     "parameters": {
         "type": "object",
@@ -1838,8 +1838,31 @@ def _verify_run_model_route(
 # ---------------------------------------------------------------------------
 
 
+def _is_plugin_host_process() -> bool:
+    """True when running inside Hermes's isolated plugin host subprocess."""
+    return os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1"
+
+
+def _capture_session_routing(parent_agent=None, session_id: str = "") -> dict:
+    """Capture origin session routing, tolerating legacy 1-arg test stubs."""
+    from .callback import capture_session_routing
+
+    fallback_session_id = str(session_id or "").strip()
+    if fallback_session_id:
+        try:
+            return capture_session_routing(
+                parent_agent,
+                session_id=fallback_session_id,
+            )
+        except TypeError:
+            return capture_session_routing(parent_agent)
+    return capture_session_routing(parent_agent)
+
+
 def _async_delivery_supported() -> bool:
     """Whether this commissioning session can receive a detached result."""
+    if _is_plugin_host_process():
+        return False
     try:
         from gateway.session_context import async_delivery_supported
 
@@ -1934,10 +1957,9 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
             f"Dispatch ledger is unavailable; no remote run was started. ({exc})"
         )
 
-    from .callback import capture_session_routing
-
+    caller_session_id = str(kwargs.get("session_id") or "").strip()
     parent_agent = _resolve_parent_agent(kwargs.get("parent_agent"))
-    routing = capture_session_routing(parent_agent)
+    routing = _capture_session_routing(parent_agent, caller_session_id)
     cached = _identity.prepare(pcfg, routing)
     if cached is not None:
         return json.dumps(cached)
@@ -1948,6 +1970,15 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
                 "This session cannot receive detached results and prior acceptance is unknown. "
                 "No new POST was sent. Preserve the original key and arguments; "
                 "reconcile existing work before retrying from a callback-capable session."
+            )
+        if _is_plugin_host_process():
+            return _tool_error(
+                "dispatch_agent with delivery='callback' is unavailable under "
+                "plugins.isolation: host because async completion callbacks "
+                "cannot cross the isolated plugin host boundary. No remote run "
+                "was started. Use delivery='none' with check_dispatch/"
+                "collect_dispatches, use dispatch_chat for a synchronous reply, "
+                "or run Hermes Herald under plugins.isolation: in_process."
             )
         return _tool_error(
             "dispatch_agent is asynchronous, but this session cannot receive "
@@ -2102,16 +2133,19 @@ def _handle_dispatch_agent(args: dict, *, _identity, **kwargs) -> str:
         # disconnects, the same thread switches to authenticated status polling.
         try:
             from .callback import start_listener
-            start_listener(
-                run_id=run_id,
-                profile=profile,
-                url=pcfg["url"],
-                api_key=pcfg["api_key"],
-                message_preview=message[:120],
-                requested_model=requested_model,
-                resolved_model=resolved_model,
-                parent_agent=parent_agent,
-            )
+            listener_kwargs = {
+                "run_id": run_id,
+                "profile": profile,
+                "url": pcfg["url"],
+                "api_key": pcfg["api_key"],
+                "message_preview": message[:120],
+                "requested_model": requested_model,
+                "resolved_model": resolved_model,
+                "parent_agent": parent_agent,
+            }
+            if caller_session_id:
+                listener_kwargs["session_id"] = caller_session_id
+            start_listener(**listener_kwargs)
         except Exception as exc:
             logger.error("Could not start SSE listener for %s: %s", run_id, exc)
             return json.dumps({
@@ -2245,6 +2279,7 @@ def handle_collect_dispatches(args: dict, **kwargs) -> str:
 
     completed: List[dict] = []
     running: List[dict] = []
+    unknown: List[dict] = []
     failed: List[dict] = []
 
     for entry in run_ids:
@@ -2298,22 +2333,32 @@ def handle_collect_dispatches(args: dict, **kwargs) -> str:
             usage=status.get("usage") if isinstance(status.get("usage"), dict) else None,
         )
 
-        if status.get("status") == "completed":
+        if live_status == "completed":
             completed.append(status)
-        elif status.get("status") in ("failed", "cancelled", "not_found", "invalid"):
+        elif live_status == "unknown":
+            if not status.get("note") and not status.get("error"):
+                status["note"] = (
+                    "Execution outcome is unresolved (status='unknown'). "
+                    "Inspect the target or resolve via "
+                    f"POST /v1/runs/{run_id}/resolve-unknown; do not blindly redispatch."
+                )
+            unknown.append(status)
+        elif live_status in ("failed", "cancelled", "not_found", "invalid"):
             failed.append(status)
         else:
-            # queued, running, or any other state
+            # queued, running, waiting_for_approval, or other active states
             running.append(status)
 
     return json.dumps({
         "completed": completed,
         "running": running,
+        "unknown": unknown,
         "failed": failed,
         "summary": {
             "total": len(run_ids),
             "completed": len(completed),
             "running": len(running),
+            "unknown": len(unknown),
             "failed": len(failed),
         },
     })
@@ -2592,9 +2637,10 @@ def handle_dispatch_chat(args: dict, **kwargs) -> str:
         recovery_warning = f"Profile-local recovery state could not be updated: {exc}"
         logger.warning("Chat completed without recovery-state write: %s", exc)
 
-    from .callback import capture_session_routing
-
-    routing = capture_session_routing(parent_agent)
+    routing = _capture_session_routing(
+        parent_agent,
+        str(kwargs.get("session_id") or "").strip(),
+    )
     try:
         _record_dispatch_ledger(
             edge_id=edge_id,
@@ -2743,6 +2789,103 @@ def handle_cancel_dispatch(args: dict, **kwargs) -> str:
 _VALID_APPROVAL_CHOICES = ("deny",)
 
 
+def _strict_int(value: Any) -> Optional[int]:
+    """Return value if it is an int (excluding bool), else None."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _resolve_approval_post_body(
+    approval_context: dict,
+    status: dict,
+    *,
+    choice: str,
+    resolve_all: bool,
+    profile: str,
+    run_id: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Build the POST /v1/runs/{run_id}/approval payload.
+
+    Hermes v0.23.3+ targets with ``session_authority`` enabled enforce an exact
+    3-key body ``{"request_id", "execution_generation", "choice"}`` and reject
+    extra keys such as ``all``. Legacy targets expect
+    ``{"choice": choice, "all": bool(resolve_all)}``.
+    """
+    ctx_generation = _strict_int(approval_context.get("execution_generation"))
+    status_generation = _strict_int(status.get("execution_generation"))
+    if (
+        ctx_generation is not None
+        and status_generation is not None
+        and ctx_generation != status_generation
+    ):
+        return None, (
+            f"Approval generation mismatch for {profile}/{run_id} "
+            f"(notice generation {ctx_generation} != target generation "
+            f"{status_generation}). Refresh status with check_dispatch or "
+            "cancel the run."
+        )
+    execution_generation = (
+        ctx_generation if ctx_generation is not None else status_generation
+    )
+
+    if execution_generation is None:
+        return {"choice": choice, "all": bool(resolve_all)}, None
+
+    if resolve_all:
+        return None, (
+            f"Target {profile} uses generation-fenced approvals "
+            "(session_authority) which resolve one exact request_id per call; "
+            "resolve_all=true is not supported. Deny the current approval_id "
+            "with resolve_all=false, or use cancel_dispatch."
+        )
+
+    request_id = str(approval_context.get("request_id") or "").strip()
+    pending_controls = status.get("pending_controls")
+    approval_prompts = (
+        [
+            ctrl
+            for ctrl in pending_controls
+            if isinstance(ctrl, dict)
+            and ctrl.get("kind") == "approval"
+            and isinstance(ctrl.get("prompt_id"), str)
+            and ctrl["prompt_id"].strip()
+        ]
+        if isinstance(pending_controls, list)
+        else []
+    )
+    if request_id:
+        if isinstance(pending_controls, list) and not any(
+            ctrl["prompt_id"].strip() == request_id for ctrl in approval_prompts
+        ):
+            return None, (
+                f"Approval request_id '{request_id}' is no longer pending on "
+                f"{profile}/{run_id}. Refresh status with check_dispatch."
+            )
+    elif len(approval_prompts) == 1:
+        request_id = approval_prompts[0]["prompt_id"].strip()
+    elif len(approval_prompts) > 1:
+        return None, (
+            f"Target {profile}/{run_id} has multiple pending approval prompts "
+            "and the delivered notice did not carry a target request_id; "
+            "cannot disambiguate which prompt to deny. Inspect the target or "
+            "use cancel_dispatch."
+        )
+    else:
+        return None, (
+            f"Target {profile}/{run_id} requires a generation-fenced "
+            "request_id for approval responses, but none was present in the "
+            "approval notice or run status. Inspect the target or use "
+            "cancel_dispatch."
+        )
+
+    return {
+        "request_id": request_id,
+        "execution_generation": execution_generation,
+        "choice": choice,
+    }, None
+
+
 def _request_dispatch_approval_consent(
     *,
     profile: str,
@@ -2803,6 +2946,15 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
     ``waiting_for_approval``. The SSE listener is left running so the run's
     normal completion is still delivered.
     """
+    if _is_plugin_host_process():
+        return _tool_error(
+            "approve_dispatch is unavailable under plugins.isolation: host "
+            "because human approval confirmation and SSE approval callbacks "
+            "cannot cross the isolated plugin host boundary. Run Hermes Herald "
+            "under plugins.isolation: in_process, or resolve/cancel the run "
+            "directly on the target (or use cancel_dispatch)."
+        )
+
     run_id = args.get("run_id", "").strip()
     profile = args.get("profile", "").strip()
     approval_id = args.get("approval_id", "")
@@ -2888,9 +3040,10 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
             )
 
         try:
-            from .callback import capture_session_routing
-
-            current_route = capture_session_routing(_resolve_parent_agent(kwargs.get("parent_agent")))
+            current_route = _capture_session_routing(
+                _resolve_parent_agent(kwargs.get("parent_agent")),
+                str(kwargs.get("session_id") or "").strip(),
+            )
         except Exception:
             current_route = {}
         expected_ui = str(approval_context.get("origin_ui_session_id") or "")
@@ -2980,6 +3133,17 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
             f"Choice '{choice}' is not offered by the target for "
             f"{profile}/{run_id}. Offered choices: {allowed_choices}."
         )
+    post_body, body_err = _resolve_approval_post_body(
+        approval_context,
+        status,
+        choice=choice,
+        resolve_all=resolve_all,
+        profile=profile,
+        run_id=run_id,
+    )
+    if body_err:
+        return _tool_error(body_err)
+
     if not _request_dispatch_approval_consent(
         profile=profile,
         run_id=run_id,
@@ -2999,7 +3163,7 @@ def handle_approve_dispatch(args: dict, **kwargs) -> str:
         request = lambda: _post_json(
             f"{pcfg['url']}/v1/runs/{run_id}/approval",
             pcfg["api_key"],
-            {"choice": choice, "all": bool(resolve_all)},
+            post_body,
             timeout=15.0,
         )
         if resolve_all:

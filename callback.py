@@ -153,6 +153,12 @@ _TERMINAL_EVENTS = {
     "run.cancelled",
 }
 
+_UNKNOWN_RUN_ERROR = (
+    "Target run entered 'unknown' state (execution outcome is unresolved after "
+    "a gateway or authority interruption). Inspect the target or resolve via "
+    "POST /v1/runs/{run_id}/resolve-unknown; do not blindly redispatch."
+)
+
 
 def _get_session_env(name: str, default: str = "") -> str:
     """Read current-session routing state with CLI-compatible fallback."""
@@ -169,27 +175,40 @@ def _get_current_session_key() -> str:
     return _get_session_env("HERMES_SESSION_KEY", "")
 
 
-def capture_session_routing(parent_agent=None) -> dict:
+def capture_session_routing(parent_agent=None, session_id: str = "") -> dict:
     """Capture a positive return address before starting background work."""
+    fallback_session_id = str(session_id or "").strip()
+    # Inside the isolated plugin host subprocess, per-call ContextVars do not
+    # cross the JSON-RPC wire and inherited HERMES_SESSION_* env vars can be
+    # stale across sessions. Prefer the per-call session_id argument when set.
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1" and fallback_session_id:
+        return {
+            "session_id": fallback_session_id,
+            "parent_session_id": fallback_session_id,
+            "session_key": fallback_session_id,
+            "origin_ui_session_id": "",
+        }
     source = _get_session_env("HERMES_SESSION_SOURCE", "")
-    session_id = _get_session_env("HERMES_SESSION_ID", "")
+    env_session_id = _get_session_env("HERMES_SESSION_ID", "")
     origin_ui_session_id = _get_session_env("HERMES_UI_SESSION_ID", "")
     session_key = _get_current_session_key()
     parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+    resolved_session_id = env_session_id or fallback_session_id
+    resolved_parent_session_id = parent_session_id or fallback_session_id
 
-    if source == "tui" and parent_session_id:
-        session_key = parent_session_id
+    if source == "tui" and resolved_parent_session_id:
+        session_key = resolved_parent_session_id
     if not session_key:
         session_key = (
             _get_session_env("HERMES_SESSION_KEY", "")
-            or parent_session_id
-            or session_id
+            or resolved_parent_session_id
+            or resolved_session_id
         )
     return {
-        "session_id": session_id,
+        "session_id": resolved_session_id,
         # The chat key/UI tab can survive /new. The host needs the durable
         # spawning session to enforce that boundary, independently of routing.
-        "parent_session_id": parent_session_id or session_id,
+        "parent_session_id": resolved_parent_session_id or resolved_session_id,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
     }
@@ -662,6 +681,24 @@ def _check_run_status(
             requested_model=requested_model, resolved_model=resolved_model,
             duration_seconds=elapsed,
         )
+    if status == "unknown":
+        _clear_pending_approval_mem(run_id)
+        try:
+            from .tools import _clear_pending_approval
+            _clear_pending_approval(run_id)
+        except Exception:
+            pass
+        return _build_delegation_event(
+            run_id, profile, "", {}, message_preview, session_id, session_key,
+            status="unknown",
+            error=str(
+                status_data.get("error")
+                or _UNKNOWN_RUN_ERROR.format(run_id=run_id)
+            ),
+            model=resolved_model,
+            requested_model=requested_model, resolved_model=resolved_model,
+            duration_seconds=elapsed,
+        )
     return None  # still running or waiting_for_approval
 
 
@@ -783,6 +820,23 @@ def _poll_run_status(
                 model=resolved_model, requested_model=requested_model,
                 resolved_model=resolved_model, duration_seconds=elapsed,
             )
+        if status == "unknown":
+            _clear_pending_approval_mem(run_id)
+            try:
+                from .tools import _clear_pending_approval
+                _clear_pending_approval(run_id)
+            except Exception:
+                pass
+            return _build_delegation_event(
+                run_id, profile, "", {}, message_preview, session_id, session_key,
+                status="unknown",
+                error=str(
+                    status_data.get("error")
+                    or _UNKNOWN_RUN_ERROR.format(run_id=run_id)
+                ),
+                model=resolved_model, requested_model=requested_model,
+                resolved_model=resolved_model, duration_seconds=elapsed,
+            )
         if status == "waiting_for_approval" and not _is_awaiting_approval(run_id):
             return _build_delegation_event(
                 run_id, profile, "", {}, message_preview, session_id, session_key,
@@ -888,6 +942,22 @@ def _read_sse_stream(
                             )
                             with _delivery_gate_lock:
                                 route = dict(_delivery_routes.get(run_id) or {})
+                            raw_request_id = evt.get("request_id")
+                            if not isinstance(raw_request_id, str) or not raw_request_id.strip():
+                                raw_request_id = evt.get("prompt_id")
+                            request_id = (
+                                raw_request_id.strip()[:256]
+                                if isinstance(raw_request_id, str)
+                                and raw_request_id.strip()
+                                else ""
+                            )
+                            raw_generation = evt.get("execution_generation")
+                            execution_generation = (
+                                raw_generation
+                                if isinstance(raw_generation, int)
+                                and not isinstance(raw_generation, bool)
+                                else None
+                            )
                             approval_data = {
                                 "run_id": run_id,
                                 "profile": profile,
@@ -919,6 +989,12 @@ def _read_sse_stream(
                                     route.get("origin_ui_session_id") or ""
                                 ),
                             }
+                            if request_id:
+                                approval_data["request_id"] = request_id
+                            if execution_generation is not None:
+                                approval_data["execution_generation"] = (
+                                    execution_generation
+                                )
                             became_current = _set_pending_approval(
                                 run_id, approval_data,
                             )
@@ -1272,12 +1348,17 @@ def start_listener(
     requested_model: str = "",
     resolved_model: str = "",
     parent_agent=None,
+    session_id: str = "",
 ) -> None:
     """Start an SSE listener thread for a dispatched run.
 
     Called by handle_dispatch_agent after a successful dispatch.
     """
-    route = capture_session_routing(parent_agent)
+    route = (
+        capture_session_routing(parent_agent, session_id=session_id)
+        if session_id
+        else capture_session_routing(parent_agent)
+    )
     session_id = route["session_id"]
     session_key = route["session_key"]
 
